@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuizKart.in - Redirecting</title>
+    <script>
+      // Single Page App fallback for GitHub Pages
+      // Redirect back to base path preserving search params and hash
+      const basePath = '/quizkart-platform/';
+      const targetUrl = basePath + (window.location.search || '') + (window.location.hash || '');
+      window.location.replace(targetUrl);
+    </script>
+  </head>
+  <body>
+    <p>Redirecting to <a href="/quizkart-platform/">QuizKart</a>...</p>
+  </body>
+</html>

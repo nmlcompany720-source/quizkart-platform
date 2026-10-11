@@ -347,13 +347,19 @@ export async function saveContestToFirestore(contest: ActiveContest): Promise<vo
   if (!contest || !contest.id) return;
   const path = `contests/${contest.id}`;
   try {
-    const safeContest = await prepareContestForFirestore(contest);
+    let safeContest = await prepareContestForFirestore(contest);
+    // Pre-emptively safeguard against Firestore 1MB document size limit (1,048,576 bytes)
+    try {
+      if (JSON.stringify(safeContest).length > 750_000) {
+        safeContest = sanitizeContestSynchronous(safeContest);
+      }
+    } catch {}
     await setDoc(doc(db, 'contests', safeContest.id), safeContest);
   } catch (error: any) {
     const errMsg = error instanceof Error ? error.message : String(error);
-    // If the error was caused by document size exceeding the 1MB Firestore limit,
-    // apply immediate emergency sanitization (replaces large base64 strings with clean CDN fallbacks) and retry.
-    if (errMsg.includes('exceeds the maximum allowed size') || errMsg.includes('1,048,576') || errMsg.includes('size')) {
+    // If the error was caused by document size exceeding the 1MB Firestore limit or payload limit,
+    // apply immediate emergency sanitization (replaces oversized base64 strings with clean CDN fallbacks) and retry.
+    if (errMsg.includes('exceeds the maximum allowed size') || errMsg.includes('1,048,576') || errMsg.includes('size') || errMsg.includes('limit') || errMsg.includes('payload')) {
       try {
         console.warn(`Applying emergency sanitization for oversized contest ${contest.id}...`);
         const fallback = sanitizeContestSynchronous(contest);

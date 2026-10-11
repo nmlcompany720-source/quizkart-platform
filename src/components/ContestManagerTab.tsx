@@ -284,7 +284,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     if (!file) return;
     try {
       const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-      if (isGif) {
+      if (isGif && file.size <= 450_000) {
         const reader = new FileReader();
         reader.onload = () => {
           const res = reader.result as string;
@@ -297,7 +297,11 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
         const compressed = await compressImage(file, 800, 600, 0.72);
         setTempImageUrl(compressed);
         soundFx.playSuccess();
-        onShowToast('Image optimized & loaded!', 'info');
+        if (isGif) {
+          onShowToast('GIF banner optimized to fit cloud storage limits (<450KB)', 'info');
+        } else {
+          onShowToast('Image optimized & loaded!', 'info');
+        }
       }
     } catch {
       onShowToast('Failed to optimize image', 'error');
@@ -447,7 +451,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     if (file) {
       try {
         const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-        if (isGif) {
+        if (isGif && file.size <= 450_000) {
           const reader = new FileReader();
           reader.onload = () => {
             const res = reader.result as string;
@@ -460,7 +464,11 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
           const compressed = await compressImage(file, 800, 600, 0.72);
           setProdImageUrl(compressed);
           soundFx.playSuccess();
-          onShowToast('Product image uploaded & optimized successfully!', 'success');
+          if (isGif) {
+            onShowToast('GIF banner optimized to fit cloud limits (<450KB)', 'info');
+          } else {
+            onShowToast('Product image uploaded & optimized successfully!', 'success');
+          }
         }
       } catch {
         onShowToast('Failed to optimize product image', 'error');
@@ -477,7 +485,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     if (file) {
       try {
         const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-        if (isGif) {
+        if (isGif && file.size <= 450_000) {
           const reader = new FileReader();
           reader.onload = () => {
             const res = reader.result as string;
@@ -490,7 +498,11 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
           const compressed = await compressImage(file, 800, 600, 0.72);
           setCashImageUrl(compressed);
           soundFx.playSuccess();
-          onShowToast('Tournament banner uploaded & optimized successfully!', 'success');
+          if (isGif) {
+            onShowToast('GIF banner optimized to fit cloud limits (<450KB)', 'info');
+          } else {
+            onShowToast('Tournament banner uploaded & optimized successfully!', 'success');
+          }
         }
       } catch {
         onShowToast('Failed to optimize tournament banner', 'error');
@@ -2623,7 +2635,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                           if (file) {
                             try {
                               const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-                              if (isGif) {
+                              if (isGif && file.size <= 450_000) {
                                 const reader = new FileReader();
                                 reader.onload = () => {
                                   const res = reader.result as string;
@@ -2636,7 +2648,11 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                                 const compressed = await compressImage(file, 800, 600, 0.72);
                                 setEditImageUrl(compressed);
                                 soundFx.playSuccess();
-                                onShowToast('Image optimized & loaded for editing!', 'info');
+                                if (isGif) {
+                                  onShowToast('GIF optimized to fit cloud limits (<450KB)', 'info');
+                                } else {
+                                  onShowToast('Image optimized & loaded for editing!', 'info');
+                                }
                               }
                             } catch {
                               onShowToast('Failed to optimize image', 'error');
