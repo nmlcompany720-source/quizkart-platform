@@ -148,7 +148,7 @@ export const getSavedContests = (): ActiveContest[] => {
         try {
           deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
         } catch {}
-        // Filter out invalid items, deleted items, legacy dummy items and sanitize document sizes
+        // Filter out invalid items, deleted items, and legacy dummy items
         const cleaned = parsed
           .filter((c: any) => 
             c && 
@@ -157,8 +157,7 @@ export const getSavedContests = (): ActiveContest[] => {
             !deletedList.includes(c.id) &&
             c.id !== 'CNT-PROD-101' && 
             c.id !== 'CNT-CASH-202'
-          )
-          .map(sanitizeContestSynchronous);
+          );
         return cleaned;
       }
     }
@@ -172,10 +171,9 @@ export const saveActiveContests = (contests: ActiveContest[]): void => {
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
-    const sanitized = (contests || [])
-      .filter(c => c && c.id && !deletedList.includes(c.id))
-      .map(sanitizeContestSynchronous);
-    localStorage.setItem(ACTIVE_CONTESTS_STORAGE_KEY, JSON.stringify(sanitized));
+    const filtered = (contests || [])
+      .filter(c => c && c.id && !deletedList.includes(c.id));
+    localStorage.setItem(ACTIVE_CONTESTS_STORAGE_KEY, JSON.stringify(filtered));
   } catch (err) {
     console.warn('LocalStorage save active contests error:', err);
   }

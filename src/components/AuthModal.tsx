@@ -69,14 +69,8 @@ function isAccountDeletedWithin30Days(emailInput?: string, mobileInput?: string)
   return deletedList.some((u) => {
     const uEmail = (u.email || '').trim().toLowerCase();
     const uMobile = (u.mobile || '').replace(/\D/g, '');
-    if (cleanEmail && uEmail) {
-      if (cleanEmail === uEmail) return true;
-      if (
-        (cleanEmail === 'rahul.sen@gmail.com' || cleanEmail === 'rahulsen@example.com' || cleanEmail === 'rahul.sen@example.com') &&
-        (uEmail === 'rahul.sen@gmail.com' || uEmail === 'rahulsen@example.com' || uEmail === 'rahul.sen@example.com' || u.id === 'USR-1001')
-      ) {
-        return true;
-      }
+    if (cleanEmail && uEmail && cleanEmail === uEmail) {
+      return true;
     }
     if (cleanMobile && cleanMobile.length >= 7 && uMobile && cleanMobile === uMobile) {
       return true;

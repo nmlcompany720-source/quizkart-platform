@@ -525,11 +525,10 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
                 const truncated = isLong ? `${(fullEmail || '').slice(0, 13)}...` : fullEmail;
 
                 return (
-                  <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-slate-500 font-medium">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500 font-medium">
                     <span className="shrink-0 font-semibold text-slate-600">
                       {userProfile.countryCode || '+91'} {userProfile.mobile}
                     </span>
-                    <span className="text-slate-300 shrink-0">•</span>
                     <span className="inline-flex items-center gap-1 min-w-0">
                       <span className="text-slate-600 font-medium truncate max-w-[200px] sm:max-w-none">
                         {isEmailExpanded ? fullEmail : truncated}
@@ -568,19 +567,21 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
         {/* Top Row: 3 Key Statistics Side-by-Side (Background completely untouched) */}
         <div className="grid grid-cols-3 gap-2 sm:gap-3.5">
           {/* Wallet Credits (Deep Emerald Green Value) */}
-          <div className="bg-emerald-50/70 rounded-2xl p-3 sm:p-4 text-center border border-emerald-200 flex flex-col justify-center">
-            <span className="text-[10px] sm:text-xs text-emerald-800 uppercase tracking-wider font-bold">
-              Wallet Credits
+          <div className="bg-emerald-50/70 rounded-2xl p-3 sm:p-4 text-center border border-emerald-200 flex flex-col justify-between">
+            <span className="text-[10px] sm:text-xs text-emerald-800 uppercase tracking-wider font-bold flex flex-col items-center justify-center leading-tight">
+              <span>WALLET</span>
+              <span>CREDITS</span>
             </span>
             <span className="text-base sm:text-xl md:text-2xl font-black text-[#059669] mt-1">
               ₹{userProfile.walletBalance ?? 0}
             </span>
           </div>
 
-          {/* Total Won (Royal Indigo/Purple Value with soft modern tint) */}
-          <div className="bg-indigo-50/70 rounded-2xl p-3 sm:p-4 text-center border border-indigo-200/80 flex flex-col justify-center">
-            <span className="text-[10px] sm:text-xs text-indigo-800 uppercase tracking-wider font-bold">
-              Total Won
+          {/* Total Won (Royal Indigo/Purple Value with soft modern tint - Stacked TOTAL WON aligned with WALLET CREDITS) */}
+          <div className="bg-indigo-50/70 rounded-2xl p-3 sm:p-4 text-center border border-indigo-200/80 flex flex-col justify-between">
+            <span className="text-[10px] sm:text-xs text-indigo-800 uppercase tracking-wider font-bold flex flex-col items-center justify-center leading-tight">
+              <span>TOTAL</span>
+              <span>WON</span>
             </span>
             <span className="text-base sm:text-xl md:text-2xl font-black text-[#6366F1] mt-1">
               ₹{userProfile.totalWonAmount ?? 0}
@@ -588,9 +589,10 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
           </div>
 
           {/* Quizzes Played (Dark Slate Value with soft modern tint) */}
-          <div className="bg-slate-100/70 rounded-2xl p-3 sm:p-4 text-center border border-slate-200/90 flex flex-col justify-center">
-            <span className="text-[10px] sm:text-xs text-slate-600 uppercase tracking-wider font-bold">
-              Quizzes Played
+          <div className="bg-slate-100/70 rounded-2xl p-3 sm:p-4 text-center border border-slate-200/90 flex flex-col justify-between">
+            <span className="text-[10px] sm:text-xs text-slate-600 uppercase tracking-wider font-bold flex flex-col items-center justify-center leading-tight">
+              <span>QUIZZES</span>
+              <span>PLAYED</span>
             </span>
             <span className="text-base sm:text-xl md:text-2xl font-black text-[#1E293B] mt-1">
               {userProfile.quizzesPlayed ?? 0}

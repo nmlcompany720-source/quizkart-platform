@@ -18,10 +18,11 @@ import {
   deleteDoc,
   query,
   where,
-  onSnapshot
+  onSnapshot,
+  setLogLevel
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import { Question, ActiveContest, LeaderboardEntry, UserProfile, QuizAttemptResult, DepositRequest, WithdrawalRequest, SupportTicket } from './types';
+import { Question, ActiveContest, LeaderboardEntry, UserProfile, QuizAttemptResult, DepositRequest, WithdrawalRequest, SupportTicket, BannerSlide } from './types';
 import { isDemoSeedUser } from './data/quizData';
 import { prepareContestForFirestore, sanitizeContestSynchronous } from './utils/imageCompressor';
 
@@ -30,6 +31,11 @@ export const app = initializeApp(firebaseConfig);
 
 // CRITICAL: Initialize Firestore with specific database ID from config
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
+// Silence Firestore internal SDK logs (e.g., maximum backoff retry notices and quota warnings)
+try {
+  setLogLevel('silent');
+} catch {}
 
 // Initialize Firebase Authentication
 export const auth = getAuth(app);
@@ -92,32 +98,134 @@ export interface FirestoreErrorInfo {
   };
 }
 
-export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid || null,
-      email: auth.currentUser?.email || null,
-      emailVerified: auth.currentUser?.emailVerified || null,
-      isAnonymous: auth.currentUser?.isAnonymous || null,
-      tenantId: auth.currentUser?.tenantId || null,
-      providerInfo: auth.currentUser?.providerData?.map(provider => ({
-        providerId: provider.providerId,
-        email: provider.email || null,
-      })) || []
-    },
-    operationType,
-    path
+// Quota and write throttling circuit breaker
+const QUOTA_STORAGE_KEY = 'quizkart_firestore_quota_exceeded';
+const QUOTA_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours cooldown
+
+let firestoreQuotaExceeded = false;
+let quotaExceededTimestamp = 0;
+
+try {
+  if (typeof localStorage !== 'undefined') {
+    const stored = localStorage.getItem(QUOTA_STORAGE_KEY);
+    if (stored) {
+      const ts = parseInt(stored, 10);
+      if (!isNaN(ts) && Date.now() - ts < QUOTA_COOLDOWN_MS) {
+        firestoreQuotaExceeded = true;
+        quotaExceededTimestamp = ts;
+      } else {
+        localStorage.removeItem(QUOTA_STORAGE_KEY);
+      }
+    }
+  }
+} catch {}
+
+// Client console safeguard against Firebase SDK quota & retry backoff logs
+if (typeof window !== 'undefined') {
+  const originalConsoleError = console.error;
+  console.error = function (...args: any[]) {
+    const fullText = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+    if (
+      fullText.includes('resource-exhausted') ||
+      fullText.includes('Quota limit exceeded') ||
+      fullText.includes('Quota exceeded') ||
+      fullText.includes('Free daily write units per project') ||
+      fullText.includes('Using maximum backoff delay to prevent overloading the backend')
+    ) {
+      handlePossibleQuotaError(fullText);
+      return;
+    }
+    originalConsoleError.apply(console, args);
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason;
+    const msg = reason?.message || String(reason || '');
+    if (
+      msg.includes('resource-exhausted') ||
+      msg.includes('Quota limit exceeded') ||
+      msg.includes('Quota exceeded') ||
+      msg.includes('Free daily write units per project') ||
+      msg.includes('maximum backoff delay')
+    ) {
+      handlePossibleQuotaError(reason);
+      event.preventDefault();
+    }
+  });
+}
+
+export function isFirestoreQuotaExceeded(): boolean {
+  if (firestoreQuotaExceeded) {
+    if (Date.now() - quotaExceededTimestamp > QUOTA_COOLDOWN_MS) {
+      firestoreQuotaExceeded = false;
+      try {
+        localStorage.removeItem(QUOTA_STORAGE_KEY);
+      } catch {}
+    }
+  }
+  return firestoreQuotaExceeded;
+}
+
+export function handlePossibleQuotaError(error: unknown): boolean {
+  const errMsg = error instanceof Error ? error.message : String(error);
+  const code = (error as any)?.code;
+  if (
+    code === 'resource-exhausted' ||
+    errMsg.includes('resource-exhausted') ||
+    errMsg.includes('Quota limit exceeded') ||
+    errMsg.includes('Quota exceeded') ||
+    errMsg.includes('Free daily write units per project') ||
+    errMsg.includes('maximum backoff delay')
+  ) {
+    firestoreQuotaExceeded = true;
+    quotaExceededTimestamp = Date.now();
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(QUOTA_STORAGE_KEY, String(quotaExceededTimestamp));
+      }
+    } catch {}
+    return true;
+  }
+  return false;
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): void {
+  if (handlePossibleQuotaError(error)) {
+    return;
+  }
+
+  const errMsg = error instanceof Error ? error.message : String(error);
+  if (errMsg.includes('insufficient permissions') || errMsg.includes('permission-denied') || (error as any)?.code === 'permission-denied') {
+    const errInfo: FirestoreErrorInfo = {
+      error: errMsg,
+      authInfo: {
+        userId: auth.currentUser?.uid || null,
+        email: auth.currentUser?.email || null,
+        emailVerified: auth.currentUser?.emailVerified || null,
+        isAnonymous: auth.currentUser?.isAnonymous || null,
+        tenantId: auth.currentUser?.tenantId || null,
+        providerInfo: auth.currentUser?.providerData?.map(provider => ({
+          providerId: provider.providerId,
+          email: provider.email || null,
+        })) || []
+      },
+      operationType,
+      path
+    };
+    console.error('Firestore Error: ', JSON.stringify(errInfo));
+    throw new Error(JSON.stringify(errInfo));
+  }
+
+  console.warn(`Firestore operation '${operationType}' notice on '${path}':`, errMsg);
 }
 
 // Test Firestore connection on boot
 export async function testConnection() {
   try {
+    if (isFirestoreQuotaExceeded()) return;
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.warn('Firebase connection notice: client is currently offline or warming up.');
     }
@@ -186,7 +294,7 @@ export function subscribeToAuth(callback: (user: User | null) => void) {
 
 // Firestore persistence helpers for QuizKart
 export async function syncUserProfile(profile: UserProfile): Promise<void> {
-  if (!profile || isDemoSeedUser(profile)) return;
+  if (!profile || isDemoSeedUser(profile) || isFirestoreQuotaExceeded()) return;
   const currentUser = auth.currentUser;
   const docId = currentUser?.uid || profile.uid || profile.id || (profile.email ? profile.email.replace(/[^a-zA-Z0-9_-]/g, '_') : null);
   if (!docId) return;
@@ -216,6 +324,7 @@ export async function syncUserProfile(profile: UserProfile): Promise<void> {
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     // Gracefully log if unauthenticated in preview mode
     console.warn('Firestore user sync notice:', error);
   }
@@ -304,20 +413,23 @@ export async function fetchQuestionsFromFirestore(): Promise<Question[]> {
 }
 
 export async function saveQuestionToFirestore(q: Question): Promise<void> {
-  if (!q || q.id == null) return;
+  if (!q || q.id == null || isFirestoreQuotaExceeded()) return;
   const path = `questions/${q.id}`;
   try {
     await setDoc(doc(db, 'questions', String(q.id)), q);
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
 export async function removeQuestionFromFirestore(qId: number): Promise<void> {
+  if (isFirestoreQuotaExceeded()) return;
   const path = `questions/${qId}`;
   try {
     await deleteDoc(doc(db, 'questions', String(qId)));
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
@@ -344,43 +456,96 @@ export async function fetchContestsFromFirestore(): Promise<ActiveContest[]> {
 }
 
 export async function saveContestToFirestore(contest: ActiveContest): Promise<void> {
-  if (!contest || !contest.id) return;
+  if (!contest || !contest.id || isFirestoreQuotaExceeded()) return;
   const path = `contests/${contest.id}`;
   try {
-    let safeContest = await prepareContestForFirestore(contest);
-    // Pre-emptively safeguard against Firestore 1MB document size limit (1,048,576 bytes)
-    try {
-      if (JSON.stringify(safeContest).length > 750_000) {
-        safeContest = sanitizeContestSynchronous(safeContest);
-      }
-    } catch {}
-    await setDoc(doc(db, 'contests', safeContest.id), safeContest);
+    const safeContest = await prepareContestForFirestore(contest);
+    const writePromise = setDoc(doc(db, 'contests', safeContest.id), safeContest);
+    // Timeout safeguard: max 3.5 seconds so Firestore never blocks the UI
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Firestore save timed out')), 3500)
+    );
+    await Promise.race([writePromise, timeoutPromise]);
   } catch (error: any) {
+    if (handlePossibleQuotaError(error)) {
+      return;
+    }
     const errMsg = error instanceof Error ? error.message : String(error);
-    // If the error was caused by document size exceeding the 1MB Firestore limit or payload limit,
-    // apply immediate emergency sanitization (replaces oversized base64 strings with clean CDN fallbacks) and retry.
-    if (errMsg.includes('exceeds the maximum allowed size') || errMsg.includes('1,048,576') || errMsg.includes('size') || errMsg.includes('limit') || errMsg.includes('payload')) {
+    if ((errMsg.includes('exceeds the maximum allowed size') || errMsg.includes('1,048,576') || errMsg.includes('payload')) && !errMsg.includes('resource-exhausted') && !errMsg.includes('Quota')) {
       try {
-        console.warn(`Applying emergency sanitization for oversized contest ${contest.id}...`);
         const fallback = sanitizeContestSynchronous(contest);
         await setDoc(doc(db, 'contests', fallback.id), fallback);
         return;
       } catch (retryErr) {
-        handleFirestoreError(retryErr, OperationType.WRITE, path);
+        if (!handlePossibleQuotaError(retryErr)) {
+          console.warn('Firestore retry save notice:', retryErr);
+        }
       }
     }
-    handleFirestoreError(error, OperationType.WRITE, path);
+    console.warn('Firestore save notice for contest:', contest.id, errMsg);
   }
 }
 
 export async function removeContestFromFirestore(contestId: string): Promise<void> {
-  if (!contestId) return;
+  if (!contestId || isFirestoreQuotaExceeded()) return;
   const path = `contests/${contestId}`;
   try {
-    await deleteDoc(doc(db, 'contests', contestId));
+    const deletePromise = deleteDoc(doc(db, 'contests', contestId));
+    // Timeout safeguard: max 3.5 seconds
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Firestore delete timed out')), 3500)
+    );
+    await Promise.race([deletePromise, timeoutPromise]);
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, path);
+    if (handlePossibleQuotaError(error)) return;
+    console.warn('Firestore remove contest notice:', contestId, error);
   }
+}
+
+// Banner Slides Cloud Persistence (Permanent storage under /settings/banners)
+export async function saveBannerSlidesToFirestore(slides: BannerSlide[]): Promise<void> {
+  if (!slides || !Array.isArray(slides) || isFirestoreQuotaExceeded()) return;
+  const path = 'settings/banners';
+  try {
+    // Only upload compact slides to Firestore to fit well within 1MB document limit
+    const safeSlides = slides.map(s => {
+      if (s.imageUrl && s.imageUrl.startsWith('data:image/') && s.imageUrl.length > 500_000) {
+        return { ...s, imageUrl: '' };
+      }
+      return s;
+    });
+    const writePromise = setDoc(doc(db, 'settings', 'banners'), {
+      slides: safeSlides,
+      updatedAt: new Date().toISOString()
+    });
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Banner save timed out')), 3500)
+    );
+    await Promise.race([writePromise, timeoutPromise]);
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
+    console.warn('Firestore banner save notice:', error);
+  }
+}
+
+export async function fetchBannerSlidesFromFirestore(): Promise<BannerSlide[] | null> {
+  const path = 'settings/banners';
+  try {
+    const snapPromise = getDoc(doc(db, 'settings', 'banners'));
+    const timeoutPromise = new Promise<null>((_, reject) => 
+      setTimeout(() => reject(new Error('Banner fetch timed out')), 3500)
+    );
+    const snap = await Promise.race([snapPromise, timeoutPromise]);
+    if (snap && snap.exists()) {
+      const data = snap.data();
+      if (data && Array.isArray(data.slides)) {
+        return data.slides as BannerSlide[];
+      }
+    }
+  } catch (error) {
+    console.warn('Firestore banner fetch notice:', error);
+  }
+  return null;
 }
 
 // Leaderboard Sync
@@ -406,7 +571,7 @@ export async function fetchLeaderboardFromFirestore(): Promise<LeaderboardEntry[
 
 export async function recordQuizAttemptInFirestore(attempt: QuizAttemptResult): Promise<void> {
   const currentUser = auth.currentUser;
-  if (!currentUser) return;
+  if (!currentUser || isFirestoreQuotaExceeded()) return;
 
   const path = `quiz_attempts/${attempt.attemptId}`;
   try {
@@ -425,6 +590,7 @@ export async function recordQuizAttemptInFirestore(attempt: QuizAttemptResult): 
       submittedAt: attempt.submittedAt || new Date().toISOString()
     });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.CREATE, path);
   }
 }
@@ -517,7 +683,7 @@ export function subscribeToUserQuizAttempts(
 
 // Deposit Requests Cloud Database Sync
 export async function saveDepositToFirestore(deposit: DepositRequest): Promise<void> {
-  if (!deposit || !deposit.id) return;
+  if (!deposit || !deposit.id || isFirestoreQuotaExceeded()) return;
   const path = `deposits/${deposit.id}`;
   const cleanEmail = (deposit.userEmail || deposit.email || auth.currentUser?.email || '').trim().toLowerCase();
   try {
@@ -538,7 +704,7 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
       updatedAt: new Date().toISOString()
     });
 
-    if (auth.currentUser) {
+    if (auth.currentUser && !isFirestoreQuotaExceeded()) {
       await setDoc(doc(db, 'users', auth.currentUser.uid), {
         pendingDepositId: deposit.status === 'pending' ? deposit.id : null,
         pendingDepositStatus: deposit.status,
@@ -546,12 +712,13 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
       }, { merge: true });
     }
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
 export async function updateDepositStatusInFirestore(depositId: string, status: 'pending' | 'approved' | 'rejected'): Promise<void> {
-  if (!depositId) return;
+  if (!depositId || isFirestoreQuotaExceeded()) return;
   const path = `deposits/${depositId}`;
   try {
     await setDoc(doc(db, 'deposits', depositId), {
@@ -559,7 +726,7 @@ export async function updateDepositStatusInFirestore(depositId: string, status: 
       updatedAt: new Date().toISOString()
     }, { merge: true });
 
-    if (auth.currentUser) {
+    if (auth.currentUser && !isFirestoreQuotaExceeded()) {
       await setDoc(doc(db, 'users', auth.currentUser.uid), {
         pendingDepositId: status === 'pending' ? depositId : null,
         pendingDepositStatus: status,
@@ -567,6 +734,7 @@ export async function updateDepositStatusInFirestore(depositId: string, status: 
       }, { merge: true });
     }
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
@@ -592,17 +760,18 @@ export async function fetchDepositsFromFirestore(): Promise<DepositRequest[]> {
 }
 
 export async function deleteDepositFromFirestore(depositId: string): Promise<void> {
-  if (!depositId) return;
+  if (!depositId || isFirestoreQuotaExceeded()) return;
   const path = `deposits/${depositId}`;
   try {
     await deleteDoc(doc(db, 'deposits', depositId));
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     console.warn(`Firestore deposit deletion notice (${depositId}):`, error);
   }
 }
 
 export async function saveDepositQrToFirestore(qrDataUrl: string): Promise<void> {
-  if (!qrDataUrl) return;
+  if (!qrDataUrl || isFirestoreQuotaExceeded()) return;
   const path = 'settings/deposit_qr';
   try {
     await setDoc(doc(db, 'settings', 'deposit_qr'), {
@@ -610,6 +779,7 @@ export async function saveDepositQrToFirestore(qrDataUrl: string): Promise<void>
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -629,7 +799,7 @@ export async function fetchDepositQrFromFirestore(): Promise<string | null> {
 
 // Global Quiz Arena Timer Persistence & Realtime Cloud Lock
 export async function saveQuizTimerToFirestore(seconds: number): Promise<void> {
-  if (!seconds || seconds <= 0) return;
+  if (!seconds || seconds <= 0 || isFirestoreQuotaExceeded()) return;
   const path = 'settings/quiz_timer';
   try {
     await setDoc(doc(db, 'settings', 'quiz_timer'), {
@@ -639,6 +809,7 @@ export async function saveQuizTimerToFirestore(seconds: number): Promise<void> {
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -684,7 +855,7 @@ export function subscribeToQuizTimer(callback: (seconds: number) => void): () =>
 
 // Withdrawal Requests Cloud Database Sync
 export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<void> {
-  if (!w || !w.id) return;
+  if (!w || !w.id || isFirestoreQuotaExceeded()) return;
   const path = `withdrawals/${w.id}`;
   const cleanEmail = (w.userEmail || w.email || auth.currentUser?.email || '').trim().toLowerCase();
   try {
@@ -707,12 +878,13 @@ export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<v
       updatedAt: new Date().toISOString()
     });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
 export async function updateWithdrawalStatusInFirestore(withdrawalId: string, status: 'pending' | 'approved' | 'rejected' | 'cancelled'): Promise<void> {
-  if (!withdrawalId) return;
+  if (!withdrawalId || isFirestoreQuotaExceeded()) return;
   const path = `withdrawals/${withdrawalId}`;
   try {
     await setDoc(doc(db, 'withdrawals', withdrawalId), {
@@ -720,6 +892,7 @@ export async function updateWithdrawalStatusInFirestore(withdrawalId: string, st
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
@@ -745,18 +918,19 @@ export async function fetchWithdrawalsFromFirestore(): Promise<WithdrawalRequest
 }
 
 export async function deleteWithdrawalFromFirestore(withdrawalId: string): Promise<void> {
-  if (!withdrawalId) return;
+  if (!withdrawalId || isFirestoreQuotaExceeded()) return;
   const path = `withdrawals/${withdrawalId}`;
   try {
     await deleteDoc(doc(db, 'withdrawals', withdrawalId));
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     console.warn(`Firestore withdrawal deletion notice (${withdrawalId}):`, error);
   }
 }
 
 // Support Tickets Cloud Database Sync
 export async function saveSupportTicketToFirestore(ticket: SupportTicket): Promise<void> {
-  if (!ticket || !ticket.id) return;
+  if (!ticket || !ticket.id || isFirestoreQuotaExceeded()) return;
   const path = `support_tickets/${ticket.id}`;
   try {
     await setDoc(doc(db, 'support_tickets', ticket.id), {
@@ -764,6 +938,7 @@ export async function saveSupportTicketToFirestore(ticket: SupportTicket): Promi
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     console.warn(`Firestore ticket save notice (${ticket.id}):`, error);
   }
 }
@@ -786,21 +961,24 @@ export async function fetchSupportTicketsFromFirestore(): Promise<SupportTicket[
 }
 
 export async function deleteSupportTicketFromFirestore(ticketId: string): Promise<void> {
-  if (!ticketId) return;
+  if (!ticketId || isFirestoreQuotaExceeded()) return;
   try {
     await deleteDoc(doc(db, 'support_tickets', ticketId));
   } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
     console.warn(`Firestore ticket deletion notice (${ticketId}):`, error);
   }
   try {
-    const q = query(collection(db, 'support_tickets'), where('id', '==', ticketId));
-    const snap = await getDocs(q);
-    const deletePromises: Promise<void>[] = [];
-    snap.forEach((docItem) => {
-      deletePromises.push(deleteDoc(docItem.ref));
-    });
-    if (deletePromises.length > 0) {
-      await Promise.all(deletePromises);
+    if (!isFirestoreQuotaExceeded()) {
+      const q = query(collection(db, 'support_tickets'), where('id', '==', ticketId));
+      const snap = await getDocs(q);
+      const deletePromises: Promise<void>[] = [];
+      snap.forEach((docItem) => {
+        deletePromises.push(deleteDoc(docItem.ref));
+      });
+      if (deletePromises.length > 0) {
+        await Promise.all(deletePromises);
+      }
     }
   } catch {}
 }

@@ -201,7 +201,7 @@ export function upsertRegisteredUser(user: Partial<UserProfile> & { email: strin
         pincode: '560001'
       },
       upiId: user.upiId || `${user.email.split('@')[0]}@upi`,
-      walletBalance: user.walletBalance !== undefined ? user.walletBalance : 500,
+      walletBalance: user.walletBalance !== undefined ? user.walletBalance : 0,
       quizzesPlayed: user.quizzesPlayed || 0,
       totalWonAmount: user.totalWonAmount || 0,
       productsWonCount: user.productsWonCount || 0,

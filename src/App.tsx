@@ -68,7 +68,10 @@ import {
   subscribeToUserQuizAttempts,
   fetchQuizTimerFromFirestore,
   subscribeToQuizTimer,
-  saveQuizTimerToFirestore
+  saveQuizTimerToFirestore,
+  fetchBannerSlidesFromFirestore,
+  saveBannerSlidesToFirestore,
+  isFirestoreQuotaExceeded
 } from './firebase';
 import { 
   getNextDepositId, 
@@ -254,7 +257,9 @@ export default function App() {
             }
             return c;
           });
-          saveContestToFirestore({ ...nextToPromote, status: 'active' }).catch(err => console.warn(err));
+          if (!isFirestoreQuotaExceeded()) {
+            saveContestToFirestore({ ...nextToPromote, status: 'active' }).catch(() => {});
+          }
         }
       }
 
@@ -343,16 +348,35 @@ export default function App() {
             deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
           } catch {}
           const validCloud = cloudContests
-            .filter((c: any) => c && c.id && !deletedList.includes(c.id) && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202')
-            .map(sanitizeContestSynchronous);
+            .filter((c: any) => c && c.id && !deletedList.includes(c.id) && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202');
           if (validCloud.length > 0) {
             setContests(prev => {
+              const prevMap = new Map<string, ActiveContest>();
+              prev.forEach(p => prevMap.set(p.id, p));
+
               const map = new Map<string, ActiveContest>();
-              validCloud.forEach(c => map.set(c.id, c));
+              validCloud.forEach(c => {
+                const localExisting = prevMap.get(c.id);
+                // Preserve local uploaded image/GIF if local copy has custom image
+                const preservedCashImage = localExisting?.cashConfig?.cashImageUrl?.startsWith('data:image/')
+                  ? localExisting.cashConfig.cashImageUrl
+                  : c.cashConfig?.cashImageUrl;
+                const preservedProdImage = localExisting?.productConfig?.productImageUrl?.startsWith('data:image/')
+                  ? localExisting.productConfig.productImageUrl
+                  : c.productConfig?.productImageUrl;
+
+                const mergedContest: ActiveContest = {
+                  ...c,
+                  cashConfig: c.cashConfig ? { ...c.cashConfig, cashImageUrl: preservedCashImage } : c.cashConfig,
+                  productConfig: c.productConfig ? { ...c.productConfig, productImageUrl: preservedProdImage } : c.productConfig,
+                };
+                map.set(c.id, mergedContest);
+              });
+
               prev.forEach(c => {
                 if (!map.has(c.id) && !deletedList.includes(c.id)) map.set(c.id, c);
               });
-              const merged = Array.from(map.values()).map(sanitizeContestSynchronous);
+              const merged = Array.from(map.values());
               try {
                 localStorage.setItem('quizkart_active_contests', JSON.stringify(merged));
               } catch {}
@@ -395,10 +419,13 @@ export default function App() {
         localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
       } catch {}
 
-      // Automatically update state in Admin Panel database (Firestore) from "Upcoming" to "LIVE"
-      updated.forEach(c => {
-        saveContestToFirestore(c).catch(err => console.warn('Sync contest to Firestore error:', err));
-      });
+      // Automatically update state in Admin Panel database (Firestore) if quota allows
+      if (!isFirestoreQuotaExceeded()) {
+        const liveContest = updated.find(c => c.id === contestId);
+        if (liveContest) {
+          saveContestToFirestore(liveContest).catch(() => {});
+        }
+      }
 
       return updated;
     });
@@ -446,21 +473,19 @@ export default function App() {
             localStorage.setItem('quizkart_current_active_contest', JSON.stringify(nextToPromote));
           } catch {}
 
-          // Automatically sync updated statuses to Firestore
-          withPromoted.forEach(c => {
-            saveContestToFirestore(c).catch(err => console.warn('Sync contest to Firestore error:', err));
-          });
+          // Automatically sync updated statuses to Firestore if quota allows
+          if (!isFirestoreQuotaExceeded()) {
+            saveContestToFirestore(nextToPromote).catch(() => {});
+          }
         }, 0);
 
         return withPromoted;
       } else {
         setTimeout(() => {
           setActiveContestId(null);
-          setBannerSliderEnabled(true);
           try {
             localStorage.setItem('quizkart_active_contest_id', '');
             localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
-            localStorage.setItem('quizkart_banner_slider_enabled', 'true');
             localStorage.removeItem('quizkart_current_active_contest');
           } catch {}
         }, 0);
@@ -515,9 +540,9 @@ export default function App() {
               localStorage.setItem('quizkart_current_active_contest', JSON.stringify(readyContest));
             } catch {}
 
-            finalized.forEach(c => {
-              saveContestToFirestore(c).catch(err => console.warn('Sync contest to Firestore error:', err));
-            });
+            if (!isFirestoreQuotaExceeded()) {
+              saveContestToFirestore(readyContest).catch(() => {});
+            }
 
             return finalized;
           }
@@ -655,7 +680,34 @@ export default function App() {
     try {
       localStorage.setItem('quizkart_banner_slides', JSON.stringify(validated));
     } catch {}
+    saveBannerSlidesToFirestore(validated).catch(() => {});
   };
+
+  // Load Banner Slides from Firestore on mount & merge
+  useEffect(() => {
+    async function loadCloudBanners() {
+      try {
+        const cloudBanners = await fetchBannerSlidesFromFirestore();
+        if (cloudBanners && cloudBanners.length > 0) {
+          setBannerSlides(prev => {
+            const validated = ensureTenSlides(cloudBanners);
+            const merged = validated.map((b, idx) => {
+              const local = prev[idx];
+              const img = local?.imageUrl && local.imageUrl.startsWith('data:image/') ? local.imageUrl : b.imageUrl;
+              return { ...b, imageUrl: img };
+            });
+            try {
+              localStorage.setItem('quizkart_banner_slides', JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+      } catch (err) {
+        console.warn('Firestore load banners notice:', err);
+      }
+    }
+    loadCloudBanners();
+  }, []);
 
   // Front-Page Carousel Banners Visibility Toggle (Admin Controlled)
   const [bannerSliderEnabled, setBannerSliderEnabled] = useState<boolean>(() => {
@@ -1267,7 +1319,6 @@ export default function App() {
     try {
       localStorage.setItem('quizkart_global_quiz_timer', globalQuizTimer.toString());
     } catch {}
-    saveQuizTimerToFirestore(globalQuizTimer).catch(() => {});
   }, [globalQuizTimer]);
 
   useEffect(() => {
@@ -1614,10 +1665,12 @@ export default function App() {
         hasPassword: true
       };
 
-      // Reset active quiz attempts list and pending withdrawal locks for the brand new user
+      // Clean slate initialization for brand new user accounts: completely empty transaction histories (₹0 Deposits, 0 Withdrawals)
       setUserQuizAttempts([]);
       setLastQuizResult(null);
       try {
+        localStorage.setItem(`quizkart_user_deposits_permanent_${cleanInputEmail}`, JSON.stringify([]));
+        localStorage.setItem(`quizkart_user_withdrawals_permanent_${cleanInputEmail}`, JSON.stringify([]));
         localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify([]));
         localStorage.removeItem('quizkart_last_result');
         localStorage.removeItem('quizkart_active_pending_withdrawal_id');
@@ -1798,10 +1851,10 @@ export default function App() {
 
   // Sync user profile updates to Firestore
   useEffect(() => {
-    if (currentUser) {
-      syncUserProfile(userProfile).catch(err => console.warn('Sync profile error:', err));
+    if (currentUser && !isFirestoreQuotaExceeded() && userProfile?.isRegistered && !userProfile?.isDeleted) {
+      syncUserProfile(userProfile).catch(() => {});
     }
-  }, [userProfile, currentUser]);
+  }, [userProfile?.walletBalance, userProfile?.totalWonAmount, userProfile?.name, userProfile?.email, currentUser]);
 
   // JavaScript Dynamic URL & Hash Listener for Secret Admin Route (#admin-gate-99)
   useEffect(() => {
@@ -1972,7 +2025,12 @@ export default function App() {
         try {
           localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
         } catch {}
-        updated.forEach(c => saveContestToFirestore(c).catch(() => {}));
+        if (!isFirestoreQuotaExceeded()) {
+          const joinedContest = updated.find(c => c.id === activeContest?.id || c.status === 'active');
+          if (joinedContest) {
+            saveContestToFirestore(joinedContest).catch(() => {});
+          }
+        }
         return updated;
       });
     }
@@ -2356,11 +2414,18 @@ export default function App() {
                 slides={bannerSlides} 
                 isLiveContest={isContestLive}
                 onSlideAction={(tab, customUrl) => {
-                  if (tab === 'quiz_arena') {
+                  if (tab === 'quiz_arena' || (tab as any) === 'tournaments') {
                     if (isContestLive) {
                       handleStartRealQuiz();
                     } else {
-                      showTunedToast("No contest live right now. Stay tuned for the next round!");
+                      setCurrentTab('home');
+                      const tournamentSection = document.getElementById('upcoming-prizes-section') || document.getElementById('how-it-works-section');
+                      if (tournamentSection) {
+                        tournamentSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      } else {
+                        window.scrollTo({ top: 380, behavior: 'smooth' });
+                      }
+                      showTunedToast("Explore Upcoming Tournaments below! Stay tuned for the next round.");
                     }
                   } else if (tab === 'refer_earn') {
                     setCurrentTab('profile');

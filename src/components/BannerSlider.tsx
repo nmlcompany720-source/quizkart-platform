@@ -20,7 +20,7 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
 }) => {
   const activeSlides = showAllSlides
     ? (slides || [])
-    : (slides || []).filter(s => s && s.isEnabled);
+    : (slides || []).filter(s => s && s.isEnabled && (Boolean(s.imageUrl) || Boolean(s.title)));
 
   const [currentIdx, setCurrentIdx] = useState<number>(() => {
     if (typeof activeSlideIndex === 'number' && activeSlideIndex >= 0) {
@@ -105,12 +105,14 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
 
   // Touch Swipe Handlers for mobile
   const handleTouchStart = (e: React.TouchEvent) => {
+    if ((e.target as HTMLElement).closest('button')) return;
     touchStartXRef.current = e.touches[0].clientX;
     touchEndXRef.current = null;
     setIsPaused(true);
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
+    if ((e.target as HTMLElement).closest('button')) return;
     touchEndXRef.current = e.touches[0].clientX;
   };
 
@@ -132,6 +134,7 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
 
   // Mouse Drag / Swipe Handlers for desktop
   const handleMouseDown = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest('button')) return;
     // Only drag with primary mouse button
     if (e.button !== 0) return;
     isDraggingRef.current = true;
@@ -238,16 +241,17 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
               </p>
             )}
 
-            {/* Real-time Action CTA Button: displays exact actionText, no automatic fallback resets */}
+            {/* Real-time Action CTA Button: displays exact actionText, single tap immediate navigation */}
             {Boolean(currentSlide.actionText && currentSlide.actionText.trim()) && (
-              <div className="pt-1.5 sm:pt-2">
+              <div className="pt-1.5 sm:pt-2 relative z-30 pointer-events-auto">
                 <button
                   type="button"
                   onClick={(e) => {
+                    e.preventDefault();
                     e.stopPropagation();
                     handleAction(currentSlide.actionTab, currentSlide.customUrl);
                   }}
-                  className="inline-flex items-center px-4 sm:px-6 py-2 sm:py-2.5 rounded-xl text-white font-bold text-xs sm:text-sm shadow-md active:scale-95 transition-all cursor-pointer hover:opacity-95"
+                  className="inline-flex items-center px-4 sm:px-6 py-2 sm:py-2.5 rounded-xl text-white font-bold text-xs sm:text-sm shadow-md active:scale-95 transition-all cursor-pointer hover:opacity-95 select-none relative z-30"
                   style={{
                     background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
                     boxShadow: '0 4px 14px rgba(65, 124, 244, 0.35)',

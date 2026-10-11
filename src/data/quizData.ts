@@ -375,116 +375,59 @@ export const INITIAL_LEADERBOARD: LeaderboardEntry[] = [
 export const DEFAULT_USER_PROFILE: UserProfile = {
   id: 'USR-1001',
   uid: 'USR-1001',
-  name: 'Rahul Sen',
-  mobile: '9876543210',
+  name: 'New Player',
+  mobile: '',
   countryCode: '+91',
-  email: 'rahul.sen@example.com',
+  email: '',
   avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=160&auto=format&fit=crop&q=80',
   address: {
-    fullName: 'Rahul Sen',
-    phoneNumber: '9876543210',
-    streetAddress: 'Flat 402, Sai Orchid Heights, Bannerghatta Road',
+    fullName: '',
+    phoneNumber: '',
+    streetAddress: '',
     city: 'Bengaluru',
     state: 'Karnataka',
-    pincode: '560076',
-    landmark: 'Near Apollo Hospital'
+    pincode: '560001',
+    landmark: ''
   },
-  upiId: 'rahulsen@okhdfcbank',
-  walletBalance: 2200,
-  quizzesPlayed: 5,
-  totalWonAmount: 550,
+  upiId: '',
+  walletBalance: 0,
+  quizzesPlayed: 0,
+  totalWonAmount: 0,
   productsWonCount: 0,
-  isRegistered: true,
-  registrationDate: '2026-09-25',
-  passwordStatus: 'rahul@123',
-  hasPassword: true,
+  isRegistered: false,
+  registrationDate: '',
+  passwordStatus: '',
+  hasPassword: false,
   emailSubscription: {
-    isSubscribed: true,
-    email: 'rahul.sen@example.com',
-    notifyJackpots: true,
-    notifyDailyResults: true,
-    notifyPrizeDispatch: true,
+    isSubscribed: false,
+    email: '',
+    notifyJackpots: false,
+    notifyDailyResults: false,
+    notifyPrizeDispatch: false,
     frequency: 'instant',
-    subscribedAt: '2026-08-20'
+    subscribedAt: ''
   },
   referrals: {
-    referralCode: 'RAHUL50',
-    referralLink: typeof window !== 'undefined' ? `${window.location.origin}?ref=RAHUL50` : '?ref=RAHUL50',
-    totalReferralsCount: 3,
-    totalBonusEarned: 150,
+    referralCode: '',
+    referralLink: '',
+    totalReferralsCount: 0,
+    totalBonusEarned: 0,
     rewardPerReferral: 50,
     friendBonus: 50,
-    history: [
-      {
-        id: 'ref-1',
-        friendName: 'Ananya Verma',
-        friendMobileMasked: '+91 98231 •••••',
-        signupDate: '23 Aug 2026',
-        bonusAmount: 50,
-        status: 'credited'
-      },
-      {
-        id: 'ref-2',
-        friendName: 'Vikram Joshi',
-        friendMobileMasked: '+91 97114 •••••',
-        signupDate: '21 Aug 2026',
-        bonusAmount: 50,
-        status: 'credited'
-      },
-      {
-        id: 'ref-3',
-        friendName: 'Pooja Nair',
-        friendMobileMasked: '+91 98452 •••••',
-        signupDate: '19 Aug 2026',
-        bonusAmount: 50,
-        status: 'credited'
-      }
-    ]
+    history: []
   }
 };
 
 export function isDemoSeedUser(u?: Partial<UserProfile> | null): boolean {
   if (!u) return true;
+  // ABSOLUTE DATA PERSISTENCE: If user has an active/registered account, NEVER drop or hide them!
+  if (u.isRegistered && u.email && !u.isDeleted) {
+    return false;
+  }
   const email = (u.email || '').trim().toLowerCase();
   const name = (u.name || '').trim().toLowerCase();
-  const mobile = (u.mobile || '').replace(/\D/g, '');
-  const upi = (u.upiId || '').trim().toLowerCase();
-
-  // Hardcoded demo emails from legacy seed data
-  if (
-    [
-      'rahul.sen@example.com',
-      'rahul.sen@gmail.com',
-      'rahulsen@example.com',
-      'priya.sundar@gmail.com',
-      'verma.aakash@gmail.com',
-      'sneha.patel@gmail.com',
-      'rohan.deshmukh@gmail.com',
-      'player@quizkart.in'
-    ].includes(email)
-  ) {
-    return true;
-  }
-
-  // Hardcoded demo names from legacy seed data
-  if (
-    [
-      'rahul sen',
-      'nml admin',
-      'priya sundaram',
-      'aakash verma',
-      'sneha patel',
-      'rohan deshmukh'
-    ].includes(name)
-  ) {
-    return true;
-  }
-
-  // Hardcoded NML Admin dummy seed record
-  if (upi === 'nmladmin@okaxis' || mobile === '9800112233') {
-    return true;
-  }
-
+  if (email === 'player@quizkart.in' && !u.isRegistered) return true;
+  if (name === 'nml admin' && !u.email) return true;
   return false;
 }
 
@@ -509,201 +452,62 @@ export const DEFAULT_ANNOUNCEMENT_SETTINGS: AnnouncementSettings = {
   speed: 'normal'
 };
 
-export const DEFAULT_BANNER_SLIDES: BannerSlide[] = [
-  {
-    id: 'slide-1',
-    imageUrl: 'https://images.unsplash.com/photo-1579621970563-ebec7560ff3e?w=1200&auto=format&fit=crop&q=80',
-    title: 'MEGA CASH JACKPOT ARENA',
-    subtitle: 'Rank #1 claims ₹5,199 instant UPI cash prize. Certified 0.1s millisecond accuracy.',
-    badge: 'LIVE CASH TOURNAMENT',
-    actionText: 'Enter Cash Arena',
-    actionTab: 'quiz_arena',
-    isEnabled: true
-  },
-  {
-    id: 'slide-2',
-    imageUrl: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=1200&auto=format&fit=crop&q=80',
-    title: 'Win Genuine Tech Gadgets',
-    subtitle: 'Certified smartwatches and electronics delivered directly to your doorstep with 100% free delivery.',
-    badge: 'FREE DOORSTEP DELIVERY',
-    actionText: 'Explore Prizes',
-    actionTab: 'home',
-    isEnabled: true
-  },
-  {
-    id: 'slide-3',
-    imageUrl: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=1200&auto=format&fit=crop&q=80',
-    title: 'Transparent 0.1s Atomic Leaderboard',
-    subtitle: 'Tamper-proof speed and accuracy calculations with immediate automated prize payout.',
-    badge: '0.1s ATOMIC TIMER',
-    actionText: 'View Live Standings',
-    actionTab: 'leaderboard',
-    isEnabled: true
-  },
-  {
-    id: 'slide-4',
-    imageUrl: 'https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=1200&auto=format&fit=crop&q=80',
-    title: 'Daily High-Stakes Blitz Rounds',
-    subtitle: 'Daily quiz challenges released every morning. Test your knowledge, conquer the ranks, win big.',
-    badge: 'DAILY BLITZ',
-    actionText: 'Play Quiz Now',
-    actionTab: 'quiz_arena',
-    isEnabled: true
-  },
-  {
-    id: 'slide-5',
-    imageUrl: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=1200&auto=format&fit=crop&q=80',
-    title: 'Weekend Mega Showdown',
-    subtitle: 'Compete with top quizzers across India and win grand cash prizes every weekend.',
-    badge: 'WEEKEND SPECIAL',
-    actionText: 'Join Now',
-    actionTab: 'quiz_arena',
-    isEnabled: true
-  },
-  {
-    id: 'slide-6',
-    imageUrl: 'https://images.unsplash.com/photo-1518770660439-4636190af475?w=1200&auto=format&fit=crop&q=80',
-    title: 'Tech & Gadgets Championship',
-    subtitle: 'Answer technology trivia and win cutting-edge smart devices directly delivered.',
-    badge: 'TECH ARENA',
-    actionText: 'Compete Now',
-    actionTab: 'quiz_arena',
-    isEnabled: true
-  },
-  {
-    id: 'slide-7',
-    imageUrl: 'https://images.unsplash.com/photo-1551836022-d5d88e9218df?w=1200&auto=format&fit=crop&q=80',
-    title: 'Instant UPI Prize Payouts',
-    subtitle: 'Guaranteed instant withdrawals directly credited to your verified UPI ID.',
-    badge: 'INSTANT PAYOUT',
-    actionText: 'Check Wallet',
-    actionTab: 'profile',
-    isEnabled: true
-  },
-  {
-    id: 'slide-8',
-    imageUrl: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?w=1200&auto=format&fit=crop&q=80',
-    title: 'Refer & Earn Unlimited Bonus',
-    subtitle: 'Invite your friends to QuizKart and earn cash bonuses directly in your winning wallet.',
-    badge: 'REFERRAL BONUS',
-    actionText: 'Invite Friends',
-    actionTab: 'refer_earn',
-    isEnabled: true
-  },
-  {
-    id: 'slide-9',
-    imageUrl: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=1200&auto=format&fit=crop&q=80',
-    title: 'Daily General Knowledge Blitz',
-    subtitle: 'Sharpen your brain and claim guaranteed rewards in fast 10-question rounds.',
-    badge: 'DAILY BLITZ',
-    actionText: 'Play Blitz',
-    actionTab: 'quiz_arena',
-    isEnabled: true
-  },
-  {
-    id: 'slide-10',
-    imageUrl: 'https://images.unsplash.com/photo-1534447677768-be436bb09401?w=1200&auto=format&fit=crop&q=80',
-    title: 'Certified 100% Fair Play',
-    subtitle: 'Atomic precision timing with fair anti-cheat proctoring certified for all players.',
-    badge: 'VERIFIED FAIR',
-    actionText: 'View Rules',
-    actionTab: 'transparency',
-    isEnabled: true
-  }
-];
+export const DEFAULT_BANNER_SLIDES: BannerSlide[] = Array.from({ length: 10 }, (_, i) => ({
+  id: `slide-${i + 1}`,
+  imageUrl: '',
+  title: '',
+  subtitle: '',
+  badge: '',
+  actionText: '',
+  actionTab: 'quiz_arena',
+  customUrl: '',
+  isEnabled: false
+}));
 
 export const ensureTenSlides = (existing?: BannerSlide[]): BannerSlide[] => {
   const slides = Array.isArray(existing) ? [...existing] : [];
   const result: BannerSlide[] = [];
+  
+  // Helper to preserve user inputs with spaces and full string intact
+  const cleanField = (val?: string) => {
+    if (val === undefined || val === null || typeof val !== 'string') return '';
+    return val;
+  };
+
   for (let i = 0; i < 10; i++) {
     const slotId = `slide-${i + 1}`;
-    const defaultSlide = DEFAULT_BANNER_SLIDES[i] || {
-      id: slotId,
-      imageUrl: '',
-      title: `Banner Slot ${i + 1}`,
-      subtitle: '',
-      badge: '',
-      actionText: 'Join Now',
-      actionTab: 'quiz_arena',
-      isEnabled: true
-    };
-
-    if (slides[i]) {
+    const s = slides[i];
+    if (s) {
       result.push({
-        ...defaultSlide,
-        ...slides[i],
-        id: slides[i].id || slotId,
-        isEnabled: typeof slides[i].isEnabled === 'boolean' ? slides[i].isEnabled : true,
+        id: s.id || slotId,
+        imageUrl: typeof s.imageUrl === 'string' ? s.imageUrl : '',
+        title: cleanField(s.title),
+        subtitle: cleanField(s.subtitle),
+        badge: cleanField(s.badge),
+        actionText: cleanField(s.actionText),
+        actionTab: s.actionTab || 'quiz_arena',
+        customUrl: typeof s.customUrl === 'string' ? s.customUrl : '',
+        // Strictly respect admin's selection; never auto-enable unselected banners!
+        isEnabled: Boolean(s.isEnabled)
       });
     } else {
-      result.push(defaultSlide);
+      result.push({
+        id: slotId,
+        imageUrl: '',
+        title: '',
+        subtitle: '',
+        badge: '',
+        actionText: '',
+        actionTab: 'quiz_arena',
+        customUrl: '',
+        isEnabled: false
+      });
     }
   }
   return result;
 };
 
-export const DEFAULT_DEPOSIT_REQUESTS: DepositRequest[] = [
-  {
-    id: 'QK-DEP-1001',
-    userName: 'Rohan Deshmukh',
-    userEmail: 'rohan.deshmukh@gmail.com',
-    email: 'rohan.deshmukh@gmail.com',
-    phone: '+91 98231 44521',
-    upiId: 'rohan.desh@okaxis',
-    amount: 100,
-    utrNumber: '428901238910',
-    screenshotUrl: 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=600&auto=format&fit=crop&q=80',
-    app: 'PhonePe',
-    timestamp: '2026-09-20 | 06:15:20 PM',
-    date: '2026-09-20',
-    status: 'pending'
-  },
-  {
-    id: 'QK-DEP-1002',
-    userName: 'Priya Sundaram',
-    userEmail: 'priya.sundar@gmail.com',
-    email: 'priya.sundar@gmail.com',
-    phone: '+91 98402 11983',
-    upiId: 'priya.sundar@ibl',
-    amount: 500,
-    utrNumber: '428901241190',
-    screenshotUrl: 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=600&auto=format&fit=crop&q=80',
-    app: 'PhonePe',
-    timestamp: '2026-09-20 | 05:40:12 PM',
-    date: '2026-09-20',
-    status: 'pending'
-  },
-  {
-    id: 'QK-DEP-1003',
-    userName: 'Aakash Verma',
-    userEmail: 'verma.aakash@gmail.com',
-    email: 'verma.aakash@gmail.com',
-    phone: '+91 97112 09841',
-    upiId: 'verma.aakash@paytm',
-    amount: 200,
-    utrNumber: '428901198421',
-    screenshotUrl: 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=600&auto=format&fit=crop&q=80',
-    app: 'PhonePe',
-    timestamp: '2026-09-20 | 04:10:05 PM',
-    date: '2026-09-20',
-    status: 'approved'
-  }
-];
+export const DEFAULT_DEPOSIT_REQUESTS: DepositRequest[] = [];
 
-export const DEFAULT_WITHDRAWAL_REQUESTS: WithdrawalRequest[] = [
-  {
-    id: 'QK-WTH-1002',
-    userName: 'Sneha Patel',
-    userEmail: 'sneha.patel@gmail.com',
-    email: 'sneha.patel@gmail.com',
-    phone: '+91 98221 00192',
-    accountHolderName: 'Sneha Patel',
-    accountNumber: '32910491823901',
-    ifscCode: 'SBIN0004521',
-    amount: 500,
-    timestamp: '2026-09-20 | 03:15:40 PM',
-    date: '2026-09-20',
-    status: 'approved'
-  }
-];
+export const DEFAULT_WITHDRAWAL_REQUESTS: WithdrawalRequest[] = [];
 

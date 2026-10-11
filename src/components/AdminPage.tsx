@@ -89,7 +89,7 @@ import {
 } from '../utils/aiQuestionParser';
 import { ContestManagerTab } from './ContestManagerTab';
 import { safeCopyToClipboard } from '../utils/clipboard';
-import { compressImage, normalizeImageUrl } from '../utils/imageCompressor';
+import { compressImage, normalizeImageUrl, isGifImage } from '../utils/imageCompressor';
 import { 
   updateDepositStatusInFirestore, 
   syncUserProfile, 
@@ -102,7 +102,8 @@ import {
   deleteWithdrawalFromFirestore,
   deleteSupportTicketFromFirestore,
   fetchSupportTicketsFromFirestore,
-  saveSupportTicketToFirestore
+  saveSupportTicketToFirestore,
+  saveBannerSlidesToFirestore
 } from '../firebase';
 import { 
   formatDepositId, 
@@ -884,14 +885,16 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const handleToggleSlideActive = (idx: number, isEnabled: boolean) => {
     const updated = [...adminBannerSlides];
     updated[idx] = { ...updated[idx], isEnabled };
-    setAdminBannerSlides(updated);
+    const validated = ensureTenSlides(updated);
+    setAdminBannerSlides(validated);
     if (onUpdateBannerSlides) {
-      onUpdateBannerSlides(updated);
+      onUpdateBannerSlides(validated);
     }
     try {
-      localStorage.setItem('quizkart_banner_slides', JSON.stringify(updated));
+      localStorage.setItem('quizkart_banner_slides', JSON.stringify(validated));
       window.dispatchEvent(new Event('storage'));
     } catch {}
+    saveBannerSlidesToFirestore(validated).catch(() => {});
     soundFx.playClick();
     showToast(`Banner ${idx + 1} is now ${isEnabled ? 'visible' : 'hidden'} on live website!`, 'info');
   };
@@ -915,6 +918,9 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       window.dispatchEvent(new Event('storage'));
     } catch {}
 
+    // Sync permanently to Firestore in background
+    saveBannerSlidesToFirestore(validated).catch(() => {});
+
     setTimeout(() => {
       setIsSavingBanners(false);
       setIsBannersSaved(true);
@@ -922,20 +928,19 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       showToast('💾 Front-Page Carousel Banners saved & updated live!');
       setTimeout(() => {
         setIsBannersSaved(false);
-      }, 2000);
-    }, 1000);
+      }, 1500);
+    }, 250);
   };
 
   const handleUpdateSlideField = (index: number, field: keyof BannerSlide, value: any) => {
     const updated = [...adminBannerSlides];
     updated[index] = { ...updated[index], [field]: value };
-    const validated = ensureTenSlides(updated);
-    setAdminBannerSlides(validated);
+    setAdminBannerSlides(updated);
     if (onUpdateBannerSlides) {
-      onUpdateBannerSlides(validated);
+      onUpdateBannerSlides(updated);
     }
     try {
-      localStorage.setItem('quizkart_banner_slides', JSON.stringify(validated));
+      localStorage.setItem('quizkart_banner_slides', JSON.stringify(updated));
       window.dispatchEvent(new Event('storage'));
     } catch {}
   };
@@ -3636,9 +3641,9 @@ Explanation: Explanation details for the contestant.`}
                       <label className="block text-xs font-bold text-slate-700 mb-1.5">Banner Heading</label>
                       <input
                         type="text"
-                        value={adminBannerSlides[activeSlideAdminIdx].title}
+                        value={adminBannerSlides[activeSlideAdminIdx]?.title || ''}
                         onChange={(e) => handleUpdateSlideField(activeSlideAdminIdx, 'title', e.target.value)}
-                        placeholder="e.g. ₹10,000 Mega Cash Blitz"
+                        placeholder=""
                         className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs bg-white text-slate-900 font-semibold"
                         style={{ backgroundColor: '#FFFFFF' }}
                       />
@@ -3649,9 +3654,9 @@ Explanation: Explanation details for the contestant.`}
                       <label className="block text-xs font-bold text-slate-700 mb-1.5">Subtitle</label>
                       <input
                         type="text"
-                        value={adminBannerSlides[activeSlideAdminIdx].subtitle || ''}
+                        value={adminBannerSlides[activeSlideAdminIdx]?.subtitle || ''}
                         onChange={(e) => handleUpdateSlideField(activeSlideAdminIdx, 'subtitle', e.target.value)}
-                        placeholder="e.g. 10 Rapid Questions • Instant UPI Payouts to Top Winners"
+                        placeholder=""
                         className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs bg-white text-slate-900"
                         style={{ backgroundColor: '#FFFFFF' }}
                       />
@@ -3662,9 +3667,9 @@ Explanation: Explanation details for the contestant.`}
                       <label className="block text-xs font-bold text-slate-700 mb-1.5">Badge Tag</label>
                       <input
                         type="text"
-                        value={adminBannerSlides[activeSlideAdminIdx].badge || ''}
+                        value={adminBannerSlides[activeSlideAdminIdx]?.badge || ''}
                         onChange={(e) => handleUpdateSlideField(activeSlideAdminIdx, 'badge', e.target.value)}
-                        placeholder="e.g. MEGA CASH POOL"
+                        placeholder=""
                         className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs bg-white text-slate-900 font-mono text-[11px]"
                         style={{ backgroundColor: '#FFFFFF' }}
                       />
@@ -3676,9 +3681,9 @@ Explanation: Explanation details for the contestant.`}
                         <label className="block text-xs font-bold text-slate-700 mb-1.5">Button Text</label>
                         <input
                           type="text"
-                          value={adminBannerSlides[activeSlideAdminIdx].actionText ?? ''}
+                          value={adminBannerSlides[activeSlideAdminIdx]?.actionText ?? ''}
                           onChange={(e) => handleUpdateSlideField(activeSlideAdminIdx, 'actionText', e.target.value)}
-                          placeholder="e.g. Join Now"
+                          placeholder=""
                           className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs bg-white text-slate-900 font-bold"
                           style={{ backgroundColor: '#FFFFFF' }}
                         />
@@ -3686,7 +3691,7 @@ Explanation: Explanation details for the contestant.`}
                       <div>
                         <label className="block text-xs font-bold text-slate-700 mb-1.5">Target Page</label>
                         <select
-                          value={adminBannerSlides[activeSlideAdminIdx].actionTab || 'quiz_arena'}
+                          value={adminBannerSlides[activeSlideAdminIdx]?.actionTab || 'quiz_arena'}
                           onChange={(e) => handleUpdateSlideField(activeSlideAdminIdx, 'actionTab', e.target.value as any)}
                           className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs bg-white text-slate-900 font-medium cursor-pointer"
                           style={{ backgroundColor: '#FFFFFF' }}
@@ -3704,14 +3709,14 @@ Explanation: Explanation details for the contestant.`}
                   </div>
 
                   {/* Optional Custom URL input if Custom URL option selected */}
-                  {adminBannerSlides[activeSlideAdminIdx].actionTab === 'custom_url' && (
+                  {adminBannerSlides[activeSlideAdminIdx]?.actionTab === 'custom_url' && (
                     <div className="pt-1">
                       <label className="block text-xs font-bold text-slate-700 mb-1.5">Custom URL Link</label>
                       <input
                         type="url"
-                        value={adminBannerSlides[activeSlideAdminIdx].customUrl || ''}
+                        value={adminBannerSlides[activeSlideAdminIdx]?.customUrl || ''}
                         onChange={(e) => handleUpdateSlideField(activeSlideAdminIdx, 'customUrl', e.target.value)}
-                        placeholder="https://example.com/target-page"
+                        placeholder=""
                         className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-xs bg-white text-slate-900"
                         style={{ backgroundColor: '#FFFFFF' }}
                       />
@@ -3728,16 +3733,28 @@ Explanation: Explanation details for the contestant.`}
                     <input
                       ref={bannerFileInputRef}
                       type="file"
-                      accept="image/*"
+                      accept="image/*,image/gif,.gif"
                       className="hidden"
                       onChange={async (e) => {
                         const file = e.target.files?.[0];
                         if (file) {
                           try {
-                            const compressed = await compressImage(file, 1200, 600, 0.75);
-                            handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', compressed);
-                            soundFx.playSuccess();
-                            showToast(`Image uploaded for Slide ${activeSlideAdminIdx + 1}!`);
+                            const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif') || isGifImage(file);
+                            if (isGif) {
+                              const reader = new FileReader();
+                              reader.onload = () => {
+                                const res = reader.result as string;
+                                handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', res);
+                                soundFx.playSuccess();
+                                showToast(`Animated GIF uploaded for Banner ${activeSlideAdminIdx + 1}!`);
+                              };
+                              reader.readAsDataURL(file);
+                            } else {
+                              const compressed = await compressImage(file, 1200, 600, 0.75);
+                              handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', compressed);
+                              soundFx.playSuccess();
+                              showToast(`Image uploaded for Banner ${activeSlideAdminIdx + 1}!`);
+                            }
                           } catch {
                             showToast('Failed to process image');
                           } finally {
@@ -3747,7 +3764,7 @@ Explanation: Explanation details for the contestant.`}
                       }}
                     />
 
-                    {adminBannerSlides[activeSlideAdminIdx].imageUrl ? (
+                    {adminBannerSlides[activeSlideAdminIdx]?.imageUrl ? (
                       /* Uploaded Image Preview with 'X' Remove Button at top-right */
                       <div className="relative w-full h-44 sm:h-52 rounded-2xl overflow-hidden border border-slate-200 bg-slate-900 flex items-center justify-center group shadow-2xs">
                         <img
@@ -3760,7 +3777,7 @@ Explanation: Explanation details for the contestant.`}
                           onClick={(e) => {
                             e.stopPropagation();
                             handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', '');
-                            showToast(`Image removed for Slide ${activeSlideAdminIdx + 1}`);
+                            showToast(`Image removed for Banner ${activeSlideAdminIdx + 1}`);
                           }}
                           className="absolute top-2.5 right-2.5 w-7 h-7 rounded-full bg-slate-900/80 hover:bg-rose-600 text-white flex items-center justify-center transition-all cursor-pointer shadow-md z-10"
                           title="Remove Image"
@@ -3781,10 +3798,22 @@ Explanation: Explanation details for the contestant.`}
                           const file = e.dataTransfer.files?.[0];
                           if (file) {
                             try {
-                              const compressed = await compressImage(file, 1200, 600, 0.75);
-                              handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', compressed);
-                              soundFx.playSuccess();
-                              showToast(`Image uploaded for Slide ${activeSlideAdminIdx + 1}!`);
+                              const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif') || isGifImage(file);
+                              if (isGif) {
+                                const reader = new FileReader();
+                                reader.onload = () => {
+                                  const res = reader.result as string;
+                                  handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', res);
+                                  soundFx.playSuccess();
+                                  showToast(`Animated GIF uploaded for Banner ${activeSlideAdminIdx + 1}!`);
+                                };
+                                reader.readAsDataURL(file);
+                              } else {
+                                const compressed = await compressImage(file, 1200, 600, 0.75);
+                                handleUpdateSlideField(activeSlideAdminIdx, 'imageUrl', compressed);
+                                soundFx.playSuccess();
+                                showToast(`Image uploaded for Banner ${activeSlideAdminIdx + 1}!`);
+                              }
                             } catch {
                               showToast('Failed to process image');
                             }

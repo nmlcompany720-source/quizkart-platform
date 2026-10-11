@@ -48,7 +48,7 @@ import { soundFx } from '../utils/audio';
 import { ScheduledTimePicker } from './ScheduledTimePicker';
 import { saveContestToFirestore, removeContestFromFirestore } from '../firebase';
 import { getCountdown, parseTargetTimestamp, formatCountdown } from '../utils/timerUtils';
-import { compressImage, sanitizeContestSynchronous } from '../utils/imageCompressor';
+import { compressImage, sanitizeContestSynchronous, isGifImage } from '../utils/imageCompressor';
 
 // Real-time Ticking Timer sub-component for Active & Scheduled Contest Cards
 const ContestCardTimers: React.FC<{ scheduledTime?: string; endTime?: string }> = ({ scheduledTime, endTime }) => {
@@ -283,8 +283,8 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-      if (isGif && file.size <= 450_000) {
+      const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif') || isGifImage(file);
+      if (isGif) {
         const reader = new FileReader();
         reader.onload = () => {
           const res = reader.result as string;
@@ -294,14 +294,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
         };
         reader.readAsDataURL(file);
       } else {
-        const compressed = await compressImage(file, 800, 600, 0.72);
+        const compressed = await compressImage(file, 800, 600, 0.75);
         setTempImageUrl(compressed);
         soundFx.playSuccess();
-        if (isGif) {
-          onShowToast('GIF banner optimized to fit cloud storage limits (<450KB)', 'info');
-        } else {
-          onShowToast('Image optimized & loaded!', 'info');
-        }
+        onShowToast('Image optimized & loaded!', 'info');
       }
     } catch {
       onShowToast('Failed to optimize image', 'error');
@@ -450,8 +446,8 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const file = e.target.files?.[0];
     if (file) {
       try {
-        const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-        if (isGif && file.size <= 450_000) {
+        const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif') || isGifImage(file);
+        if (isGif) {
           const reader = new FileReader();
           reader.onload = () => {
             const res = reader.result as string;
@@ -461,14 +457,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
           };
           reader.readAsDataURL(file);
         } else {
-          const compressed = await compressImage(file, 800, 600, 0.72);
+          const compressed = await compressImage(file, 800, 600, 0.75);
           setProdImageUrl(compressed);
           soundFx.playSuccess();
-          if (isGif) {
-            onShowToast('GIF banner optimized to fit cloud limits (<450KB)', 'info');
-          } else {
-            onShowToast('Product image uploaded & optimized successfully!', 'success');
-          }
+          onShowToast('Product image uploaded & optimized successfully!', 'success');
         }
       } catch {
         onShowToast('Failed to optimize product image', 'error');
@@ -484,8 +476,8 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const file = e.target.files?.[0];
     if (file) {
       try {
-        const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-        if (isGif && file.size <= 450_000) {
+        const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif') || isGifImage(file);
+        if (isGif) {
           const reader = new FileReader();
           reader.onload = () => {
             const res = reader.result as string;
@@ -495,14 +487,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
           };
           reader.readAsDataURL(file);
         } else {
-          const compressed = await compressImage(file, 800, 600, 0.72);
+          const compressed = await compressImage(file, 800, 600, 0.75);
           setCashImageUrl(compressed);
           soundFx.playSuccess();
-          if (isGif) {
-            onShowToast('GIF banner optimized to fit cloud limits (<450KB)', 'info');
-          } else {
-            onShowToast('Tournament banner uploaded & optimized successfully!', 'success');
-          }
+          onShowToast('Tournament banner uploaded & optimized successfully!', 'success');
         }
       } catch {
         onShowToast('Failed to optimize tournament banner', 'error');
@@ -520,20 +508,21 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
   const isRatioHealthy = easyCount >= 3 && mediumCount >= 3 && hardCount >= 3 && expertCount >= 1;
   const answeredIds = getAnsweredQuestionIds();
 
-  // Save contests update helper with immediate Firestore sync and sanitization
+  // Save contests update helper with immediate state response and non-blocking background Firestore sync
   const updateContestList = (newList: ActiveContest[]) => {
     let deletedList: string[] = [];
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
     const filteredList = (newList || []).filter(c => c && c.id && !deletedList.includes(c.id));
-    const sanitizedList = filteredList.map(sanitizeContestSynchronous);
-    setContests(sanitizedList);
-    saveActiveContests(sanitizedList);
+    // Keep user's full uploaded images and GIFs permanently in state and storage
+    setContests(filteredList);
+    saveActiveContests(filteredList);
     if (onUpdateContests) {
-      onUpdateContests(sanitizedList);
+      onUpdateContests(filteredList);
     }
-    sanitizedList.forEach(c => {
+    // Background sync to Firestore without hanging or blocking any UI actions
+    filteredList.forEach(c => {
       saveContestToFirestore(c).catch(() => {});
     });
   };
@@ -1407,30 +1396,23 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     onShowToast(`⏸️ Contest "${contest.title}" marked as EXPIRED.`, 'info');
   };
 
-  // Delete contest permanently (from Firestore, state, and storage) with 1-second circular loading spinner
+  // Delete contest permanently (from Firestore, state, and storage) immediately without hang/freeze
   const handleDeleteContest = (id: string) => {
     if (deletingContestId) return;
     setDeletingContestId(id);
     soundFx.playClick();
 
-    setTimeout(async () => {
-      // 1. Add to permanent deleted blacklist in localStorage so cloud sync never resurrects it
-      try {
-        const deletedList: string[] = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
-        if (!deletedList.includes(id)) {
-          deletedList.push(id);
-          localStorage.setItem('quizkart_deleted_contests', JSON.stringify(deletedList));
-        }
-      } catch {}
-
-      // 2. Delete permanently from Firestore
-      try {
-        await removeContestFromFirestore(id);
-      } catch (err) {
-        console.warn('Error removing contest from Firestore:', err);
+    // 1. Add to permanent deleted blacklist in localStorage so cloud sync never resurrects it
+    try {
+      const deletedList: string[] = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
+      if (!deletedList.includes(id)) {
+        deletedList.push(id);
+        localStorage.setItem('quizkart_deleted_contests', JSON.stringify(deletedList));
       }
+    } catch {}
 
-      // 3. Immediately purge from local contests and sync to global state
+    // 2. Immediately purge from local contests and sync to global state (snappy 150ms feedback)
+    setTimeout(() => {
       const filtered = (contests || []).filter(c => c && c.id !== id);
 
       if (activeContest?.id === id) {
@@ -1518,11 +1500,15 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       }
 
       onDeleteContest?.(id);
-
       setDeletingContestId(null);
       soundFx.playSuccess();
       onShowToast('Tournament permanently deleted.', 'info');
-    }, 1000);
+
+      // 3. Delete permanently from Firestore asynchronously in background (never blocks UI)
+      removeContestFromFirestore(id).catch(err => {
+        console.warn('Error removing contest from Firestore in background:', err);
+      });
+    }, 150);
   };
 
   const labelGradientStyle: React.CSSProperties = {
@@ -2634,8 +2620,8 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                           const file = e.target.files?.[0];
                           if (file) {
                             try {
-                              const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
-                              if (isGif && file.size <= 450_000) {
+                              const isGif = file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif') || isGifImage(file);
+                              if (isGif) {
                                 const reader = new FileReader();
                                 reader.onload = () => {
                                   const res = reader.result as string;
@@ -2645,14 +2631,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                                 };
                                 reader.readAsDataURL(file);
                               } else {
-                                const compressed = await compressImage(file, 800, 600, 0.72);
+                                const compressed = await compressImage(file, 800, 600, 0.75);
                                 setEditImageUrl(compressed);
                                 soundFx.playSuccess();
-                                if (isGif) {
-                                  onShowToast('GIF optimized to fit cloud limits (<450KB)', 'info');
-                                } else {
-                                  onShowToast('Image optimized & loaded for editing!', 'info');
-                                }
+                                onShowToast('Image optimized & loaded for editing!', 'info');
                               }
                             } catch {
                               onShowToast('Failed to optimize image', 'error');

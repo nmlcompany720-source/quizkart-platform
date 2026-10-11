@@ -914,33 +914,28 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
 
             <div className="flex-1 overflow-y-auto px-3 py-2 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
               <table className="w-full text-left text-xs bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                {/* Table headers: official brand gradient background, white text */}
+                {/* Table headers: pure white background (#FFFFFF), clean dark black text */}
                 <thead 
-                  className="sticky top-0 text-white text-[10px] uppercase font-bold select-none rounded-t-lg overflow-hidden"
-                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                  className="sticky top-0 text-[10px] uppercase font-extrabold select-none border-b border-slate-200"
+                  style={{ backgroundColor: '#FFFFFF', color: '#000000' }}
                 >
-                  <tr>
-                    <th className="py-2 px-2.5 text-white">#</th>
-                    <th className="py-2 px-2 text-white">USER</th>
-                    <th className="py-2 px-2 text-white">SCORE</th>
-                    <th className="py-2 text-right pr-2.5 text-white">TIME</th>
+                  <tr className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                    <th className="py-2 px-2.5 text-black font-extrabold" style={{ color: '#000000' }}>#</th>
+                    <th className="py-2 px-2 text-black font-extrabold" style={{ color: '#000000' }}>USER</th>
+                    <th className="py-2 px-2 text-black font-extrabold" style={{ color: '#000000' }}>SCORE</th>
+                    <th className="py-2 text-right pr-2.5 text-black font-extrabold" style={{ color: '#000000' }}>TIME</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-[11px] bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                  {/* Rank 1: Winner highlight with official brand gradient accent */}
+                  {/* Rank 1: Winner row with normal regular weight (#4B5563) matching ranks 2-5 */}
                   <tr 
-                    className="font-semibold transition-colors"
+                    className="transition-colors"
                     style={{ background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.12) 0%, rgba(65, 124, 244, 0.12) 35%, rgba(58, 129, 245, 0.12) 65%, rgba(32, 165, 172, 0.12) 100%)' }}
                   >
-                    <td className="py-2.5 px-2.5 font-bold">
-                      <span 
-                        className="w-4.5 h-4.5 rounded text-white font-black text-[10px] flex items-center justify-center shadow-2xs"
-                        style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
-                      >
-                        1
-                      </span>
+                    <td className="py-2.5 px-2.5 text-[#4B5563] font-normal" style={{ color: '#4B5563', fontWeight: 400 }}>
+                      1
                     </td>
-                    <td className="py-2.5 px-2 text-slate-900 truncate max-w-[90px] font-bold">Rohan S.</td>
+                    <td className="py-2.5 px-2 text-[#4B5563] truncate max-w-[90px] font-normal" style={{ color: '#4B5563', fontWeight: 400 }}>Rohan S.</td>
                     <td className="py-2.5 px-2 font-black text-[#417CF4]">10/10</td>
                     <td className="py-2.5 text-right pr-2.5 font-mono text-slate-700">4m 12s</td>
                   </tr>

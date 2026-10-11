@@ -47,7 +47,7 @@ export async function compressImage(
   input: File | Blob | string,
   maxWidth = 800,
   maxHeight = 800,
-  quality = 0.72
+  quality = 0.75
 ): Promise<string> {
   if (!input) return '';
 
@@ -56,25 +56,19 @@ export async function compressImage(
     return input;
   }
 
-  // If animated GIF file or data URL:
-  // If within safe size limit (<= 450KB), preserve all animation frames intact!
+  // Preserve animated GIF files (.gif):
+  // NEVER flatten animated GIFs through HTML5 Canvas! Canvas converts GIFs to static single-frame JPEGs.
   if (isGifImage(input)) {
     if (typeof input === 'string') {
-      if (input.length <= MAX_DATA_URL_LENGTH) {
-        return input;
-      }
-      // If oversized GIF string (>450KB base64), fall through to canvas compression
-      // so it converts to an optimized ~40KB image rather than crashing Firestore
-    } else if (typeof Blob !== 'undefined' && input instanceof Blob) {
-      if (input.size <= 450_000) {
-        return new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = () => reject(new Error('Failed to read GIF file'));
-          reader.readAsDataURL(input);
-        });
-      }
-      // If oversized GIF file (>450KB), fall through to canvas compression
+      return input;
+    }
+    if (typeof Blob !== 'undefined' && input instanceof Blob) {
+      return new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error('Failed to read animated GIF file'));
+        reader.readAsDataURL(input);
+      });
     }
   }
 
@@ -289,16 +283,17 @@ export function sanitizeContestSynchronous(contest: ActiveContest): ActiveContes
     copy = { ...contest };
   }
 
+  // Preserve user images and GIFs permanently. Only guard against astronomical strings (> 15MB) that could crash the browser tab.
   if (copy.cashConfig?.cashImageUrl && typeof copy.cashConfig.cashImageUrl === 'string') {
-    if (copy.cashConfig.cashImageUrl.startsWith('data:image/') && copy.cashConfig.cashImageUrl.length > MAX_DATA_URL_LENGTH) {
-      console.warn(`[Firestore Safeguard] Sanitizing oversized cash image (${copy.cashConfig.cashImageUrl.length} chars) for contest ${copy.id}`);
+    if (copy.cashConfig.cashImageUrl.startsWith('data:image/') && copy.cashConfig.cashImageUrl.length > 15_000_000) {
+      console.warn(`[Safeguard] Trimming astronomical data URL (${copy.cashConfig.cashImageUrl.length} chars) for contest ${copy.id}`);
       copy.cashConfig.cashImageUrl = DEFAULT_CASH_IMAGE;
     }
   }
 
   if (copy.productConfig?.productImageUrl && typeof copy.productConfig.productImageUrl === 'string') {
-    if (copy.productConfig.productImageUrl.startsWith('data:image/') && copy.productConfig.productImageUrl.length > MAX_DATA_URL_LENGTH) {
-      console.warn(`[Firestore Safeguard] Sanitizing oversized product image (${copy.productConfig.productImageUrl.length} chars) for contest ${copy.id}`);
+    if (copy.productConfig.productImageUrl.startsWith('data:image/') && copy.productConfig.productImageUrl.length > 15_000_000) {
+      console.warn(`[Safeguard] Trimming astronomical data URL (${copy.productConfig.productImageUrl.length} chars) for contest ${copy.id}`);
       copy.productConfig.productImageUrl = DEFAULT_PRODUCT_IMAGE;
     }
   }
@@ -309,7 +304,7 @@ export function sanitizeContestSynchronous(contest: ActiveContest): ActiveContes
 /**
  * Prepares a contest document for Firestore writes:
  * Preserves animated GIFs and custom images intact while ensuring safety.
- * For oversized images (>450KB data URL), compresses them so they can be saved safely.
+ * For oversized images (>750KB data URL), compresses them so they can be saved safely.
  */
 export async function prepareContestForFirestore(contest: ActiveContest): Promise<ActiveContest> {
   if (!contest || !contest.id) return contest;
@@ -321,34 +316,35 @@ export async function prepareContestForFirestore(contest: ActiveContest): Promis
     copy = { ...contest };
   }
 
-  // If cash image is an oversized data URL (> 450KB), compress it down to ~40KB
+  // If cash image is an oversized non-GIF data URL (> 750KB), optimize it down to ~40KB for the Firestore copy
   if (copy.cashConfig?.cashImageUrl && copy.cashConfig.cashImageUrl.startsWith('data:image/')) {
-    if (copy.cashConfig.cashImageUrl.length > MAX_DATA_URL_LENGTH) {
+    if (copy.cashConfig.cashImageUrl.length > 750_000 && !isGifImage(copy.cashConfig.cashImageUrl)) {
       try {
         const compressed = await compressImage(copy.cashConfig.cashImageUrl, 800, 600, 0.72);
-        copy.cashConfig.cashImageUrl = compressed.length <= MAX_DATA_URL_LENGTH ? compressed : DEFAULT_CASH_IMAGE;
-      } catch {
-        copy.cashConfig.cashImageUrl = DEFAULT_CASH_IMAGE;
-      }
+        copy.cashConfig.cashImageUrl = compressed;
+      } catch {}
     }
   }
 
-  // If product image is an oversized data URL (> 450KB), compress it down to ~40KB
+  // If product image is an oversized non-GIF data URL (> 750KB), optimize it down to ~40KB for the Firestore copy
   if (copy.productConfig?.productImageUrl && copy.productConfig.productImageUrl.startsWith('data:image/')) {
-    if (copy.productConfig.productImageUrl.length > MAX_DATA_URL_LENGTH) {
+    if (copy.productConfig.productImageUrl.length > 750_000 && !isGifImage(copy.productConfig.productImageUrl)) {
       try {
         const compressed = await compressImage(copy.productConfig.productImageUrl, 800, 600, 0.72);
-        copy.productConfig.productImageUrl = compressed.length <= MAX_DATA_URL_LENGTH ? compressed : DEFAULT_PRODUCT_IMAGE;
-      } catch {
-        copy.productConfig.productImageUrl = DEFAULT_PRODUCT_IMAGE;
-      }
+        copy.productConfig.productImageUrl = compressed;
+      } catch {}
     }
   }
 
-  // Hard safety check: ensure the document JSON does not exceed Firestore's limit
+  // Hard safety check: ensure the document JSON does not exceed Firestore's 1MB limit for the write payload
   try {
-    if (JSON.stringify(copy).length > MAX_DOC_JSON_LENGTH) {
-      return sanitizeContestSynchronous(copy);
+    if (JSON.stringify(copy).length > 850_000) {
+      if (copy.cashConfig?.cashImageUrl?.startsWith('data:image/')) {
+        copy.cashConfig.cashImageUrl = DEFAULT_CASH_IMAGE;
+      }
+      if (copy.productConfig?.productImageUrl?.startsWith('data:image/')) {
+        copy.productConfig.productImageUrl = DEFAULT_PRODUCT_IMAGE;
+      }
     }
   } catch {}
 
