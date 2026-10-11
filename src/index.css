@@ -1,0 +1,119 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+}
+
+.brand-gradient {
+  background: linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%);
+}
+
+.brand-text-gradient {
+  background: linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.gemini-gradient {
+  background: linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%);
+}
+
+.gemini-text-gradient {
+  background: linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.gemini-glow {
+  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.25);
+}
+
+.gemini-glow:hover {
+  box-shadow: 0 6px 20px rgba(79, 70, 229, 0.35);
+}
+
+.gemini-glow-subtle {
+  box-shadow: 0 2px 10px rgba(99, 102, 241, 0.12);
+}
+
+.brand-gradient-focus-ring {
+  box-shadow: 0 0 14px rgba(37, 99, 235, 0.6) !important;
+}
+
+.image1-gradient {
+  background: linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%);
+}
+
+.image1-text-gradient {
+  background: linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.pure-white-input,
+.pure-white-input:focus,
+.pure-white-input:active,
+.pure-white-input:hover,
+.pure-white-input:-webkit-autofill,
+.pure-white-input:-webkit-autofill:hover,
+.pure-white-input:-webkit-autofill:focus,
+.pure-white-input:-webkit-autofill:active {
+  background-color: #FFFFFF !important;
+  -webkit-box-shadow: 0 0 0px 1000px #FFFFFF inset !important;
+  box-shadow: 0 0 0px 1000px #FFFFFF inset !important;
+  -webkit-text-fill-color: #0F172A !important;
+}
+
+.no-calendar-icon::-webkit-inner-spin-button,
+.no-calendar-icon::-webkit-clear-button {
+  display: none !important;
+  -webkit-appearance: none !important;
+  appearance: none !important;
+}
+
+.no-calendar-icon::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+}
+
+@keyframes livePulse {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(255, 255, 255, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
+  }
+}
+
+.animate-live-pulse {
+  animation: livePulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes marquee {
+  0% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-marquee {
+  display: inline-flex;
+  animation: marquee 24s linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
+
+

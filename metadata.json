@@ -1,0 +1,6 @@
+{
+  "name": "QuizKart.in",
+  "description": "Skill-based daily quiz platform where users compete on speed and accuracy to win e-commerce products and UPI cashbacks with full financial transparency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

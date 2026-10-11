@@ -1,0 +1,465 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User account profile and wallet data",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth User UID",
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the user",
+          "maxLength": 100
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address",
+          "maxLength": 150
+        },
+        "mobile": {
+          "type": "string",
+          "description": "Indian Mobile phone number",
+          "maxLength": 20
+        },
+        "upiId": {
+          "type": "string",
+          "description": "UPI VPA ID for winnings transfer",
+          "maxLength": 80
+        },
+        "walletBalance": {
+          "type": "number",
+          "description": "Current wallet credit balance in Rupees"
+        },
+        "quizzesPlayed": {
+          "type": "number",
+          "description": "Total quizzes played"
+        },
+        "totalWonAmount": {
+          "type": "number",
+          "description": "Total cash winnings in Rupees"
+        },
+        "productsWonCount": {
+          "type": "number",
+          "description": "Total physical products won"
+        },
+        "isRegistered": {
+          "type": "boolean",
+          "description": "Registration completion flag"
+        },
+        "isBlocked": {
+          "type": "boolean",
+          "description": "Flag indicating if the user account has been blocked by Admin"
+        },
+        "quizActivity": {
+          "type": "array",
+          "description": "List of user quiz attempt activity records"
+        },
+        "blockReason": {
+          "type": "string",
+          "description": "Reason for account block",
+          "maxLength": 200
+        },
+        "registrationDate": {
+          "type": "string",
+          "description": "Formatted registration date and time",
+          "maxLength": 60
+        },
+        "passwordStatus": {
+          "type": "string",
+          "description": "Password security status display",
+          "maxLength": 60
+        },
+        "hasPassword": {
+          "type": "boolean",
+          "description": "Whether the user has configured a password"
+        },
+        "avatarUrl": {
+          "type": "string",
+          "description": "Selected user avatar image URL",
+          "maxLength": 500
+        },
+        "countryCode": {
+          "type": "string",
+          "description": "Country calling code (e.g. +91)",
+          "maxLength": 10
+        },
+        "kycStatus": {
+          "type": "string",
+          "enum": ["Verified", "Pending", "Unverified"],
+          "description": "Government ID verification status"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of account creation",
+          "maxLength": 50
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update",
+          "maxLength": 50
+        }
+      },
+      "required": ["uid", "name", "email", "walletBalance"]
+    },
+    "Question": {
+      "title": "Quiz Question",
+      "description": "Individual multiple choice quiz question",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "number",
+          "description": "Sequential numerical ID of the question"
+        },
+        "question": {
+          "type": "string",
+          "description": "The question text",
+          "maxLength": 500
+        },
+        "correctIndex": {
+          "type": "number",
+          "description": "0-based index of the correct option (0 to 3)"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["General Knowledge", "Science & Tech", "Indian Heritage", "Current Affairs", "Geography & Nature"],
+          "description": "Question category",
+          "maxLength": 50
+        },
+        "explanation": {
+          "type": "string",
+          "description": "Educational reasoning for the answer",
+          "maxLength": 500
+        },
+        "difficulty": {
+          "type": "string",
+          "enum": ["Easy", "Medium", "Hard", "Expert"],
+          "description": "Difficulty tier",
+          "maxLength": 20
+        }
+      },
+      "required": ["id", "question", "correctIndex", "category", "difficulty"]
+    },
+    "ActiveContest": {
+      "title": "Active Contest",
+      "description": "Tournament contest instance (cash or product)",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique Contest ID",
+          "maxLength": 64
+        },
+        "type": {
+          "type": "string",
+          "enum": ["cash", "product"],
+          "description": "Contest category",
+          "maxLength": 20
+        },
+        "title": {
+          "type": "string",
+          "description": "Contest title",
+          "maxLength": 150
+        },
+        "entryFee": {
+          "type": "number",
+          "description": "Entry fee in Rupees"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "scheduled", "completed", "full"],
+          "description": "Lifecycle status",
+          "maxLength": 20
+        },
+        "scheduledTime": {
+          "type": "string",
+          "description": "Scheduled start time",
+          "maxLength": 80
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp",
+          "maxLength": 50
+        }
+      },
+      "required": ["id", "type", "entryFee", "status"]
+    },
+    "LeaderboardEntry": {
+      "title": "Leaderboard Entry",
+      "description": "Ranked tournament participant score",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique score submission ID",
+          "maxLength": 64
+        },
+        "rank": {
+          "type": "number",
+          "description": "Leaderboard rank"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Participant display name",
+          "maxLength": 100
+        },
+        "avatar": {
+          "type": "string",
+          "description": "Avatar initials or image URL",
+          "maxLength": 200
+        },
+        "score": {
+          "type": "number",
+          "description": "Number of correctly answered questions"
+        },
+        "totalQuestions": {
+          "type": "number",
+          "description": "Total questions in quiz"
+        },
+        "timeTakenSeconds": {
+          "type": "number",
+          "description": "Time elapsed in seconds"
+        },
+        "formattedTime": {
+          "type": "string",
+          "description": "Formatted time display",
+          "maxLength": 20
+        },
+        "city": {
+          "type": "string",
+          "description": "City of residence",
+          "maxLength": 60
+        },
+        "state": {
+          "type": "string",
+          "description": "State of residence",
+          "maxLength": 60
+        },
+        "rewardText": {
+          "type": "string",
+          "description": "Reward description",
+          "maxLength": 150
+        },
+        "rewardType": {
+          "type": "string",
+          "enum": ["product", "cashback", "none"],
+          "description": "Type of reward",
+          "maxLength": 20
+        },
+        "rewardAmount": {
+          "type": "number",
+          "description": "Cash prize amount if applicable"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Auth UID of participant",
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Display timestamp",
+          "maxLength": 40
+        },
+        "submittedAt": {
+          "type": "string",
+          "description": "ISO timestamp of submission",
+          "maxLength": 50
+        }
+      },
+      "required": ["id", "userName", "score", "totalQuestions", "timeTakenSeconds"]
+    },
+    "QuizAttempt": {
+      "title": "Quiz Attempt Result",
+      "description": "Individual user quiz completion record",
+      "type": "object",
+      "properties": {
+        "attemptId": {
+          "type": "string",
+          "description": "Unique attempt ID",
+          "maxLength": 64
+        },
+        "userId": {
+          "type": "string",
+          "description": "User UID who took the quiz",
+          "maxLength": 128
+        },
+        "quizDate": {
+          "type": "string",
+          "description": "Date of the quiz",
+          "maxLength": 40
+        },
+        "score": {
+          "type": "number",
+          "description": "Points scored"
+        },
+        "totalQuestions": {
+          "type": "number",
+          "description": "Total questions in attempt"
+        },
+        "timeTakenSeconds": {
+          "type": "number",
+          "description": "Duration in seconds"
+        },
+        "rank": {
+          "type": "number",
+          "description": "Achieved rank"
+        },
+        "rewardWon": {
+          "type": "string",
+          "description": "Won prize title",
+          "maxLength": 150
+        },
+        "rewardType": {
+          "type": "string",
+          "enum": ["product", "cashback", "none"],
+          "description": "Type of prize",
+          "maxLength": 20
+        },
+        "submittedAt": {
+          "type": "string",
+          "description": "ISO timestamp",
+          "maxLength": 50
+        }
+      },
+      "required": ["attemptId", "userId", "score", "totalQuestions", "timeTakenSeconds"]
+    },
+    "AppSetting": {
+      "title": "Application Setting",
+      "description": "Global application configuration item",
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Config key identifier",
+          "maxLength": 64
+        },
+        "data": {
+          "type": "string",
+          "description": "JSON stringified or structured configuration payload",
+          "maxLength": 5000
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of update",
+          "maxLength": 50
+        }
+      },
+      "required": ["key"]
+    },
+    "DepositRequest": {
+      "title": "Deposit Request",
+      "description": "User wallet deposit request record",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique deposit ID",
+          "maxLength": 64
+        },
+        "userName": {
+          "type": "string",
+          "description": "Full name of contestant",
+          "maxLength": 100
+        },
+        "phone": {
+          "type": "string",
+          "description": "Contact mobile phone",
+          "maxLength": 30
+        },
+        "amount": {
+          "type": "number",
+          "description": "Deposit amount in Rupees"
+        },
+        "utrNumber": {
+          "type": "string",
+          "description": "Bank UTR transaction ref",
+          "maxLength": 60
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected"],
+          "description": "Verification status",
+          "maxLength": 20
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Timestamp string",
+          "maxLength": 50
+        }
+      },
+      "required": ["id", "userName", "amount", "status"]
+    },
+    "SupportTicket": {
+      "title": "Support Ticket",
+      "description": "User customer support dispute ticket and messages",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Ticket ID starting from QK-TK-1001",
+          "maxLength": 60
+        },
+        "userName": {
+          "type": "string",
+          "description": "User full name",
+          "maxLength": 100
+        },
+        "userEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address",
+          "maxLength": 150
+        },
+        "category": {
+          "type": "string",
+          "description": "Query category",
+          "maxLength": 60
+        },
+        "status": {
+          "type": "string",
+          "description": "Ticket status",
+          "maxLength": 30
+        }
+      },
+      "required": ["id", "userEmail", "category", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile, balance, and KYC status"
+    },
+    "/deposits/{depositId}": {
+      "schema": { "$ref": "#/entities/DepositRequest" },
+      "description": "User wallet deposit records with pending verification status"
+    },
+    "/support_tickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/SupportTicket" },
+      "description": "Customer support tickets"
+    },
+    "/questions/{questionId}": {
+      "schema": { "$ref": "#/entities/Question" },
+      "description": "Questions bank for quiz tournaments"
+    },
+    "/contests/{contestId}": {
+      "schema": { "$ref": "#/entities/ActiveContest" },
+      "description": "Tournament contests scheduled or active"
+    },
+    "/leaderboard/{entryId}": {
+      "schema": { "$ref": "#/entities/LeaderboardEntry" },
+      "description": "Public leaderboard rankings"
+    },
+    "/quiz_attempts/{attemptId}": {
+      "schema": { "$ref": "#/entities/QuizAttempt" },
+      "description": "User quiz attempt history"
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/AppSetting" },
+      "description": "Global platform configurations (today's prize, timer, pool economics)"
+    }
+  }
+}

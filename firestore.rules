@@ -1,0 +1,161 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all unknown paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // Admin authorization: hardcoded verified admin email or admin doc in database
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'nmlcompany720@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidContest(data) {
+      return (!('title' in data) || (data.title is string && data.title.size() <= 200)) &&
+             (!('type' in data) || (data.type is string && (data.type == 'cash' || data.type == 'product'))) &&
+             (!('entryFee' in data) || (data.entryFee is number && data.entryFee >= 0)) &&
+             (!('status' in data) || (data.status is string && (data.status == 'active' || data.status == 'scheduled' || data.status == 'completed' || data.status == 'full')));
+    }
+
+    function isValidQuestion(data) {
+      return data.question is string && data.question.size() > 0 && data.question.size() <= 500 &&
+             data.correctIndex is number && data.correctIndex >= 0 && data.correctIndex <= 3 &&
+             data.category is string && data.category.size() <= 80 &&
+             data.difficulty is string && data.difficulty.size() <= 30;
+    }
+
+    function isValidLeaderboard(data) {
+      return data.userName is string && data.userName.size() > 0 && data.userName.size() <= 100 &&
+             data.score is number && data.score >= 0 &&
+             data.totalQuestions is number && data.totalQuestions > 0 &&
+             data.timeTakenSeconds is number && data.timeTakenSeconds >= 0;
+    }
+
+    // Connection test document
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // Admins registry
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // User Profile: /users/{userId}
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isSignedIn() && 
+        isValidId(userId) && 
+        request.auth.uid == userId &&
+        incoming().uid == userId &&
+        incoming().name is string && incoming().name.size() <= 100 &&
+        incoming().email is string && incoming().email.size() <= 150 &&
+        incoming().walletBalance is number && incoming().walletBalance >= 0;
+
+      allow update: if isSignedIn() && 
+        isValidId(userId) && 
+        (request.auth.uid == userId || isAdmin()) &&
+        incoming().uid == userId &&
+        incoming().name is string && incoming().name.size() <= 100 &&
+        incoming().email is string && incoming().email.size() <= 150 &&
+        incoming().walletBalance is number && incoming().walletBalance >= 0;
+
+      allow delete: if isAdmin();
+    }
+
+    // Question Bank: /questions/{questionId}
+    match /questions/{questionId} {
+      allow read: if true;
+
+      allow create, update: if isValidId(questionId) && isValidQuestion(incoming());
+
+      allow delete: if isValidId(questionId);
+    }
+
+    // Contests: /contests/{contestId}
+    match /contests/{contestId} {
+      allow read: if true;
+
+      allow create, update: if isValidId(contestId) && isValidContest(incoming());
+
+      allow delete: if isValidId(contestId);
+    }
+
+    // Leaderboard Entries: /leaderboard/{entryId}
+    match /leaderboard/{entryId} {
+      allow read: if true;
+
+      allow create: if isValidId(entryId) && isValidLeaderboard(incoming());
+
+      allow update, delete: if isAdmin();
+    }
+
+    // Quiz Attempt Records: /quiz_attempts/{attemptId}
+    match /quiz_attempts/{attemptId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn() &&
+        isValidId(attemptId) &&
+        incoming().userId == request.auth.uid &&
+        incoming().score is number && incoming().score >= 0 &&
+        incoming().totalQuestions is number && incoming().totalQuestions > 0 &&
+        incoming().timeTakenSeconds is number && incoming().timeTakenSeconds >= 0;
+
+      allow update, delete: if isAdmin();
+    }
+
+    // Settings: /settings/{settingId}
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isValidId(settingId);
+    }
+
+    // Deposit Requests: /deposits/{depositId}
+    match /deposits/{depositId} {
+      allow read: if true;
+      allow create, update: if isValidId(depositId);
+      allow delete: if isValidId(depositId);
+    }
+
+    // Withdrawal Requests: /withdrawals/{withdrawalId}
+    match /withdrawals/{withdrawalId} {
+      allow read: if true;
+      allow create, update: if isValidId(withdrawalId);
+      allow delete: if isValidId(withdrawalId);
+    }
+
+    // Support Tickets: /support_tickets/{ticketId}
+    match /support_tickets/{ticketId} {
+      allow read: if true;
+      allow create, update: if isValidId(ticketId);
+      allow delete: if isValidId(ticketId);
+    }
+  }
+}
