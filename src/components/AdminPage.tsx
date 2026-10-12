@@ -49,6 +49,7 @@ import {
   UserCheck,
   Headphones,
   LifeBuoy,
+  Ticket,
   Send
 } from 'lucide-react';
 import { 
@@ -5086,7 +5087,7 @@ Explanation: Explanation details for the contestant.`}
                   if (filtered.length === 0) {
                     return (
                       <div className="py-12 text-center text-slate-400 space-y-2 border border-dashed border-slate-200 rounded-2xl border-b-0 shadow-none">
-                        <LifeBuoy className="w-8 h-8 text-slate-300 mx-auto" />
+                        <Ticket className="w-10 h-10 text-slate-300 mx-auto stroke-[1.5]" />
                         <div className="text-sm font-bold text-slate-600">No Support Tickets Found</div>
                       </div>
                     );

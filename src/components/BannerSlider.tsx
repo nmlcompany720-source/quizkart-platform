@@ -246,12 +246,24 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
               <div className="pt-1.5 sm:pt-2 relative z-30 pointer-events-auto">
                 <button
                   type="button"
+                  id="banner-cta-action-btn"
                   onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    handleAction(currentSlide.actionTab, currentSlide.customUrl);
+                    const isLeaderboardAction = 
+                      currentSlide.actionTab === 'leaderboard' ||
+                      (currentSlide.actionText && currentSlide.actionText.toLowerCase().includes('leaderboard')) ||
+                      (currentSlide.title && currentSlide.title.toLowerCase().includes('leaderboard'));
+                    const targetTab = isLeaderboardAction ? 'leaderboard' : (currentSlide.actionTab || 'quiz_arena');
+                    handleAction(targetTab, currentSlide.customUrl);
                   }}
-                  className="inline-flex items-center px-4 sm:px-6 py-2 sm:py-2.5 rounded-xl text-white font-bold text-xs sm:text-sm shadow-md active:scale-95 transition-all cursor-pointer hover:opacity-95 select-none relative z-30"
+                  onTouchStart={(e) => {
+                    e.stopPropagation();
+                  }}
+                  onTouchEnd={(e) => {
+                    e.stopPropagation();
+                  }}
+                  className="inline-flex items-center px-4 sm:px-6 py-2 sm:py-2.5 rounded-xl text-white font-bold text-xs sm:text-sm shadow-md active:scale-95 transition-all cursor-pointer hover:opacity-95 select-none relative z-30 touch-manipulation"
                   style={{
                     background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
                     boxShadow: '0 4px 14px rgba(65, 124, 244, 0.35)',

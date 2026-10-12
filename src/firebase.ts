@@ -569,6 +569,38 @@ export async function fetchLeaderboardFromFirestore(): Promise<LeaderboardEntry[
   }
 }
 
+// 30-Day Rolling Data Retention Window for Tournament History / Activity Logs
+export const RETENTION_DAYS = 30;
+export const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+export function isWithinRetentionWindow(submittedAt?: string): boolean {
+  if (!submittedAt) return true;
+  const time = new Date(submittedAt).getTime();
+  if (isNaN(time) || time <= 0) return true;
+  return (Date.now() - time) <= RETENTION_MS;
+}
+
+// Automatically prune/remove records crossing 31 days (older than 30 days) from backend storage
+export async function pruneExpiredUserQuizAttempts(userId: string): Promise<void> {
+  if (!userId || isFirestoreQuotaExceeded()) return;
+  try {
+    const q = query(collection(db, 'quiz_attempts'), where('userId', '==', userId));
+    const snap = await getDocs(q);
+    const now = Date.now();
+    snap.forEach((docItem) => {
+      const data = docItem.data();
+      if (data) {
+        const submittedTime = new Date(data.submittedAt || 0).getTime();
+        if (!isNaN(submittedTime) && submittedTime > 0 && (now - submittedTime > RETENTION_MS)) {
+          deleteDoc(doc(db, 'quiz_attempts', docItem.id)).catch(() => {});
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('Error pruning expired quiz attempts:', err);
+  }
+}
+
 export async function recordQuizAttemptInFirestore(attempt: QuizAttemptResult): Promise<void> {
   const currentUser = auth.currentUser;
   if (!currentUser || isFirestoreQuotaExceeded()) return;
@@ -589,6 +621,9 @@ export async function recordQuizAttemptInFirestore(attempt: QuizAttemptResult): 
       title: attempt.title || 'Cash Tournament',
       submittedAt: attempt.submittedAt || new Date().toISOString()
     });
+
+    // Auto-prune any historical entry crossing 31 days
+    pruneExpiredUserQuizAttempts(currentUser.uid).catch(() => {});
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.CREATE, path);
@@ -602,9 +637,19 @@ export async function fetchUserQuizAttemptsFromFirestore(userId: string): Promis
     const q = query(collection(db, path), where('userId', '==', userId));
     const snap = await getDocs(q);
     const list: QuizAttemptResult[] = [];
+    const now = Date.now();
+    const expiredDocIds: string[] = [];
+
     snap.forEach((docItem) => {
       const data = docItem.data();
       if (data) {
+        const submittedTime = new Date(data.submittedAt || 0).getTime();
+        // Check 30-day retention rule: if crosses 31 days, queue for pruning and exclude
+        if (!isNaN(submittedTime) && submittedTime > 0 && (now - submittedTime > RETENTION_MS)) {
+          expiredDocIds.push(docItem.id);
+          return;
+        }
+
         list.push({
           attemptId: data.attemptId || docItem.id,
           quizDate: data.quizDate || '',
@@ -623,6 +668,14 @@ export async function fetchUserQuizAttemptsFromFirestore(userId: string): Promis
         } as QuizAttemptResult);
       }
     });
+
+    // Automatically prune expired records from backend storage
+    if (expiredDocIds.length > 0 && !isFirestoreQuotaExceeded()) {
+      expiredDocIds.forEach((docId) => {
+        deleteDoc(doc(db, 'quiz_attempts', docId)).catch(() => {});
+      });
+    }
+
     list.sort((a, b) => {
       const timeA = new Date(a.submittedAt || 0).getTime();
       const timeB = new Date(b.submittedAt || 0).getTime();
@@ -645,9 +698,19 @@ export function subscribeToUserQuizAttempts(
     const q = query(collection(db, path), where('userId', '==', userId));
     return onSnapshot(q, (snap) => {
       const list: QuizAttemptResult[] = [];
+      const now = Date.now();
+      const expiredDocIds: string[] = [];
+
       snap.forEach((docItem) => {
         const data = docItem.data();
         if (data) {
+          const submittedTime = new Date(data.submittedAt || 0).getTime();
+          // Check 30-day retention rule: prune if record crosses 31 days
+          if (!isNaN(submittedTime) && submittedTime > 0 && (now - submittedTime > RETENTION_MS)) {
+            expiredDocIds.push(docItem.id);
+            return;
+          }
+
           list.push({
             attemptId: data.attemptId || docItem.id,
             quizDate: data.quizDate || '',
@@ -666,6 +729,14 @@ export function subscribeToUserQuizAttempts(
           } as QuizAttemptResult);
         }
       });
+
+      // Automatically prune expired entries from backend storage
+      if (expiredDocIds.length > 0 && !isFirestoreQuotaExceeded()) {
+        expiredDocIds.forEach((docId) => {
+          deleteDoc(doc(db, 'quiz_attempts', docId)).catch(() => {});
+        });
+      }
+
       list.sort((a, b) => {
         const timeA = new Date(a.submittedAt || 0).getTime();
         const timeB = new Date(b.submittedAt || 0).getTime();

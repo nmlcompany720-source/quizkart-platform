@@ -336,11 +336,8 @@ export const SupportTicketsPage: React.FC<SupportTicketsPageProps> = ({
             className="py-12 px-4 rounded-3xl border border-dashed border-slate-200 text-center space-y-3 bg-white shadow-2xs"
             style={{ backgroundColor: '#FFFFFF' }}
           >
-            <div 
-              className="w-12 h-12 rounded-2xl mx-auto flex items-center justify-center text-white shadow-sm"
-              style={{ background: BRAND_GRADIENT }}
-            >
-              <Ticket className="w-6 h-6 text-white" />
+            <div className="mx-auto flex items-center justify-center">
+              <Ticket className="w-10 h-10 text-slate-300 stroke-[1.5]" />
             </div>
             <div>
               <h3 className="text-sm font-bold text-slate-800">

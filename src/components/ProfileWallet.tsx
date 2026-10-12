@@ -674,8 +674,11 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
 
           {/* Interactive Date Range Filter Dropdown */}
           <div className="flex items-center gap-2 self-start sm:self-auto">
-            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200/90 rounded-xl px-2.5 py-1 text-xs text-slate-700 font-semibold hover:border-slate-300 transition-colors shadow-2xs">
-              <Calendar className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+            <div 
+              className="flex items-center gap-1.5 bg-white border border-slate-200/90 rounded-xl px-2.5 py-1 text-xs text-slate-700 font-semibold hover:border-slate-300 transition-colors shadow-2xs"
+              style={{ backgroundColor: '#FFFFFF' }}
+            >
+              <Trophy className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
               <select
                 id="activity-date-filter"
                 value={dateFilter}
@@ -696,7 +699,8 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
                 type="date"
                 value={customDate}
                 onChange={(e) => setCustomDate(e.target.value)}
-                className="text-xs bg-slate-50 border border-slate-200/90 rounded-xl px-2.5 py-1 text-slate-700 outline-none font-medium"
+                className="text-xs bg-white border border-slate-200/90 rounded-xl px-2.5 py-1 text-slate-700 outline-none font-medium"
+                style={{ backgroundColor: '#FFFFFF' }}
               />
             )}
           </div>
@@ -707,7 +711,8 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
           {filteredHistory.length === 0 ? (
             <div 
               id="no-recent-activity-container" 
-              className="py-8 px-4 text-center rounded-xl border border-dashed border-slate-200 bg-slate-50/60 flex items-center justify-center"
+              className="py-8 px-4 text-center rounded-xl border border-dashed border-slate-200 bg-white flex items-center justify-center shadow-2xs"
+              style={{ backgroundColor: '#FFFFFF' }}
             >
               <p className="text-xs sm:text-sm font-bold text-slate-700">No Recent Quiz Activity</p>
             </div>

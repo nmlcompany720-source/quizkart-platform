@@ -71,7 +71,8 @@ import {
   saveQuizTimerToFirestore,
   fetchBannerSlidesFromFirestore,
   saveBannerSlidesToFirestore,
-  isFirestoreQuotaExceeded
+  isFirestoreQuotaExceeded,
+  isWithinRetentionWindow
 } from './firebase';
 import { 
   getNextDepositId, 
@@ -1218,24 +1219,37 @@ export default function App() {
     }
   });
 
-  // User's Real-time Quiz Attempts (Live Tournament Records)
+  // User's Real-time Quiz Attempts (Live Tournament Records - Strict 30-Day Rolling Retention Window)
   const [userQuizAttempts, setUserQuizAttempts] = useState<QuizAttemptResult[]>(() => {
     try {
       const saved = localStorage.getItem('quizkart_user_quiz_attempts');
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return parsed.filter(a => a && isWithinRetentionWindow(a.submittedAt));
+        }
+      }
     } catch {}
     return [];
   });
 
-  // Subscribe to real-time user quiz attempts from Firestore
+  // Subscribe to real-time user quiz attempts from Firestore (Strict 30-Day Retention Window)
   useEffect(() => {
     if (!currentUser?.uid) return;
     const unsubscribe = subscribeToUserQuizAttempts(currentUser.uid, (cloudAttempts) => {
       if (cloudAttempts && cloudAttempts.length > 0) {
         setUserQuizAttempts(prev => {
           const map = new Map<string, QuizAttemptResult>();
-          prev.forEach(a => { if (a && a.attemptId) map.set(a.attemptId, a); });
-          cloudAttempts.forEach(a => { if (a && a.attemptId) map.set(a.attemptId, a); });
+          prev.forEach(a => { 
+            if (a && a.attemptId && isWithinRetentionWindow(a.submittedAt)) {
+              map.set(a.attemptId, a); 
+            }
+          });
+          cloudAttempts.forEach(a => { 
+            if (a && a.attemptId && isWithinRetentionWindow(a.submittedAt)) {
+              map.set(a.attemptId, a); 
+            }
+          });
           const merged = Array.from(map.values()).sort((a, b) => {
             const timeA = new Date(a.submittedAt || 0).getTime();
             const timeB = new Date(b.submittedAt || 0).getTime();
@@ -2212,9 +2226,10 @@ export default function App() {
 
     setLastQuizResult(attemptResult);
 
-    // Update real-time user quiz attempts immediately
+    // Update real-time user quiz attempts immediately (Strict 30-Day Retention Window)
     setUserQuizAttempts(prev => {
-      const updated = [attemptResult, ...prev.filter(a => a.attemptId !== attemptResult.attemptId)];
+      const updated = [attemptResult, ...prev.filter(a => a.attemptId !== attemptResult.attemptId)]
+        .filter(a => isWithinRetentionWindow(a.submittedAt));
       try {
         localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(updated));
       } catch {}
@@ -2414,7 +2429,10 @@ export default function App() {
                 slides={bannerSlides} 
                 isLiveContest={isContestLive}
                 onSlideAction={(tab, customUrl) => {
-                  if (tab === 'quiz_arena' || (tab as any) === 'tournaments') {
+                  if (tab === 'leaderboard' || (tab as any) === 'leaderboards') {
+                    setCurrentTab('leaderboard');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  } else if (tab === 'quiz_arena' || (tab as any) === 'tournaments') {
                     if (isContestLive) {
                       handleStartRealQuiz();
                     } else {

@@ -128,7 +128,7 @@ service cloud.firestore {
         incoming().totalQuestions is number && incoming().totalQuestions > 0 &&
         incoming().timeTakenSeconds is number && incoming().timeTakenSeconds >= 0;
 
-      allow update, delete: if isAdmin();
+      allow update, delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
     }
 
     // Settings: /settings/{settingId}

@@ -349,7 +349,7 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
           </div>
         </div>
 
-        {/* Withdrawal History Shortcut Icon Button */}
+        {/* Withdrawal History Shortcut Icon Button strictly to the far right corner with pure white background */}
         <button
           type="button"
           id="withdrawal-history-shortcut-btn"
@@ -357,7 +357,8 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
             soundFx.playClick();
             onOpenHistory();
           }}
-          className="w-9 h-9 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 hover:text-slate-900 flex items-center justify-center transition-all cursor-pointer shadow-xs active:scale-95 shrink-0 border border-slate-200/80"
+          className="w-9 h-9 rounded-xl bg-white hover:bg-slate-50 text-slate-700 hover:text-slate-900 flex items-center justify-center transition-all cursor-pointer shadow-xs active:scale-95 shrink-0 border border-slate-200 ml-auto"
+          style={{ backgroundColor: '#FFFFFF' }}
           title="Withdrawal Transaction History"
           aria-label="Withdrawal Transaction History"
         >

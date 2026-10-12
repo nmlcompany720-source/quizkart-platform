@@ -503,31 +503,23 @@ export const DepositPage: React.FC<DepositPageProps> = ({
             </h1>
           </div>
 
-          {/* History Shortcut Icon and Session Timer pill */}
-          <div className="flex items-center gap-2">
-            {onOpenHistory && (
-              <button
-                type="button"
-                id="deposit-history-btn"
-                onClick={() => {
-                  soundFx.playClick();
-                  onOpenHistory();
-                }}
-                className="w-8 h-8 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 hover:text-slate-900 flex items-center justify-center transition-all cursor-pointer shadow-xs active:scale-95 border border-slate-200/80 shrink-0"
-                title="Deposit Transaction History"
-                aria-label="Deposit Transaction History"
-              >
-                <Clock className="w-4 h-4 text-slate-700" />
-              </button>
-            )}
-
-            <div 
-              className="px-3.5 py-1 rounded-full text-white font-mono font-bold text-xs tracking-widest shadow-xs inline-flex items-center justify-center"
-              style={{ background: GRADIENT_BG }}
+          {/* History Shortcut Icon strictly to the far right corner with pure white background */}
+          {onOpenHistory && (
+            <button
+              type="button"
+              id="deposit-history-btn"
+              onClick={() => {
+                soundFx.playClick();
+                onOpenHistory();
+              }}
+              className="w-9 h-9 rounded-xl bg-white hover:bg-slate-50 text-slate-700 hover:text-slate-900 flex items-center justify-center transition-all cursor-pointer shadow-xs active:scale-95 border border-slate-200 shrink-0 ml-auto"
+              style={{ backgroundColor: '#FFFFFF' }}
+              title="Deposit Transaction History"
+              aria-label="Deposit Transaction History"
             >
-              {formatTimer(secondsRemaining)}
-            </div>
-          </div>
+              <Clock className="w-4.5 h-4.5 text-slate-700" />
+            </button>
+          )}
         </div>
 
         {/* Clean Amount Selection Card */}
@@ -642,31 +634,23 @@ export const DepositPage: React.FC<DepositPageProps> = ({
           </h1>
         </div>
 
-        {/* History Shortcut Icon and Global Continuous Timer pill */}
-        <div className="flex items-center gap-2">
-          {onOpenHistory && (
-            <button
-              type="button"
-              id="checkout-history-btn"
-              onClick={() => {
-                soundFx.playClick();
-                onOpenHistory();
-              }}
-              className="w-8 h-8 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 hover:text-slate-900 flex items-center justify-center transition-all cursor-pointer shadow-xs active:scale-95 border border-slate-200/80 shrink-0"
-              title="Deposit Transaction History"
-              aria-label="Deposit Transaction History"
-            >
-              <Clock className="w-4 h-4 text-slate-700" />
-            </button>
-          )}
-
-          <div 
-            className="px-3.5 py-1 rounded-full text-white font-mono font-bold text-xs tracking-widest shadow-xs inline-flex items-center justify-center"
-            style={{ background: GRADIENT_BG }}
+        {/* History Shortcut Icon strictly to the far right corner with pure white background */}
+        {onOpenHistory && (
+          <button
+            type="button"
+            id="checkout-history-btn"
+            onClick={() => {
+              soundFx.playClick();
+              onOpenHistory();
+            }}
+            className="w-9 h-9 rounded-xl bg-white hover:bg-slate-50 text-slate-700 hover:text-slate-900 flex items-center justify-center transition-all cursor-pointer shadow-xs active:scale-95 border border-slate-200 shrink-0 ml-auto"
+            style={{ backgroundColor: '#FFFFFF' }}
+            title="Deposit Transaction History"
+            aria-label="Deposit Transaction History"
           >
-            {formatTimer(secondsRemaining)}
-          </div>
-        </div>
+            <Clock className="w-4.5 h-4.5 text-slate-700" />
+          </button>
+        )}
       </div>
 
       {/* Error Alert */}

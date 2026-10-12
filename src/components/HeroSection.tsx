@@ -986,7 +986,21 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
       </div>
 
       {/* 4-Step Rules Bar */}
-      <section id="how-it-works-section" className="rounded-2xl bg-white border border-slate-200/90 p-5 shadow-sm">
+      <section id="how-it-works-section" className="rounded-2xl bg-white border border-slate-200/90 p-5 shadow-sm space-y-4">
+        {/* Clean, professional title above the steps */}
+        <div className="flex items-center gap-2.5 pb-2 border-b border-slate-100">
+          <div 
+            className="w-7 h-7 rounded-lg flex items-center justify-center text-white shadow-xs shrink-0"
+            style={{ background: BRAND_GRADIENT }}
+          >
+            <Zap className="w-4 h-4 text-white" />
+          </div>
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 tracking-tight">How It Works</h3>
+            <p className="text-[11px] text-slate-500 font-medium">Simple 4-step process to compete and win</p>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3.5">
           <div 
             className="flex items-center gap-3 p-3.5 rounded-xl bg-white border border-slate-200/90 shadow-xs transition-shadow hover:shadow-sm"
