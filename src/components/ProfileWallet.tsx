@@ -678,7 +678,7 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
               className="flex items-center gap-1.5 bg-white border border-slate-200/90 rounded-xl px-2.5 py-1 text-xs text-slate-700 font-semibold hover:border-slate-300 transition-colors shadow-2xs"
               style={{ backgroundColor: '#FFFFFF' }}
             >
-              <Trophy className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+              <Trophy className="w-3.5 h-3.5 text-[#417CF4] shrink-0" style={{ color: '#417CF4' }} />
               <select
                 id="activity-date-filter"
                 value={dateFilter}

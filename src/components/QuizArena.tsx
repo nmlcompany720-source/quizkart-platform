@@ -2,17 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Clock, 
   AlertTriangle, 
-  CheckCircle2, 
-  BookmarkCheck, 
-  ChevronLeft, 
-  ChevronRight, 
   X, 
   AlertCircle,
-  Shield,
-  ShieldAlert,
-  Lock,
-  Maximize2,
-  Minimize2
+  ShieldAlert
 } from 'lucide-react';
 import { Question, DailyPrizeItem, PoolBreakdown } from '../types';
 import { QUIZ_QUESTIONS } from '../data/quizData';
@@ -43,6 +35,33 @@ interface QuizArenaProps {
 
 const QUESTION_TIMER_SECONDS = 59; // Strict 59-second per-question timer
 const DEFAULT_MAX_TIME_SECONDS = 600; // 10 mins (600s) locked default master timer
+const BRAND_GRADIENT = 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)';
+
+const translateCategory = (cat: string, lang: 'English' | 'Hindi') => {
+  if (lang !== 'Hindi') return cat;
+  const map: Record<string, string> = {
+    'Science & Tech': 'विज्ञान एवं प्रौद्योगिकी',
+    'Science': 'विज्ञान',
+    'General Knowledge': 'सामान्य ज्ञान',
+    'Current Affairs': 'करेंट अफेयर्स',
+    'History': 'इतिहास',
+    'Geography': 'भूगोल',
+    'Mathematics': 'गणित',
+    'Sports': 'खेल',
+    'Technology': 'प्रौद्योगिकी',
+  };
+  return map[cat] || cat;
+};
+
+const translateDifficulty = (diff: string, lang: 'English' | 'Hindi') => {
+  if (lang !== 'Hindi') return diff;
+  const map: Record<string, string> = {
+    'Easy': 'सरल',
+    'Medium': 'मध्यम',
+    'Hard': 'कठिन',
+  };
+  return map[diff] || diff;
+};
 
 export const QuizArena: React.FC<QuizArenaProps> = ({
   questions,
@@ -72,7 +91,21 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
 
   // Two-Step Pre-Quiz Onboarding State (Language Selection & Paper Pattern Instructions)
   const [preQuizCompleted, setPreQuizCompleted] = useState<boolean>(false);
-  const [selectedLanguage, setSelectedLanguage] = useState<'English' | 'Hindi'>('English');
+  const [selectedLanguage, setSelectedLanguage] = useState<'English' | 'Hindi'>(() => {
+    try {
+      const saved = localStorage.getItem('quizkart_selected_language') || sessionStorage.getItem('quizkart_selected_language');
+      if (saved === 'Hindi' || saved === 'English') return saved;
+    } catch {}
+    return 'English';
+  });
+
+  const handleUpdateLanguage = (lang: 'English' | 'Hindi') => {
+    try {
+      localStorage.setItem('quizkart_selected_language', lang);
+      sessionStorage.setItem('quizkart_selected_language', lang);
+    } catch {}
+    setSelectedLanguage(lang);
+  };
 
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [answers, setAnswers] = useState<Record<number, number>>({});
@@ -96,8 +129,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     countdown: 3
   });
 
-  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
-
   const startTimeRef = useRef<number>(Date.now());
   const questionTimerRef = useRef<NodeJS.Timeout | null>(null);
   const totalTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -105,6 +136,12 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   const isSubmittingRef = useRef<boolean>(false);
   const isMountedRef = useRef<boolean>(false);
   const hasTriggered30SecAlertRef = useRef<boolean>(false);
+
+  // Web Audio API background voice / microphone monitoring refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const voiceAlertTriggeredRef = useRef<boolean>(false);
 
   // Synchronized refs to avoid re-binding listeners or state tearing
   const answersRef = useRef(answers);
@@ -247,24 +284,37 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isSubmittingRef.current || !preQuizCompleted) return;
 
-      // PrintScreen key
+      // PrintScreen key & Screenshot Hotkeys / Snipping tools detection -> Instantly trigger full test auto-submission
       if (e.key === 'PrintScreen' || e.code === 'PrintScreen') {
         e.preventDefault();
-        triggerSecurityBreach('Screenshot attempt blocked: PrintScreen detected.');
+        triggerSecurityBreach('Screenshot attempt blocked: PrintScreen key detected. Auto-submitting test.');
+        return;
+      }
+
+      // Mac screenshot commands: Cmd+Shift+3, Cmd+Shift+4, Cmd+Shift+5
+      // Windows Snipping Tool: Win+Shift+S (Meta+Shift+S)
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === '3' || e.key === '4' || e.key === '5' || e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        triggerSecurityBreach('Screenshot attempt blocked: Screen capture hotkey detected. Auto-submitting test.');
         return;
       }
 
       // F12 or Developer shortcut
       if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i' || e.key === 'C' || e.key === 'c' || e.key === 'J' || e.key === 'j'))) {
         e.preventDefault();
-        triggerSecurityBreach('Developer Inspect Element tools blocked.');
+        triggerSecurityBreach('Developer Inspect Element tools blocked. Auto-submitting test.');
         return;
       }
 
       // Ctrl+U (View Source), Ctrl+C (Copy), Ctrl+V (Paste), Ctrl+A (Select All), Ctrl+P (Print)
       if (e.ctrlKey || e.metaKey) {
         const key = e.key.toLowerCase();
-        if (key === 'c' || key === 'v' || key === 'u' || key === 'a' || key === 'p' || key === 's') {
+        if (key === 'p') {
+          e.preventDefault();
+          triggerSecurityBreach('Print command detected. Auto-submitting test.');
+          return false;
+        }
+        if (key === 'c' || key === 'v' || key === 'u' || key === 'a' || key === 's') {
           e.preventDefault();
           soundFx.playWrong();
           return false;
@@ -279,6 +329,50 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
       soundFx.playWrong();
       return false;
     };
+
+    // 6. Voice / Microphone Monitoring via Web Audio API
+    if (preQuizCompleted && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+        mediaStreamRef.current = stream;
+        try {
+          const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+          if (AudioContextClass) {
+            const audioCtx = new AudioContextClass();
+            audioContextRef.current = audioCtx;
+            const source = audioCtx.createMediaStreamSource(stream);
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 256;
+            source.connect(analyser);
+
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            let consecutiveSpeechSamples = 0;
+
+            audioIntervalRef.current = setInterval(() => {
+              if (isSubmittingRef.current || voiceAlertTriggeredRef.current) return;
+              analyser.getByteFrequencyData(dataArray);
+              let sum = 0;
+              for (let i = 2; i < Math.min(dataArray.length, 32); i++) {
+                sum += dataArray[i];
+              }
+              const average = sum / 30;
+              if (average > 48) {
+                consecutiveSpeechSamples++;
+                if (consecutiveSpeechSamples >= 2) {
+                  voiceAlertTriggeredRef.current = true;
+                  triggerSecurityBreach('Voice monitoring alert: Secondary device speech detected during test.');
+                }
+              } else {
+                consecutiveSpeechSamples = 0;
+              }
+            }, 800);
+          }
+        } catch (err) {
+          console.warn('AudioContext init error:', err);
+        }
+      }).catch((err) => {
+        console.warn('Microphone permission not granted:', err);
+      });
+    }
 
     // Attach all listeners
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -296,6 +390,14 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
       window.removeEventListener('keydown', handleKeyDown, true);
       document.removeEventListener('copy', handleCopy);
       document.removeEventListener('cut', handleCopy);
+
+      if (audioIntervalRef.current) clearInterval(audioIntervalRef.current);
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close().catch(() => {});
+      }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      }
     };
   }, [triggerSecurityBreach, preQuizCompleted]);
 
@@ -426,24 +528,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     }
   };
 
-  const toggleFullscreen = () => {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch(() => {});
-      setIsFullscreen(true);
-    } else {
-      if (document.exitFullscreen) {
-        document.exitFullscreen().catch(() => {});
-        setIsFullscreen(false);
-      }
-    }
-  };
-
-  const formatTotalTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
-
   const isMarked = currentQuestion?.id != null ? markedForReview.includes(currentQuestion.id) : false;
   const selectedOption = currentQuestion?.id != null ? answers[currentQuestion.id] : undefined;
   const progressPercent = Math.round(((currentIndex + 1) / Math.max(1, validQuestions.length)) * 100);
@@ -483,124 +567,77 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
         </div>
       )}
 
-      {/* TOP SECURITY & PROCTORING STATUS BAR */}
-      <div className="bg-slate-900 text-white rounded-2xl px-4 py-3 shadow-md flex flex-wrap items-center justify-between gap-3 border border-slate-800">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1.5 bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 px-3 py-1 rounded-full text-xs font-bold">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span>AI PROCTOR LIVE</span>
-          </div>
-          <div className="hidden sm:flex items-center gap-2 text-xs text-slate-300">
-            <Shield className="w-3.5 h-3.5 text-indigo-400" />
-            <span>Anti-Screen Record & Vision Shield Armed</span>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3">
-          {/* Strict Question Timer Badge */}
-          <div className="flex items-center gap-1.5 bg-amber-500/20 border border-amber-500/40 text-amber-300 px-3 py-1 rounded-full text-xs font-bold">
-            <Clock className="w-3.5 h-3.5 text-amber-400" />
-            <span>Q{currentIndex + 1} Timer: <span className="font-mono text-white text-sm">{questionSecondsRemaining}s</span></span>
-          </div>
-
-          <button
-            type="button"
-            onClick={toggleFullscreen}
-            title="Toggle Fullscreen"
-            className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors cursor-pointer text-xs flex items-center gap-1 font-bold"
-          >
-            {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-            <span className="hidden md:inline">{isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}</span>
-          </button>
+      {/* TOP SECURITY & PROCTORING STATUS BAR: Centered AI PROCTOR LIVE badge on Pure White (#FFFFFF) container */}
+      <div 
+        className="bg-white rounded-2xl px-4 py-3 shadow-xs flex items-center justify-center border border-slate-200/90"
+        style={{ backgroundColor: '#FFFFFF' }}
+      >
+        {/* AI PROCTOR LIVE badge with clean brand styling and pure white background */}
+        <div 
+          className="flex items-center gap-2 bg-white border border-slate-200 text-emerald-600 px-4 py-1.5 rounded-full text-xs font-black shadow-2xs"
+          style={{ backgroundColor: '#FFFFFF' }}
+        >
+          <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+          <span className="tracking-wider">AI PROCTOR LIVE</span>
         </div>
       </div>
 
       {/* 3-Column High-Density Layout */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-        {/* Left Column (col-span-3): Today's Mega Prize & Security Rules */}
+        {/* Left Column (col-span-3): Security Rules (Today's Mega Prize and Pool Filling hidden during active quiz) */}
         <aside className="lg:col-span-3 flex flex-col gap-4">
-          {/* Today's Mega Prize */}
-          <div className="rounded-2xl bg-white p-4 shadow-sm border border-slate-200/90">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Today's Mega Prize
-              </h3>
-              <span className="text-[10px] font-bold text-amber-800 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
-                Rank #1
-              </span>
-            </div>
-
-            <div className="relative aspect-video rounded-xl bg-slate-100 mb-3 flex items-center justify-center overflow-hidden border border-slate-200">
-              {prize?.imageUrl ? (
-                <img
-                  src={prize.imageUrl}
-                  alt={prize.title}
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover select-none pointer-events-none"
-                  style={{ WebkitUserSelect: 'none', userSelect: 'none' }}
-                />
-              ) : null}
-              <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/30 to-transparent" />
-              <div className="absolute bottom-2.5 left-2.5 right-2.5 text-white">
-                <p className="text-[11px] font-medium text-emerald-300 truncate">{prize.brand} • {prize.title}</p>
-                <p className="font-bold text-sm text-white">Value: ₹{prize.retailValue.toLocaleString('en-IN')}</p>
-              </div>
-            </div>
-
-            <div className="space-y-2.5 text-xs">
-              <div className="flex justify-between items-center text-sm">
-                <span className="text-slate-600">Entry Fee</span>
-                <span className="font-bold text-emerald-600">₹{pool.entryFee}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-slate-600">Active Pool</span>
-                <span className="font-bold text-slate-900">{pool.activeParticipants} / {pool.targetParticipants}</span>
-              </div>
-
-              {/* Progress bar */}
-              <div className="space-y-1.5 pt-1">
-                <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden border border-slate-200">
-                  <div 
-                    className="h-full transition-all duration-500" 
-                    style={{ 
-                      width: `${poolFillPercent}%`,
-                      background: 'linear-gradient(90deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)'
-                    }} 
-                  />
-                </div>
-                <div className="flex justify-between text-[10px] text-slate-500">
-                  <span>Pool Filling</span>
-                  <span className="text-indigo-600 font-semibold">{poolFillPercent}% Full</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Strict Security Enforcement Card */}
+          {/* Strict Security Enforcement Card: Synchronized with user selected test medium */}
           <div className="rounded-2xl bg-white p-4 shadow-sm border border-slate-200/90 space-y-3">
-            <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
-              <Lock className="w-4 h-4 text-indigo-600" />
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-900">
-                Security Enforced
+            <div className="border-b border-slate-100 pb-2 text-center">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-900 text-center">
+                {selectedLanguage === 'Hindi' ? 'सुरक्षा नियम' : 'Security Enforced'}
               </h3>
             </div>
 
-            <div className="space-y-2 text-[11px] text-slate-600">
+            <div className="space-y-2.5 text-xs text-slate-700">
+              {/* Rule 1: Question Timer rule */}
               <div className="flex items-start gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1 shrink-0" />
-                <span><strong>59s Per Question:</strong> Auto-advances on timeout.</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-600 mt-1.5 shrink-0" />
+                <span className="leading-relaxed">
+                  {selectedLanguage === 'Hindi' ? (
+                    <><strong>प्रश्न टाइमर:</strong> प्रत्येक प्रश्न के लिए 59 सेकंड का समय, समय समाप्त होने पर स्वतः अगले प्रश्न पर अग्रसर।</>
+                  ) : (
+                    <><strong>Question Timer:</strong> 59s timer per question with auto-advance to next question.</>
+                  )}
+                </span>
               </div>
+              {/* Rule 2: Negative Marking rule */}
               <div className="flex items-start gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1 shrink-0" />
-                <span><strong>-0.33 Negative Marking:</strong> Applies to incorrect answers.</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-600 mt-1.5 shrink-0" />
+                <span className="leading-relaxed">
+                  {selectedLanguage === 'Hindi' ? (
+                    <><strong>अंकन योजना:</strong> प्रत्येक सही उत्तर पर <strong>+1.0 अंक</strong>, गलत उत्तर पर <strong>-0.33 नकारात्मक अंकन</strong>।</>
+                  ) : (
+                    <><strong>Negative Marking:</strong> <strong>+1.0 mark</strong> for each correct answer, <strong>-0.33</strong> for incorrect answer.</>
+                  )}
+                </span>
               </div>
+              {/* Rule 3: Proctored Tab-switch rule */}
               <div className="flex items-start gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1 shrink-0" />
-                <span><strong>Anti-Tab Switch:</strong> Switching tabs triggers instant submit.</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-600 mt-1.5 shrink-0" />
+                <span className="leading-relaxed">
+                  {selectedLanguage === 'Hindi' ? (
+                    <><strong>प्रॉक्टर्ड परीक्षा:</strong> परीक्षा के दौरान विंडो मिनिमाइज़ करना या टैब बदलना सख्त मना है (स्वतः सबमिट होगा)।</>
+                  ) : (
+                    <><strong>Anti-Cheating Proctored:</strong> Tab switching or minimizing window triggers instant auto-submit.</>
+                  )}
+                </span>
               </div>
+              {/* Rule 4: Internet Stability rule */}
               <div className="flex items-start gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1 shrink-0" />
-                <span><strong>Encrypted Canvas:</strong> Screenshot & scraping blocked.</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-600 mt-1.5 shrink-0" />
+                <span className="leading-relaxed">
+                  {selectedLanguage === 'Hindi' ? (
+                    <><strong>इंटरनेट स्थिरता:</strong> स्थिर इंटरनेट कनेक्शन बनाए रखें। परीक्षा शुरू होने के बाद दोबारा मौका नहीं मिलेगा।</>
+                  ) : (
+                    <><strong>Internet Stability:</strong> Ensure a stable internet connection. No re-attempts allowed once started.</>
+                  )}
+                </span>
               </div>
             </div>
           </div>
@@ -609,13 +646,13 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
         {/* Center Column (col-span-6): Primary HTML5 Canvas Question Area */}
         <section className="lg:col-span-6 flex flex-col gap-4">
           <div className="relative rounded-2xl bg-white p-5 sm:p-7 shadow-sm border border-slate-200/90 overflow-hidden">
-            {/* Top Linear Progress Indicator */}
+            {/* Top Linear Progress Indicator: Primary Website Brand Gradient */}
             <div className="absolute top-0 left-0 h-1.5 w-full bg-slate-100 z-10">
               <div 
                 className="h-full transition-all duration-300"
                 style={{ 
                   width: `${progressPercent}%`,
-                  background: 'linear-gradient(135deg, #2563EB 0%, #06B6D4 50%, #8B5CF6 100%)'
+                  background: BRAND_GRADIENT
                 }} 
               />
             </div>
@@ -632,46 +669,46 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
             <div className="relative z-10 space-y-6">
               {/* Question Header & Timers */}
               <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-4">
-                {/* Horizontal row of upper badges: [2 / 19] [Category Name] [Difficulty] [-0.33] */}
+                {/* Horizontal row of upper badges: [5 / 19] [Category Name] [Difficulty] [-0.33] */}
                 <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap no-scrollbar py-0.5">
-                  {/* Badge 1: [2 / 19] */}
+                  {/* Badge 1: [5 / 19] with Primary Website Brand Gradient */}
                   <span 
                     className="text-xs font-bold text-white px-3 py-1 rounded-full shadow-xs border border-white/20 shrink-0 inline-flex items-center justify-center tracking-wide"
-                    style={{ background: 'linear-gradient(135deg, #06B6D4 0%, #3B82F6 50%, #8B5CF6 100%)' }}
+                    style={{ background: BRAND_GRADIENT }}
                   >
                     {currentIndex + 1} / {validQuestions.length}
                   </span>
 
-                  {/* Badge 2: [Category Name] */}
+                  {/* Badge 2: [Category Name] with Pure White (#FFFFFF) Background */}
                   <span 
-                    className="text-xs font-bold text-slate-800 px-3 py-1 rounded-full border border-slate-200/90 shrink-0 inline-flex items-center justify-center"
-                    style={{ backgroundColor: '#F1F5F9' }}
+                    className="text-xs font-bold text-slate-800 px-3 py-1 rounded-full border border-slate-200/90 shrink-0 inline-flex items-center justify-center shadow-2xs"
+                    style={{ backgroundColor: '#FFFFFF' }}
                   >
-                    {currentQuestion.category}
+                    {translateCategory(currentQuestion.category, selectedLanguage)}
                   </span>
 
-                  {/* Badge 3: [Difficulty] */}
+                  {/* Badge 3: [Difficulty] with Pure White (#FFFFFF) Background */}
                   <span 
-                    className="text-xs font-bold text-slate-800 px-3 py-1 rounded-full border border-slate-200/90 shrink-0 inline-flex items-center justify-center"
-                    style={{ backgroundColor: '#F1F5F9' }}
+                    className="text-xs font-bold text-slate-800 px-3 py-1 rounded-full border border-slate-200/90 shrink-0 inline-flex items-center justify-center shadow-2xs"
+                    style={{ backgroundColor: '#FFFFFF' }}
                   >
-                    {currentQuestion.difficulty || 'Medium'}
+                    {translateDifficulty(currentQuestion.difficulty || 'Medium', selectedLanguage)}
                   </span>
 
-                  {/* Badge 4: [-0.33] */}
+                  {/* Badge 4: [-0.33 Neg.] in light-red warning tag */}
                   <span 
-                    className="text-xs font-black px-2.5 py-1 rounded-full border border-red-200/80 shrink-0 inline-flex items-center justify-center"
+                    className="text-xs font-black px-2.5 py-1 rounded-full border border-red-200 shrink-0 inline-flex items-center justify-center tracking-tight"
                     style={{ backgroundColor: '#FEE2E2', color: '#DC2626' }}
                   >
-                    -0.33
+                    -0.33 Neg.
                   </span>
                 </div>
 
-                {/* Per-Question 59-Second Countdown Timer on Top Right with NO Clock icon */}
+                {/* Per-Question 59-Second Consolidated Countdown Timer on Top Right with Primary Brand Styling (Clock icon removed) */}
                 <div className="shrink-0 flex items-center">
                   <div 
-                    className="flex items-center justify-center px-4 py-1.5 rounded-xl text-white font-mono font-black text-lg sm:text-xl shadow-xs border border-white/20"
-                    style={{ background: 'linear-gradient(135deg, #06B6D4 0%, #3B82F6 50%, #8B5CF6 100%)' }}
+                    className="px-4 py-1.5 rounded-xl text-white font-mono font-black text-lg sm:text-xl shadow-xs border border-white/20"
+                    style={{ background: BRAND_GRADIENT }}
                   >
                     <span>00:{questionSecondsRemaining.toString().padStart(2, '0')}</span>
                   </div>
@@ -684,10 +721,12 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                   <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
                     {selectedLanguage === 'Hindi' ? 'हिन्दी माध्यम' : 'English Medium'}
                   </span>
+                  {/* Language Switcher: Primary Brand Gradient Background */}
                   <button
                     type="button"
-                    onClick={() => setSelectedLanguage(prev => prev === 'Hindi' ? 'English' : 'Hindi')}
-                    className="text-[11px] font-bold text-indigo-700 hover:text-indigo-900 px-2 py-0.5 rounded-lg border border-indigo-200 bg-indigo-50/60 hover:bg-indigo-100 transition-colors cursor-pointer"
+                    onClick={() => handleUpdateLanguage(selectedLanguage === 'Hindi' ? 'English' : 'Hindi')}
+                    className="text-[11px] font-bold text-white px-3 py-1 rounded-lg transition-all cursor-pointer shadow-xs active:scale-95 hover:opacity-95"
+                    style={{ background: BRAND_GRADIENT }}
                   >
                     {selectedLanguage === 'Hindi' ? 'Switch to English' : 'हिन्दी में बदलें'}
                   </button>
@@ -699,7 +738,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                 </h2>
               </div>
 
-              {/* 4 Clear Option Buttons (A, B, C, D): Bold & Larger typography */}
+              {/* 4 Option Cards (A, B, C, D): Pure White (#FFFFFF) background always. When selected, Primary Brand Gradient applied strictly to OUTLINE BORDER only */}
               <div className="space-y-3 pt-1">
                 {(selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
                   ? HINDI_QUESTION_MAP[currentQuestion.id].options
@@ -714,33 +753,49 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                       type="button"
                       id={`quiz-option-${letter}`}
                       onClick={() => handleSelectOption(optIdx)}
-                      className={`w-full p-4 sm:p-5 rounded-2xl border-2 text-left transition-all flex items-center gap-4 cursor-pointer active:scale-[0.99] ${
+                      className={`w-full p-4 sm:p-5 rounded-2xl text-left transition-all flex items-center gap-4 cursor-pointer active:scale-[0.99] shadow-xs`}
+                      style={
                         isSelected
-                          ? 'border-indigo-600 bg-indigo-50/70 shadow-sm ring-2 ring-indigo-500/20'
-                          : 'border-slate-200 bg-white hover:border-indigo-300 hover:bg-slate-50/80 text-slate-800'
-                      }`}
+                          ? { 
+                              border: '2px solid transparent',
+                              background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box',
+                              color: '#0F172A',
+                              boxShadow: '0 4px 14px rgba(65, 124, 244, 0.18)'
+                            }
+                          : { 
+                              background: '#FFFFFF', 
+                              border: '2px solid #E2E8F0', 
+                              color: '#1E293B' 
+                            }
+                      }
                     >
                       {/* Option Letter (A, B, C, D) */}
-                      <span className={`w-10 h-10 rounded-xl font-black text-base flex items-center justify-center shrink-0 border transition-colors ${
+                      <span className={`w-10 h-10 rounded-xl font-black text-base flex items-center justify-center shrink-0 border transition-all ${
                         isSelected
-                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                          ? 'border-transparent text-white shadow-xs'
                           : 'bg-slate-100 text-slate-700 border-slate-300'
-                      }`}>
+                      }`}
+                      style={
+                        isSelected
+                          ? { background: BRAND_GRADIENT }
+                          : undefined
+                      }
+                      >
                         {letter}
                       </span>
 
-                      {/* Option Choice Text - Bold & Larger */}
+                      {/* Option Choice Text - Bold & Larger typography */}
                       <span className={`text-base sm:text-lg font-bold leading-snug flex-1 ${
-                        isSelected ? 'text-indigo-950' : 'text-slate-900'
+                        isSelected ? 'text-slate-900 font-extrabold' : 'text-slate-800'
                       }`}>
                         {optText}
                       </span>
 
                       {/* Radio Selection Indicator */}
                       <span className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
-                        isSelected ? 'border-indigo-600 bg-indigo-600' : 'border-slate-300 bg-white'
+                        isSelected ? 'border-blue-600 bg-white' : 'border-slate-300 bg-white'
                       }`}>
-                        {isSelected && <span className="w-2 h-2 rounded-full bg-white" />}
+                        {isSelected && <span className="w-2.5 h-2.5 rounded-full" style={{ background: BRAND_GRADIENT }} />}
                       </span>
                     </button>
                   );
@@ -750,43 +805,49 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
               {/* Question Footer Actions */}
               <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-100">
                 <div className="flex items-center gap-2">
+                  {/* 'Mark for Review' Button: No left icon, clean dark black outline style (#000000) */}
                   <button
                     id="mark-review-btn"
                     onClick={handleToggleMarkForReview}
-                    className={`px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2 transition-colors border cursor-pointer ${
-                      isMarked
-                        ? 'bg-amber-100 border-amber-300 text-amber-900 font-bold'
-                        : 'bg-slate-100 hover:bg-slate-200 border-slate-200 text-slate-700'
-                    }`}
+                    className="px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer bg-white text-black border border-black hover:bg-black/5"
+                    style={{ backgroundColor: '#FFFFFF', borderColor: '#000000', color: '#000000' }}
                   >
-                    <BookmarkCheck className="w-4 h-4" />
-                    <span>{isMarked ? 'Marked for Review' : 'Mark for Review'}</span>
+                    <span>
+                      {isMarked
+                        ? (selectedLanguage === 'Hindi' ? 'समीक्षा हेतु चिह्नित' : 'Marked for Review')
+                        : (selectedLanguage === 'Hindi' ? 'समीक्षा के लिए चिह्नित करें' : 'Mark for Review')}
+                    </span>
                   </button>
                 </div>
 
                 <div className="flex items-center gap-2.5">
+                  {/* 'Previous' Button: No arrow icon, Primary Website Brand Gradient Background */}
                   <button
                     id="prev-question-btn"
                     disabled={currentIndex === 0}
                     onClick={handlePrev}
-                    className={`px-4 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    className={`px-5 py-2.5 rounded-xl text-white text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-95 ${
                       currentIndex === 0
-                        ? 'opacity-40 cursor-not-allowed text-slate-400 bg-slate-50'
-                        : 'text-slate-700 hover:bg-slate-100 hover:text-slate-900'
+                        ? 'opacity-40 cursor-not-allowed'
+                        : 'hover:opacity-95'
                     }`}
+                    style={{ background: BRAND_GRADIENT }}
                   >
-                    <ChevronLeft className="w-4 h-4" />
-                    <span>Previous</span>
+                    <span>{selectedLanguage === 'Hindi' ? 'पिछला' : 'Previous'}</span>
                   </button>
 
+                  {/* 'Next Question' Button: No arrow icon, Primary Website Brand Gradient Background */}
                   <button
                     id="next-question-btn"
                     onClick={handleNext}
-                    className="px-5 py-2.5 rounded-xl text-white text-xs font-bold flex items-center gap-1.5 shadow-xs active:scale-95 transition-all cursor-pointer"
-                    style={{ background: 'linear-gradient(135deg, #06B6D4 0%, #3B82F6 50%, #8B5CF6 100%)' }}
+                    className="px-5 py-2.5 rounded-xl text-white text-xs font-bold shadow-xs active:scale-95 transition-all cursor-pointer hover:opacity-95"
+                    style={{ background: BRAND_GRADIENT }}
                   >
-                    <span>{currentIndex === validQuestions.length - 1 ? 'Review & Submit' : 'Next Question'}</span>
-                    <ChevronRight className="w-4 h-4" />
+                    <span>
+                      {currentIndex === validQuestions.length - 1
+                        ? (selectedLanguage === 'Hindi' ? 'समीक्षा एवं सबमिट' : 'Review & Submit')
+                        : (selectedLanguage === 'Hindi' ? 'अगला प्रश्न' : 'Next Question')}
+                    </span>
                   </button>
                 </div>
               </div>
@@ -798,15 +859,19 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
         <aside className="lg:col-span-3 flex flex-col gap-4">
           <div className="rounded-2xl bg-white p-4 shadow-sm border border-slate-200/90">
             <div className="flex items-center justify-between mb-3 border-b border-slate-100 pb-2.5">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-900">
-                Question Matrix
+              {/* Question Matrix Heading in Dark Black (#000000) */}
+              <h3 
+                className="text-xs font-bold uppercase tracking-wider text-black"
+                style={{ color: '#000000' }}
+              >
+                {selectedLanguage === 'Hindi' ? 'प्रश्न मैट्रिक्स' : 'Question Matrix'}
               </h3>
               <span className="text-xs font-bold text-slate-500">
-                {answeredCount}/{questions.length} Answered
+                {answeredCount}/{questions.length} {selectedLanguage === 'Hindi' ? 'उत्तर दिए' : 'Answered'}
               </span>
             </div>
 
-            {/* Matrix Grid */}
+            {/* Matrix Grid: Unattempted Pure White (#FFFFFF), Active Question Primary Brand Gradient */}
             <div className="grid grid-cols-5 gap-2 mb-3">
               {validQuestions.map((q, idx) => {
                 if (!q || q.id == null) return null;
@@ -814,15 +879,28 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                 const hasAnswered = answers[q.id] !== undefined;
                 const isReview = markedForReview.includes(q.id);
 
-                let btnStyle = 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-slate-100';
-                if (hasAnswered) {
-                  btnStyle = 'border-emerald-300 bg-emerald-50 text-emerald-800 font-bold';
-                }
-                if (isReview) {
-                  btnStyle = 'border-amber-300 bg-amber-50 text-amber-900 font-bold';
-                }
+                let btnClass = 'h-9 rounded-xl text-xs font-bold flex items-center justify-center transition-all cursor-pointer shadow-2xs';
+                let btnStyle: React.CSSProperties = { background: '#FFFFFF', border: '1px solid #E2E8F0' };
+
                 if (isCurrent) {
-                  btnStyle += ' ring-2 ring-indigo-500 font-black text-indigo-900';
+                  // Active Question: Clean primary brand gradient OUTLINE BORDER only, with a white background
+                  btnClass += ' font-black shadow-xs';
+                  btnStyle = { 
+                    color: '#1E293B',
+                    border: '2px solid transparent',
+                    background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box',
+                    boxShadow: '0 2px 8px rgba(65, 124, 244, 0.25)'
+                  };
+                } else if (hasAnswered) {
+                  btnClass += ' border-emerald-300 bg-emerald-50 text-emerald-800 font-bold';
+                  btnStyle = { background: '#ECFDF5', border: '1px solid #6EE7B7' };
+                } else if (isReview) {
+                  btnClass += ' border-amber-300 bg-amber-50 text-amber-900 font-bold';
+                  btnStyle = { background: '#FFFBEB', border: '1px solid #FCD34D' };
+                } else {
+                  // Unattempted Grid Boxes: Background color strictly pure white (#FFFFFF)
+                  btnClass += ' text-slate-700 hover:border-slate-300';
+                  btnStyle = { background: '#FFFFFF', border: '1px solid #E2E8F0' };
                 }
 
                 return (
@@ -833,7 +911,8 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                       soundFx.playClick();
                       setCurrentIndex(idx);
                     }}
-                    className={`h-9 rounded-xl border text-xs flex items-center justify-center transition-all cursor-pointer ${btnStyle}`}
+                    className={btnClass}
+                    style={btnStyle}
                   >
                     {idx + 1}
                   </button>
@@ -841,27 +920,33 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
               })}
             </div>
 
-            {/* Matrix Legend */}
+            {/* Matrix Legend: Answered (Green), Marked (Yellow), Unanswered (White/Grey), Current (Primary Brand Gradient) */}
             <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-500 pt-3 border-t border-slate-100">
               <div className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-                <span>Answered ({answeredCount})</span>
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0" />
+                <span>{selectedLanguage === 'Hindi' ? 'उत्तर दिया' : 'Answered'} ({answeredCount})</span>
               </div>
               <div className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
-                <span>Marked ({markedCount})</span>
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shrink-0" />
+                <span>{selectedLanguage === 'Hindi' ? 'चिह्नित' : 'Marked'} ({markedCount})</span>
               </div>
               <div className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
-                <span>Unanswered ({unansweredCount})</span>
+                <span className="w-2.5 h-2.5 rounded-full bg-white border border-slate-300 shrink-0" style={{ backgroundColor: '#FFFFFF' }} />
+                <span>{selectedLanguage === 'Hindi' ? 'अनुत्तरित' : 'Unanswered'} ({unansweredCount})</span>
               </div>
               <div className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full border border-indigo-600 bg-indigo-100" />
-                <span>Current</span>
+                <span 
+                  className="w-2.5 h-2.5 rounded-full bg-white shrink-0 shadow-2xs border-2" 
+                  style={{ 
+                    border: '2px solid transparent',
+                    background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box'
+                  }} 
+                />
+                <span>{selectedLanguage === 'Hindi' ? 'वर्तमान' : 'Current'}</span>
               </div>
             </div>
 
-            {/* Primary Submit Button */}
+            {/* Primary Submit Button: No left checkmark icon, Primary Brand Gradient Background */}
             <div className="pt-4 mt-3 border-t border-slate-100 space-y-2">
               <button
                 id="submit-quiz-direct-btn"
@@ -869,10 +954,10 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                   soundFx.playClick();
                   setShowSubmitConfirm(true);
                 }}
-                className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm flex items-center justify-center gap-2 transition-all cursor-pointer active:scale-95"
+                className="w-full py-3 rounded-xl text-white font-bold text-xs shadow-sm flex items-center justify-center transition-all cursor-pointer active:scale-95 hover:opacity-95"
+                style={{ background: BRAND_GRADIENT }}
               >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Submit Final Answers</span>
+                <span>{selectedLanguage === 'Hindi' ? 'अंतिम उत्तर सबमिट करें' : 'Submit Final Answers'}</span>
               </button>
 
               {onQuitQuiz && (
@@ -882,52 +967,30 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     soundFx.playClick();
                     onQuitQuiz();
                   }}
-                  className="w-full py-2 text-[11px] text-slate-500 hover:text-rose-600 transition-colors cursor-pointer"
+                  className="w-full py-2.5 rounded-xl text-white font-bold text-[11px] shadow-xs flex items-center justify-center transition-all cursor-pointer active:scale-95 hover:opacity-95"
+                  style={{ background: BRAND_GRADIENT }}
                 >
-                  Quit Contest & Exit
+                  {selectedLanguage === 'Hindi' ? 'प्रतियोगिता छोड़ें और बाहर जाएं' : 'Quit Contest & Exit'}
                 </button>
               )}
-            </div>
-          </div>
-
-          {/* Overall Time Card */}
-          <div className={`rounded-2xl bg-white shadow-sm border p-4 transition-all ${
-            totalSecondsRemaining < 30
-              ? 'border-rose-300 ring-2 ring-rose-400/20'
-              : 'border-slate-200/90'
-          }`}>
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">Overall Clock</h3>
-              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                totalSecondsRemaining < 30
-                  ? 'bg-rose-100 text-rose-800 animate-pulse'
-                  : 'text-indigo-700 bg-indigo-50'
-              }`}>
-                {totalSecondsRemaining < 30 ? 'Final Seconds' : `${Math.ceil(contestMaxSeconds / 60)} Min Arena`}
-              </span>
-            </div>
-            <div className={`p-3 rounded-xl border flex items-center justify-between transition-colors ${
-              totalSecondsRemaining < 30
-                ? 'bg-rose-50 border-rose-200 text-rose-900'
-                : 'bg-slate-50 border-slate-200 text-slate-900'
-            }`}>
-              <span className={`text-xs font-semibold ${totalSecondsRemaining < 30 ? 'text-rose-700' : 'text-slate-600'}`}>Remaining</span>
-              <span className={`font-mono font-bold text-base ${totalSecondsRemaining < 30 ? 'text-rose-700 animate-pulse' : 'text-slate-900'}`}>
-                {formatTotalTime(totalSecondsRemaining)}
-              </span>
             </div>
           </div>
         </aside>
       </div>
 
-      {/* Submit Confirmation Modal */}
+      {/* Submit Confirmation Modal: Centered dialog, pure white container, bilingual localization */}
       {showSubmitConfirm && (
         <div className="fixed inset-0 z-50 overflow-y-auto bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200">
+          <div 
+            className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200"
+            style={{ backgroundColor: '#FFFFFF' }}
+          >
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
                 <AlertTriangle className="w-5 h-5 text-indigo-600" />
-                <h3 className="text-base font-bold text-slate-900">Ready to Submit Quiz?</h3>
+                <h3 className="text-base font-bold text-slate-900">
+                  {selectedLanguage === 'Hindi' ? 'क्या आप क्विज़ सबमिट करना चाहते हैं?' : 'Ready to Submit Quiz?'}
+                </h3>
               </div>
               <button
                 onClick={() => setShowSubmitConfirm(false)}
@@ -941,15 +1004,21 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
               <div className="grid grid-cols-3 gap-2 text-center">
                 <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
                   <div className="text-base font-bold text-emerald-700">{answeredCount}</div>
-                  <div className="text-[10px] text-emerald-800 font-medium">Answered</div>
+                  <div className="text-[10px] text-emerald-800 font-medium">
+                    {selectedLanguage === 'Hindi' ? 'उत्तर दिया' : 'Answered'}
+                  </div>
                 </div>
                 <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
                   <div className="text-base font-bold text-amber-800">{markedCount}</div>
-                  <div className="text-[10px] text-amber-800 font-medium">Marked</div>
+                  <div className="text-[10px] text-amber-800 font-medium">
+                    {selectedLanguage === 'Hindi' ? 'चिह्नित' : 'Marked'}
+                  </div>
                 </div>
                 <div className="p-3 rounded-xl bg-rose-50 border border-rose-200">
                   <div className="text-base font-bold text-rose-700">{unansweredCount}</div>
-                  <div className="text-[10px] text-rose-800 font-medium">Unanswered</div>
+                  <div className="text-[10px] text-rose-800 font-medium">
+                    {selectedLanguage === 'Hindi' ? 'अनुत्तरित' : 'Unanswered'}
+                  </div>
                 </div>
               </div>
 
@@ -957,13 +1026,21 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                 <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 flex items-start gap-2.5">
                   <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
                   <span>
-                    You have <strong>{unansweredCount}</strong> unattempted questions. Skipped questions receive 0 points.
+                    {selectedLanguage === 'Hindi' ? (
+                      <>आपके <strong>{unansweredCount}</strong> प्रश्न अनुत्तरित हैं। छोड़े गए प्रश्नों के लिए 0 अंक मिलेंगे।</>
+                    ) : (
+                      <>You have <strong>{unansweredCount}</strong> unattempted questions. Skipped questions receive 0 points.</>
+                    )}
                   </span>
                 </div>
               )}
 
               <p className="text-slate-600">
-                Correct answers: <strong>+1.0</strong> • Incorrect answers: <strong>-0.33</strong>
+                {selectedLanguage === 'Hindi' ? (
+                  <>सही उत्तर: <strong>+1.0</strong> • गलत उत्तर: <strong>-0.33</strong></>
+                ) : (
+                  <>Correct answers: <strong>+1.0</strong> • Incorrect answers: <strong>-0.33</strong></>
+                )}
               </p>
             </div>
 
@@ -972,15 +1049,15 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                 onClick={() => setShowSubmitConfirm(false)}
                 className="px-4 py-2.5 text-xs font-semibold text-slate-600 hover:text-slate-900 rounded-xl hover:bg-slate-100 cursor-pointer"
               >
-                Continue Quiz
+                {selectedLanguage === 'Hindi' ? 'क्विज़ जारी रखें' : 'Continue Quiz'}
               </button>
               <button
                 id="final-confirm-submit-btn"
                 onClick={handleStandardSubmit}
-                className="px-5 py-2.5 rounded-xl text-white font-bold text-xs shadow-sm gemini-glow cursor-pointer"
-                style={{ background: 'linear-gradient(135deg, #06B6D4 0%, #3B82F6 50%, #8B5CF6 100%)' }}
+                className="px-5 py-2.5 rounded-xl text-white font-bold text-xs shadow-sm cursor-pointer hover:opacity-95"
+                style={{ background: BRAND_GRADIENT }}
               >
-                Yes, Submit Final Score
+                {selectedLanguage === 'Hindi' ? 'हाँ, अंतिम स्कोर सबमिट करें' : 'Yes, Submit Final Score'}
               </button>
             </div>
           </div>
@@ -991,7 +1068,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
       {!preQuizCompleted && (
         <PreQuizOnboarding
           selectedLanguage={selectedLanguage}
-          onSelectLanguage={setSelectedLanguage}
+          onSelectLanguage={handleUpdateLanguage}
           onDoneStartTest={() => {
             setPreQuizCompleted(true);
             startTimeRef.current = Date.now();
@@ -1005,6 +1082,8 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
           totalDurationMinutes={Math.ceil(contestMaxSeconds / 60)}
           prizeTitle={prize.title}
           isPractice={isPractice}
+          questions={validQuestions}
+          negativeMarks={0.33}
         />
       )}
     </div>

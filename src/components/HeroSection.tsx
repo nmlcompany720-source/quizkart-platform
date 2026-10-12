@@ -997,7 +997,6 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
           </div>
           <div>
             <h3 className="text-sm font-bold text-slate-900 tracking-tight">How It Works</h3>
-            <p className="text-[11px] text-slate-500 font-medium">Simple 4-step process to compete and win</p>
           </div>
         </div>
 

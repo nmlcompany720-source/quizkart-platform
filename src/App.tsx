@@ -2363,12 +2363,13 @@ export default function App() {
     );
   }
 
+  const isTestTakingActive = currentTab === 'quiz_arena' && !lastQuizResult;
   const isStandalonePage = currentTab === 'deposit' || currentTab === 'history' || currentTab === 'edit_profile' || currentTab === 'withdrawal';
 
   return (
     <div className="min-h-screen flex flex-col bg-[#FFFFFF] text-slate-900 antialiased selection:bg-blue-600 selection:text-white relative" style={{ backgroundColor: '#FFFFFF' }}>
-      {/* Top Blue Moving Ticker Announcement Strip */}
-      {!isStandalonePage && (
+      {/* Top Blue Moving Ticker Announcement Strip - Hidden in Test Mode */}
+      {!isStandalonePage && !isTestTakingActive && (
         <AnnouncementBar 
           text={announcement.text} 
           isEnabled={announcement.isEnabled} 
@@ -2393,8 +2394,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Top Navigation */}
-      {!isStandalonePage && (
+      {/* Top Navigation - Completely hidden whenever a user is inside the active test-taking screen */}
+      {!isStandalonePage && !isTestTakingActive && (
         <Navbar
           currentTab={currentTab}
           setCurrentTab={(tab) => {
@@ -2419,7 +2420,7 @@ export default function App() {
       )}
 
       {/* Main Content Area */}
-      <main className={`flex-1 w-full mx-auto ${isStandalonePage ? 'max-w-4xl px-4 sm:px-6 py-6' : 'max-w-7xl px-4 sm:px-6 lg:px-8 pt-4 pb-12'}`}>
+      <main className={`flex-1 w-full mx-auto ${isTestTakingActive ? 'max-w-7xl px-3 sm:px-6 py-3' : isStandalonePage ? 'max-w-4xl px-4 sm:px-6 py-6' : 'max-w-7xl px-4 sm:px-6 lg:px-8 pt-4 pb-12'}`}>
         {/* VIEW 1: HOME */}
         {currentTab === 'home' && (
           <div className="space-y-6">

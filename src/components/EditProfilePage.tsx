@@ -754,7 +754,7 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
                                   background: IMAGE_1_GRADIENT,
                                   boxShadow: '0 0 14px rgba(74, 125, 243, 0.45)'
                                 }
-                              : { backgroundColor: '#FFFFFF' }
+                              : { background: '#FFFFFF' }
                           }
                         >
                           <div className="w-full h-full rounded-[13px] overflow-hidden bg-white p-[1px]">
@@ -792,7 +792,7 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
                         background: IMAGE_1_GRADIENT,
                         boxShadow: '0 0 12px rgba(74, 125, 243, 0.25)'
                       }
-                    : { padding: '0px', backgroundColor: '#FFFFFF' }
+                    : { padding: '0px', background: '#FFFFFF' }
                 }
               >
                 <div className="relative bg-white rounded-[10px]" style={{ backgroundColor: '#FFFFFF' }}>
@@ -893,7 +893,7 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
                           background: IMAGE_1_GRADIENT,
                           boxShadow: '0 0 12px rgba(74, 125, 243, 0.25)'
                         }
-                      : { padding: '0px', backgroundColor: '#FFFFFF' }
+                      : { padding: '0px', background: '#FFFFFF' }
                   }
                 >
                   <div className="relative h-full bg-white rounded-[10px]" style={{ backgroundColor: '#FFFFFF' }}>

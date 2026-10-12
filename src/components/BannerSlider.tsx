@@ -98,9 +98,29 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
     goToNext();
   };
 
+  const lastActionTimeRef = useRef<number>(0);
+
   const handleAction = (tab?: BannerTargetPage, customUrl?: string) => {
     soundFx.playClick();
     onSlideAction(tab || 'quiz_arena', customUrl);
+  };
+
+  const handleBannerBtnClick = (e: React.SyntheticEvent) => {
+    const now = Date.now();
+    if (now - lastActionTimeRef.current < 450) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    lastActionTimeRef.current = now;
+    e.preventDefault();
+    e.stopPropagation();
+    const isLeaderboardAction = 
+      currentSlide.actionTab === 'leaderboard' ||
+      (currentSlide.actionText && currentSlide.actionText.toLowerCase().includes('leaderboard')) ||
+      (currentSlide.title && currentSlide.title.toLowerCase().includes('leaderboard'));
+    const targetTab = isLeaderboardAction ? 'leaderboard' : (currentSlide.actionTab || 'quiz_arena');
+    handleAction(targetTab, currentSlide.customUrl);
   };
 
   // Touch Swipe Handlers for mobile
@@ -247,22 +267,11 @@ export const BannerSlider: React.FC<BannerSliderProps> = ({
                 <button
                   type="button"
                   id="banner-cta-action-btn"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const isLeaderboardAction = 
-                      currentSlide.actionTab === 'leaderboard' ||
-                      (currentSlide.actionText && currentSlide.actionText.toLowerCase().includes('leaderboard')) ||
-                      (currentSlide.title && currentSlide.title.toLowerCase().includes('leaderboard'));
-                    const targetTab = isLeaderboardAction ? 'leaderboard' : (currentSlide.actionTab || 'quiz_arena');
-                    handleAction(targetTab, currentSlide.customUrl);
-                  }}
+                  onClick={handleBannerBtnClick}
                   onTouchStart={(e) => {
                     e.stopPropagation();
                   }}
-                  onTouchEnd={(e) => {
-                    e.stopPropagation();
-                  }}
+                  onTouchEnd={handleBannerBtnClick}
                   className="inline-flex items-center px-4 sm:px-6 py-2 sm:py-2.5 rounded-xl text-white font-bold text-xs sm:text-sm shadow-md active:scale-95 transition-all cursor-pointer hover:opacity-95 select-none relative z-30 touch-manipulation"
                   style={{
                     background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
