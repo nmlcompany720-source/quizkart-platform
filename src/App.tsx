@@ -89,7 +89,7 @@ import { calculateDynamicPool } from './utils/poolUtils';
 import { sanitizeContestSynchronous } from './utils/imageCompressor';
 import { getActiveDepositQr, setActiveDepositQr } from './utils/qrConfig';
 import { User } from 'firebase/auth';
-import { Bell, Download, X } from 'lucide-react';
+import { Bell, X } from 'lucide-react';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -153,9 +153,34 @@ export default function App() {
     }
     return false;
   });
+  const [appLanguage, setAppLanguage] = useState<'English' | 'Hindi'>(() => {
+    try {
+      const saved = localStorage.getItem('quizkart_selected_language') || sessionStorage.getItem('quizkart_selected_language');
+      if (saved === 'Hindi' || saved === 'English') return saved;
+    } catch {}
+    return 'English';
+  });
+
+  useEffect(() => {
+    const syncLanguage = () => {
+      try {
+        const saved = localStorage.getItem('quizkart_selected_language') || sessionStorage.getItem('quizkart_selected_language');
+        if (saved === 'Hindi' || saved === 'English') {
+          setAppLanguage(saved);
+        }
+      } catch {}
+    };
+    window.addEventListener('storage', syncLanguage);
+    window.addEventListener('focus', syncLanguage);
+    return () => {
+      window.removeEventListener('storage', syncLanguage);
+      window.removeEventListener('focus', syncLanguage);
+    };
+  }, []);
+
   const [isInstallBannerDismissed, setIsInstallBannerDismissed] = useState<boolean>(() => {
     try {
-      return sessionStorage.getItem('quizkart_pwa_banner_dismissed') === 'true';
+      return sessionStorage.getItem('pwaDismissedSession') === 'true';
     } catch {
       return false;
     }
@@ -186,7 +211,7 @@ export default function App() {
       setDeferredPrompt(null);
       setIsInstallBannerDismissed(true);
       try {
-        sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+        sessionStorage.setItem('pwaDismissedSession', 'true');
       } catch {}
     };
 
@@ -953,7 +978,7 @@ export default function App() {
         setDeferredPrompt(null);
         setIsInstallBannerDismissed(true);
         try {
-          sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+          sessionStorage.setItem('pwaDismissedSession', 'true');
         } catch {}
       } catch (err) {
         console.warn('Install prompt error:', err);
@@ -961,10 +986,12 @@ export default function App() {
       }
     } else {
       // Guide user if running in browser or iOS Safari
-      showTunedToast('To install QuizKart on your home screen, tap your browser menu (or Safari Share) and choose "Add to Home Screen".');
+      showTunedToast(appLanguage === 'Hindi'
+        ? 'QuizKart ऐप इंस्टॉल करने के लिए: ब्राउज़र मेनू पर टैप करें और "होम स्क्रीन में जोड़ें" चुनें।'
+        : 'To install QuizKart on your home screen, tap your browser menu (or Safari Share) and choose "Add to Home Screen".');
       setIsInstallBannerDismissed(true);
       try {
-        sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+        sessionStorage.setItem('pwaDismissedSession', 'true');
       } catch {}
     }
   };
@@ -973,7 +1000,7 @@ export default function App() {
     soundFx.playClick();
     setIsInstallBannerDismissed(true);
     try {
-      sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+      sessionStorage.setItem('pwaDismissedSession', 'true');
     } catch {}
   };
 
@@ -2521,11 +2548,11 @@ export default function App() {
         {/* VIEW 1: HOME */}
         {currentTab === 'home' && (
           <div className="space-y-6">
-            {/* Clean, Non-Intrusive PWA Install Banner (ONLY on Home Tab) */}
+            {/* Clean, Sleek PWA Install Banner (ONLY on Home Tab) */}
             {!isAppInstalled && !isInstallBannerDismissed && (
               <div 
                 id="pwa-install-banner"
-                className="relative overflow-hidden rounded-2xl border border-slate-200/90 shadow-sm p-4 sm:p-5 transition-all duration-300"
+                className="relative overflow-hidden rounded-2xl border border-slate-200/90 shadow-xs p-3.5 sm:p-4 transition-all duration-300"
                 style={{ background: '#FFFFFF' }}
               >
                 {/* Top Brand Accent Line */}
@@ -2534,67 +2561,61 @@ export default function App() {
                   style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                 />
 
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  {/* Official QuizKart logo image next to app title and description */}
-                  <div className="flex items-center gap-3.5 pr-8 sm:pr-0">
-                    <div className="relative flex w-12 h-12 aspect-square shrink-0 items-center justify-center rounded-2xl overflow-hidden shadow-sm border border-slate-100 bg-white">
-                      <img 
-                        src="/icon.svg" 
-                        alt="QuizKart" 
-                        className="w-full h-full object-cover"
-                      />
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+                  {/* Left: Clean Official QuizKart Logo + Title Only */}
+                  <div className="flex items-center gap-3 min-w-0 pr-8 sm:pr-0">
+                    {/* Dedicated Official 'Q' Brand Logo Container (Strictly No Star/Gemini Icon) */}
+                    <div 
+                      className="relative flex w-10 h-10 aspect-square shrink-0 items-center justify-center rounded-xl font-bold text-white shadow-xs select-none"
+                      style={{ 
+                        background: 'linear-gradient(135deg, #4878F4 0%, #407EF5 25%, #3B8DDF 50%, #2998C6 75%, #19ABA0 100%)',
+                        boxShadow: '0 2px 8px rgba(72, 120, 244, 0.25)',
+                      }}
+                    >
+                      <span className="text-xl font-black text-white leading-none select-none tracking-tight pointer-events-none">
+                        Q
+                      </span>
                     </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-base sm:text-lg font-bold text-slate-900 tracking-tight">
-                          Install QuizKart App
-                        </h3>
-                        <span 
-                          className="px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white rounded-full shadow-xs shrink-0"
-                          style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
-                        >
-                          App
-                        </span>
-                      </div>
-                      <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-                        Fast access & better quiz experience
-                      </p>
-                    </div>
+
+                    {/* Title strictly in English or Hindi mode */}
+                    <h3 className="text-sm sm:text-base font-bold text-slate-900 tracking-tight truncate">
+                      {appLanguage === 'Hindi' ? 'QuizKart ऐप इंस्टॉल करें' : 'Install QuizKart App'}
+                    </h3>
                   </div>
 
-                  {/* Actions: Later / Close and Install */}
-                  <div className="flex items-center gap-2.5 shrink-0 self-end sm:self-center w-full sm:w-auto">
+                  {/* Right: Actions */}
+                  <div className="flex items-center gap-2 sm:gap-2.5 shrink-0 self-end sm:self-center w-full sm:w-auto justify-end">
                     <button
                       type="button"
                       id="pwa-later-btn"
                       onClick={handleDismissInstallBanner}
-                      className="flex-1 sm:flex-none px-4 py-2 text-xs sm:text-sm font-semibold text-slate-600 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all cursor-pointer text-center"
+                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl border border-[#417CF4] text-[#3A81F5] hover:bg-blue-50/60 active:scale-95 transition-all cursor-pointer text-center bg-white"
+                      style={{ borderColor: '#417CF4', color: '#3A81F5', background: '#FFFFFF' }}
                     >
-                      Later
+                      {appLanguage === 'Hindi' ? 'बाद में' : 'Later'}
                     </button>
 
                     <button
                       type="button"
                       id="pwa-install-btn"
                       onClick={handleInstallApp}
-                      className="flex-1 sm:flex-none px-5 py-2 text-xs sm:text-sm font-bold text-white rounded-xl shadow-sm hover:opacity-95 active:scale-95 transition-all flex items-center justify-center gap-1.5 cursor-pointer text-center"
+                      className="flex-1 sm:flex-none px-5 py-1.5 sm:py-2 text-xs sm:text-sm font-bold text-white rounded-xl shadow-xs hover:opacity-95 active:scale-95 transition-all cursor-pointer text-center"
                       style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                     >
-                      <Download className="w-4 h-4 shrink-0" />
-                      Install
+                      {appLanguage === 'Hindi' ? 'इंस्टॉल करें' : 'Install'}
+                    </button>
+
+                    {/* Close ('X') dismiss button */}
+                    <button
+                      type="button"
+                      aria-label="Close"
+                      onClick={handleDismissInstallBanner}
+                      className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
-
-                {/* Mobile top-right close dismiss button */}
-                <button
-                  type="button"
-                  aria-label="Close"
-                  onClick={handleDismissInstallBanner}
-                  className="absolute top-2.5 right-2.5 p-1 text-slate-400 hover:text-slate-600 rounded-lg sm:hidden cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
               </div>
             )}
             {/* Front-Page Carousel Banner Slider: Fully preserved and rendered (Image 1000155983) */}
