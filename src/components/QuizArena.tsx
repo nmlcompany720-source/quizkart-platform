@@ -4,7 +4,8 @@ import {
   AlertTriangle, 
   X, 
   AlertCircle,
-  ShieldAlert
+  ShieldAlert,
+  Check
 } from 'lucide-react';
 import { Question, DailyPrizeItem, PoolBreakdown } from '../types';
 import { QUIZ_QUESTIONS } from '../data/quizData';
@@ -537,14 +538,14 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
             </div>
 
             <div className="space-y-2.5 text-xs text-slate-700">
-              {/* Rule 1: Question Timer rule */}
+              {/* Rule 1: Contest Timer rule */}
               <div className="flex items-start gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-600 mt-1.5 shrink-0" />
                 <span className="leading-relaxed">
                   {selectedLanguage === 'Hindi' ? (
-                    <><strong>प्रश्न टाइमर:</strong> प्रत्येक प्रश्न के लिए 59 सेकंड का समय, समय समाप्त होने पर स्वतः अगले प्रश्न पर अग्रसर।</>
+                    <><strong>परीक्षा समय:</strong> प्रतियोगिता के लिए कुल 10 मिनट का समय निर्धारित है, समय समाप्त होने पर टेस्ट स्वतः सबमिट हो जाएगा।</>
                   ) : (
-                    <><strong>Question Timer:</strong> 59s timer per question with auto-advance to next question.</>
+                    <><strong>Test Timer:</strong> 10 minutes total contest duration. Auto-submits when time expires.</>
                   )}
                 </span>
               </div>
@@ -676,6 +677,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                   </button>
                 </div>
                 <h2 className="text-xl sm:text-2xl lg:text-3xl font-bold text-slate-900 leading-relaxed tracking-tight">
+                  <span className="mr-2 font-black">{currentIndex + 1}.</span>
                   {selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
                     ? HINDI_QUESTION_MAP[currentQuestion.id].question
                     : currentQuestion.question}
@@ -732,11 +734,13 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                         {optText}
                       </span>
 
-                      {/* Radio Selection Indicator */}
-                      <span className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
-                        isSelected ? 'border-blue-600 bg-white' : 'border-slate-300 bg-white'
-                      }`}>
-                        {isSelected && <span className="w-2.5 h-2.5 rounded-full" style={{ background: BRAND_GRADIENT }} />}
+                      {/* Selection Checkmark Indicator: Stays visible when marked for review */}
+                      <span className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-all ${
+                        isSelected ? 'border-transparent text-white' : 'border-2 border-slate-300 bg-white'
+                      }`}
+                      style={isSelected ? { background: BRAND_GRADIENT } : undefined}
+                      >
+                        {isSelected && <Check className="w-3.5 h-3.5 stroke-[3]" />}
                       </span>
                     </button>
                   );
@@ -928,7 +932,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
           >
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
-                <AlertTriangle className="w-5 h-5 text-indigo-600" />
+                <AlertTriangle className="w-5 h-5 text-[#417CF4]" />
                 <h3 className="text-base font-bold text-slate-900">
                   {selectedLanguage === 'Hindi' ? 'क्या आप क्विज़ सबमिट करना चाहते हैं?' : 'Ready to Submit Quiz?'}
                 </h3>
@@ -975,20 +979,13 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                   </span>
                 </div>
               )}
-
-              <p className="text-slate-600">
-                {selectedLanguage === 'Hindi' ? (
-                  <>सही उत्तर: <strong>+1.0</strong> • गलत उत्तर: <strong>-0.33</strong></>
-                ) : (
-                  <>Correct answers: <strong>+1.0</strong> • Incorrect answers: <strong>-0.33</strong></>
-                )}
-              </p>
             </div>
 
             <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-slate-100">
               <button
                 onClick={() => setShowSubmitConfirm(false)}
-                className="px-4 py-2.5 text-xs font-semibold text-slate-600 hover:text-slate-900 rounded-xl hover:bg-slate-100 cursor-pointer"
+                className="px-5 py-2.5 text-xs font-bold text-white rounded-xl shadow-sm hover:opacity-95 active:scale-98 transition-all cursor-pointer"
+                style={{ background: BRAND_GRADIENT }}
               >
                 {selectedLanguage === 'Hindi' ? 'क्विज़ जारी रखें' : 'Continue Quiz'}
               </button>

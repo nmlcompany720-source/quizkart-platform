@@ -386,9 +386,9 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0 mt-1.5" />
                 <span className="leading-relaxed">
                   {selectedLanguage === 'Hindi' ? (
-                    <><strong>प्रश्न टाइमर:</strong> प्रत्येक प्रश्न के लिए 59 सेकंड का समय, समय समाप्त होने पर स्वतः अगले प्रश्न पर अग्रसर।</>
+                    <><strong>परीक्षा समय:</strong> प्रतियोगिता के लिए कुल 10 मिनट का समय निर्धारित है, समय समाप्त होने पर टेस्ट स्वतः सबमिट हो जाएगा।</>
                   ) : (
-                    <><strong>Question Timer:</strong> 59s timer per question with auto-advance to the next question.</>
+                    <><strong>Test Timer:</strong> 10 minutes total contest duration. Auto-submits when time expires.</>
                   )}
                 </span>
               </div>
