@@ -100,12 +100,12 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
     <div className="min-h-screen bg-slate-900/60 backdrop-blur-sm fixed inset-0 z-50 overflow-y-auto flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-150">
       <div 
         className="w-full max-w-lg bg-white rounded-2xl shadow-2xl border border-slate-200/90 overflow-hidden flex flex-col my-auto"
-        style={{ backgroundColor: '#FFFFFF' }}
+        style={{ background: '#FFFFFF' }}
       >
         {/* Compact Header Bar with Signature Gradient Accent */}
         <div 
           className="px-4 py-3 sm:px-5 sm:py-3.5 border-b border-slate-100 flex items-center justify-between bg-white"
-          style={{ backgroundColor: '#FFFFFF' }}
+          style={{ background: '#FFFFFF' }}
         >
           <div className="flex items-center gap-2.5">
             <div 
@@ -140,7 +140,7 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
         {step === 'language' && (
           <div 
             className="p-4 sm:p-5 space-y-4 bg-white"
-            style={{ backgroundColor: '#FFFFFF' }}
+            style={{ background: '#FFFFFF' }}
           >
             {/* Sleek, compact horizontal radio tiles side-by-side */}
             <div className="grid grid-cols-2 gap-3">
@@ -248,9 +248,10 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
                   soundFx.playClick();
                   onExit();
                 }}
-                className="px-4 py-2 rounded-xl text-slate-600 hover:text-slate-900 font-bold text-xs hover:bg-slate-100 active:scale-98 transition-all cursor-pointer border border-slate-200 bg-white"
+                className="px-6 py-2 rounded-xl text-white font-bold text-xs shadow-sm hover:opacity-95 active:scale-98 transition-all flex items-center justify-center cursor-pointer"
+                style={{ background: BRAND_GRADIENT }}
               >
-                {selectedLanguage === 'Hindi' ? 'रद्द करें' : 'Cancel'}
+                <span>{selectedLanguage === 'Hindi' ? 'रद्द करें' : 'Cancel'}</span>
               </button>
 
               <button
@@ -273,34 +274,34 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
         {step === 'instructions' && (
           <div 
             className="p-4 sm:p-5 space-y-3.5 bg-white"
-            style={{ backgroundColor: '#FFFFFF' }}
+            style={{ background: '#FFFFFF' }}
           >
             {/* 1. Four Top Summary Boxes: Pure White Background (#FFFFFF) & Internal Icons Removed */}
             <div className="grid grid-cols-4 gap-1.5 sm:gap-2">
               <div 
                 className="px-2 py-2 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-[11px] sm:text-xs font-bold text-slate-900 shadow-2xs text-center"
-                style={{ backgroundColor: '#FFFFFF' }}
+                style={{ background: '#FFFFFF' }}
               >
                 <span className="truncate">{totalDurationMinutes} {selectedLanguage === 'Hindi' ? 'मिनट' : 'Mins'}</span>
               </div>
 
               <div 
                 className="px-2 py-2 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-[11px] sm:text-xs font-bold text-slate-900 shadow-2xs text-center"
-                style={{ backgroundColor: '#FFFFFF' }}
+                style={{ background: '#FFFFFF' }}
               >
                 <span className="truncate">{effectiveTotalQuestions} {selectedLanguage === 'Hindi' ? 'प्रश्न' : 'Questions'}</span>
               </div>
 
               <div 
                 className="px-2 py-2 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-[11px] sm:text-xs font-bold text-slate-900 shadow-2xs text-center"
-                style={{ backgroundColor: '#FFFFFF' }}
+                style={{ background: '#FFFFFF' }}
               >
                 <span className="truncate">{effectiveTotalMarks} {selectedLanguage === 'Hindi' ? 'अंक' : 'Marks'}</span>
               </div>
 
               <div 
                 className="px-2 py-2 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-[11px] sm:text-xs font-black text-red-600 shadow-2xs text-center"
-                style={{ backgroundColor: '#FFFFFF' }}
+                style={{ background: '#FFFFFF' }}
               >
                 <span className="truncate">-{negativeMarks} {selectedLanguage === 'Hindi' ? 'नेगेटिव' : 'Neg'}</span>
               </div>
@@ -332,7 +333,7 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
             <div className="rounded-xl border border-slate-200 overflow-hidden text-xs bg-white shadow-2xs">
               <div 
                 className="px-3 py-2 font-black grid grid-cols-12 text-[11px] uppercase tracking-wider border-b border-slate-200 bg-white"
-                style={{ backgroundColor: '#FFFFFF', color: '#000000' }}
+                style={{ background: '#FFFFFF', color: '#000000' }}
               >
                 <div className="col-span-6" style={{ color: '#000000' }}>
                   {selectedLanguage === 'Hindi' ? 'विषय' : 'Subject'}
@@ -344,7 +345,7 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
                   {selectedLanguage === 'Hindi' ? 'अंक' : 'Marks'}
                 </div>
               </div>
-              <div className="divide-y divide-slate-100 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+              <div className="divide-y divide-slate-100 bg-white" style={{ background: '#FFFFFF' }}>
                 {subjectList.map((row, idx) => (
                   <div key={idx} className="px-3 py-2 grid grid-cols-12 items-center text-xs bg-white">
                     <div className="col-span-6 font-semibold" style={{ color: '#000000' }}>
@@ -361,7 +362,7 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
                 {/* Dynamic Total Summary Row */}
                 <div 
                   className="px-3 py-2.5 grid grid-cols-12 items-center text-xs font-black border-t-2 border-slate-200 bg-white"
-                  style={{ backgroundColor: '#FFFFFF', color: '#000000' }}
+                  style={{ background: '#FFFFFF', color: '#000000' }}
                 >
                   <div className="col-span-6 font-black uppercase tracking-wide" style={{ color: '#000000' }}>
                     {selectedLanguage === 'Hindi' ? 'कुल' : 'Total'}
@@ -379,7 +380,7 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
             {/* 3. Instructions List: Pure white box background (#FFFFFF), Primary Blue bullets, dynamic rules and bilingual text */}
             <div 
               className="rounded-xl bg-white border border-slate-200 p-3 space-y-2 text-xs text-slate-700"
-              style={{ backgroundColor: '#FFFFFF' }}
+              style={{ background: '#FFFFFF' }}
             >
               <div className="flex items-start gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0 mt-1.5" />
