@@ -2560,9 +2560,9 @@ export default function App() {
             </div>
           </div>
 
-          {/* Splash Screen Footer Text at bottom center */}
-          <div className="text-center pb-2">
-            <p className="text-xs sm:text-sm font-medium text-slate-500 tracking-wide">
+          {/* Splash Screen Footer Line: Display "Developed by QuizKart Team" in clean, subtle muted brand-grey typography (#6B7280) */}
+          <div className="text-center pb-6">
+            <p className="text-xs sm:text-sm font-medium tracking-wide" style={{ color: '#6B7280' }}>
               Developed by QuizKart Team
             </p>
           </div>
@@ -2653,7 +2653,7 @@ export default function App() {
                       className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl transition-all active:scale-95 cursor-pointer text-center"
                       style={{
                         border: '1.5px solid #417CF4',
-                        background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.08) 0%, rgba(65, 124, 244, 0.08) 35%, rgba(58, 129, 245, 0.08) 65%, rgba(32, 165, 172, 0.08) 100%)',
+                        background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.12) 0%, rgba(65, 124, 244, 0.14) 50%, rgba(32, 165, 172, 0.12) 100%)',
                         color: '#3A81F5',
                       }}
                     >
