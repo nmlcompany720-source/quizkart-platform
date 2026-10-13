@@ -2561,9 +2561,19 @@ export default function App() {
                   style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                 />
 
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
-                  {/* Left: Clean Official QuizKart Logo + Title Only */}
-                  <div className="flex items-center gap-3 min-w-0 pr-8 sm:pr-0">
+                {/* Close ('X') Icon: Repositioned to top-right corner of container alongside main title area */}
+                <button
+                  type="button"
+                  aria-label="Close"
+                  onClick={handleDismissInstallBanner}
+                  className="absolute top-3 right-3 sm:top-3.5 sm:right-3.5 p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer z-10"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 pr-7 sm:pr-8">
+                  {/* Left: Clean Official QuizKart Logo + Title Strictly in English */}
+                  <div className="flex items-center gap-3 min-w-0">
                     {/* Dedicated Official 'Q' Brand Logo Container (Strictly No Star/Gemini Icon) */}
                     <div 
                       className="relative flex w-10 h-10 aspect-square shrink-0 items-center justify-center rounded-xl font-bold text-white shadow-xs select-none"
@@ -2577,9 +2587,9 @@ export default function App() {
                       </span>
                     </div>
 
-                    {/* Title strictly in English or Hindi mode */}
+                    {/* Title strictly 'Install QuizKart App' in English */}
                     <h3 className="text-sm sm:text-base font-bold text-slate-900 tracking-tight truncate">
-                      {appLanguage === 'Hindi' ? 'QuizKart ऐप इंस्टॉल करें' : 'Install QuizKart App'}
+                      Install QuizKart App
                     </h3>
                   </div>
 
@@ -2589,10 +2599,14 @@ export default function App() {
                       type="button"
                       id="pwa-later-btn"
                       onClick={handleDismissInstallBanner}
-                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl border border-[#417CF4] text-[#3A81F5] hover:bg-blue-50/60 active:scale-95 transition-all cursor-pointer text-center bg-white"
-                      style={{ borderColor: '#417CF4', color: '#3A81F5', background: '#FFFFFF' }}
+                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl border border-[#417CF4] text-[#3A81F5] hover:opacity-90 active:scale-95 transition-all cursor-pointer text-center"
+                      style={{ 
+                        borderColor: '#417CF4', 
+                        color: '#3A81F5', 
+                        background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.12) 0%, rgba(65, 124, 244, 0.12) 35%, rgba(58, 129, 245, 0.12) 65%, rgba(32, 165, 172, 0.12) 100%)' 
+                      }}
                     >
-                      {appLanguage === 'Hindi' ? 'बाद में' : 'Later'}
+                      Later
                     </button>
 
                     <button
@@ -2602,17 +2616,7 @@ export default function App() {
                       className="flex-1 sm:flex-none px-5 py-1.5 sm:py-2 text-xs sm:text-sm font-bold text-white rounded-xl shadow-xs hover:opacity-95 active:scale-95 transition-all cursor-pointer text-center"
                       style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                     >
-                      {appLanguage === 'Hindi' ? 'इंस्टॉल करें' : 'Install'}
-                    </button>
-
-                    {/* Close ('X') dismiss button */}
-                    <button
-                      type="button"
-                      aria-label="Close"
-                      onClick={handleDismissInstallBanner}
-                      className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
-                    >
-                      <X className="w-4 h-4" />
+                      Install
                     </button>
                   </div>
                 </div>
