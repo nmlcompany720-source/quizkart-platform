@@ -143,14 +143,6 @@ export default function App() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(() => !checkIsUserAuthenticated());
   const [authModalStep, setAuthModalStep] = useState<1 | 2 | 3>(1);
   const [isEmailChangeMode, setIsEmailChangeMode] = useState<boolean>(false);
-  const [isAppLoadingSplash, setIsAppLoadingSplash] = useState<boolean>(true);
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setIsAppLoadingSplash(false);
-    }, 1200);
-    return () => clearTimeout(timer);
-  }, []);
 
   // PWA Deferred App Install Prompt state
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
@@ -2526,49 +2518,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Splash Screen / Launch Screen Overlay */}
-      {isAppLoadingSplash && (
-        <div 
-          id="app-splash-screen"
-          className="fixed inset-0 z-50 flex flex-col items-center justify-between bg-white px-4 py-12 select-none"
-          style={{ background: '#FFFFFF' }}
-        >
-          <div className="flex-1 flex flex-col items-center justify-center">
-            {/* Compact Square Rounded-Corner 'Q' Logo Badge (Exact 1:1 Aspect Ratio, not stretched) */}
-            <div 
-              className="relative flex w-18 h-18 sm:w-20 sm:h-20 aspect-square shrink-0 items-center justify-center rounded-2xl sm:rounded-3xl font-bold text-white shadow-md select-none mx-auto"
-              style={{ 
-                background: 'linear-gradient(135deg, #4878F4 0%, #407EF5 25%, #3B8DDF 50%, #2998C6 75%, #19ABA0 100%)',
-                boxShadow: '0 8px 24px rgba(72, 120, 244, 0.28)',
-              }}
-            >
-              <span className="text-3xl sm:text-4xl font-black text-white leading-none select-none tracking-tight pointer-events-none">
-                Q
-              </span>
-            </div>
-
-            <div className="mt-4 text-2xl sm:text-3xl font-black tracking-tight select-none">
-              <span
-                style={{
-                  background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
-                  WebkitBackgroundClip: 'text',
-                  WebkitTextFillColor: 'transparent',
-                }}
-              >
-                QuizKart
-              </span>
-            </div>
-          </div>
-
-          {/* Splash Screen Footer Line: Display "Developed by QuizKart Team" in clean, subtle muted brand-grey typography (#6B7280) */}
-          <div className="text-center pb-6">
-            <p className="text-xs sm:text-sm font-medium tracking-wide" style={{ color: '#6B7280' }}>
-              Developed by QuizKart Team
-            </p>
-          </div>
-        </div>
-      )}
-
       {/* Top Navigation - Completely hidden whenever a user is inside the active test-taking screen */}
       {!isStandalonePage && !isTestTakingActive && (
         <Navbar
@@ -2612,19 +2561,9 @@ export default function App() {
                   style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                 />
 
-                {/* Close ('X') Icon: Top-right corner of the banner container aligned neatly alongside the title (Image 3) */}
-                <button
-                  type="button"
-                  aria-label="Close"
-                  onClick={handleDismissInstallBanner}
-                  className="absolute top-3.5 right-3.5 p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer z-10"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 pr-7 sm:pr-8">
-                  {/* Left: Clean Official QuizKart Logo + English Title Strictly */}
-                  <div className="flex items-center gap-3 min-w-0">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+                  {/* Left: Clean Official QuizKart Logo + Title Only */}
+                  <div className="flex items-center gap-3 min-w-0 pr-8 sm:pr-0">
                     {/* Dedicated Official 'Q' Brand Logo Container (Strictly No Star/Gemini Icon) */}
                     <div 
                       className="relative flex w-10 h-10 aspect-square shrink-0 items-center justify-center rounded-xl font-bold text-white shadow-xs select-none"
@@ -2638,9 +2577,9 @@ export default function App() {
                       </span>
                     </div>
 
-                    {/* Title strictly in English: 'Install QuizKart App' */}
+                    {/* Title strictly in English or Hindi mode */}
                     <h3 className="text-sm sm:text-base font-bold text-slate-900 tracking-tight truncate">
-                      Install QuizKart App
+                      {appLanguage === 'Hindi' ? 'QuizKart ऐप इंस्टॉल करें' : 'Install QuizKart App'}
                     </h3>
                   </div>
 
@@ -2650,14 +2589,10 @@ export default function App() {
                       type="button"
                       id="pwa-later-btn"
                       onClick={handleDismissInstallBanner}
-                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl transition-all active:scale-95 cursor-pointer text-center"
-                      style={{
-                        border: '1.5px solid #417CF4',
-                        background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.12) 0%, rgba(65, 124, 244, 0.14) 50%, rgba(32, 165, 172, 0.12) 100%)',
-                        color: '#3A81F5',
-                      }}
+                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl border border-[#417CF4] text-[#3A81F5] hover:bg-blue-50/60 active:scale-95 transition-all cursor-pointer text-center bg-white"
+                      style={{ borderColor: '#417CF4', color: '#3A81F5', background: '#FFFFFF' }}
                     >
-                      Later
+                      {appLanguage === 'Hindi' ? 'बाद में' : 'Later'}
                     </button>
 
                     <button
@@ -2667,7 +2602,17 @@ export default function App() {
                       className="flex-1 sm:flex-none px-5 py-1.5 sm:py-2 text-xs sm:text-sm font-bold text-white rounded-xl shadow-xs hover:opacity-95 active:scale-95 transition-all cursor-pointer text-center"
                       style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                     >
-                      Install
+                      {appLanguage === 'Hindi' ? 'इंस्टॉल करें' : 'Install'}
+                    </button>
+
+                    {/* Close ('X') dismiss button */}
+                    <button
+                      type="button"
+                      aria-label="Close"
+                      onClick={handleDismissInstallBanner}
+                      className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
