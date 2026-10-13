@@ -89,7 +89,12 @@ import { calculateDynamicPool } from './utils/poolUtils';
 import { sanitizeContestSynchronous } from './utils/imageCompressor';
 import { getActiveDepositQr, setActiveDepositQr } from './utils/qrConfig';
 import { User } from 'firebase/auth';
-import { Bell } from 'lucide-react';
+import { Bell, Download, X } from 'lucide-react';
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
 
 export default function App() {
   const checkIsUserAuthenticated = (): boolean => {
@@ -138,6 +143,61 @@ export default function App() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(() => !checkIsUserAuthenticated());
   const [authModalStep, setAuthModalStep] = useState<1 | 2 | 3>(1);
   const [isEmailChangeMode, setIsEmailChangeMode] = useState<boolean>(false);
+
+  // PWA Deferred App Install Prompt state
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [isAppInstalled, setIsAppInstalled] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return window.matchMedia('(display-mode: standalone)').matches ||
+        (window.navigator as any)?.standalone === true;
+    }
+    return false;
+  });
+  const [isInstallBannerDismissed, setIsInstallBannerDismissed] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('quizkart_pwa_banner_dismissed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  // Capture and defer beforeinstallprompt event, preventing the default browser prompt
+  useEffect(() => {
+    const checkStandalone = () => {
+      if (typeof window !== 'undefined') {
+        const isStandalone =
+          window.matchMedia('(display-mode: standalone)').matches ||
+          (window.navigator as any)?.standalone === true;
+        if (isStandalone) {
+          setIsAppInstalled(true);
+        }
+      }
+    };
+    checkStandalone();
+
+    const handleBeforeInstallPrompt = (e: Event) => {
+      // Prevent browser's default prompt banner from showing automatically at inconvenient times
+      e.preventDefault();
+      setDeferredPrompt(e as BeforeInstallPromptEvent);
+    };
+
+    const handleAppInstalled = () => {
+      setIsAppInstalled(true);
+      setDeferredPrompt(null);
+      setIsInstallBannerDismissed(true);
+      try {
+        sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+      } catch {}
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
 
   // Enforce redirect to Registration/Login page for non-logged-in users attempting to access internal app pages
   useEffect(() => {
@@ -879,6 +939,43 @@ export default function App() {
     }, 4000);
     return () => clearTimeout(timer);
   }, [globalNotice]);
+
+  // PWA Install Handlers
+  const handleInstallApp = async () => {
+    soundFx.playClick();
+    if (deferredPrompt) {
+      try {
+        await deferredPrompt.prompt();
+        const choice = await deferredPrompt.userChoice;
+        if (choice && choice.outcome === 'accepted') {
+          setIsAppInstalled(true);
+        }
+        setDeferredPrompt(null);
+        setIsInstallBannerDismissed(true);
+        try {
+          sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+        } catch {}
+      } catch (err) {
+        console.warn('Install prompt error:', err);
+        setIsInstallBannerDismissed(true);
+      }
+    } else {
+      // Guide user if running in browser or iOS Safari
+      showTunedToast('To install QuizKart on your home screen, tap your browser menu (or Safari Share) and choose "Add to Home Screen".');
+      setIsInstallBannerDismissed(true);
+      try {
+        sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+      } catch {}
+    }
+  };
+
+  const handleDismissInstallBanner = () => {
+    soundFx.playClick();
+    setIsInstallBannerDismissed(true);
+    try {
+      sessionStorage.setItem('quizkart_pwa_banner_dismissed', 'true');
+    } catch {}
+  };
 
   const [globalQuizTimer, setGlobalQuizTimer] = useState<number>(() => {
     try {
@@ -2424,6 +2521,82 @@ export default function App() {
         {/* VIEW 1: HOME */}
         {currentTab === 'home' && (
           <div className="space-y-6">
+            {/* Clean, Non-Intrusive PWA Install Banner (ONLY on Home Tab) */}
+            {!isAppInstalled && !isInstallBannerDismissed && (
+              <div 
+                id="pwa-install-banner"
+                className="relative overflow-hidden rounded-2xl border border-slate-200/90 shadow-sm p-4 sm:p-5 transition-all duration-300"
+                style={{ background: '#FFFFFF' }}
+              >
+                {/* Top Brand Accent Line */}
+                <div 
+                  className="absolute top-0 left-0 right-0 h-1"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                />
+
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  {/* Official QuizKart logo image next to app title and description */}
+                  <div className="flex items-center gap-3.5 pr-8 sm:pr-0">
+                    <div className="relative flex w-12 h-12 aspect-square shrink-0 items-center justify-center rounded-2xl overflow-hidden shadow-sm border border-slate-100 bg-white">
+                      <img 
+                        src="/icon.svg" 
+                        alt="QuizKart" 
+                        className="w-full h-full object-cover"
+                      />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-base sm:text-lg font-bold text-slate-900 tracking-tight">
+                          Install QuizKart App
+                        </h3>
+                        <span 
+                          className="px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white rounded-full shadow-xs shrink-0"
+                          style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                        >
+                          App
+                        </span>
+                      </div>
+                      <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
+                        Fast access & better quiz experience
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Actions: Later / Close and Install */}
+                  <div className="flex items-center gap-2.5 shrink-0 self-end sm:self-center w-full sm:w-auto">
+                    <button
+                      type="button"
+                      id="pwa-later-btn"
+                      onClick={handleDismissInstallBanner}
+                      className="flex-1 sm:flex-none px-4 py-2 text-xs sm:text-sm font-semibold text-slate-600 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all cursor-pointer text-center"
+                    >
+                      Later
+                    </button>
+
+                    <button
+                      type="button"
+                      id="pwa-install-btn"
+                      onClick={handleInstallApp}
+                      className="flex-1 sm:flex-none px-5 py-2 text-xs sm:text-sm font-bold text-white rounded-xl shadow-sm hover:opacity-95 active:scale-95 transition-all flex items-center justify-center gap-1.5 cursor-pointer text-center"
+                      style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                    >
+                      <Download className="w-4 h-4 shrink-0" />
+                      Install
+                    </button>
+                  </div>
+                </div>
+
+                {/* Mobile top-right close dismiss button */}
+                <button
+                  type="button"
+                  aria-label="Close"
+                  onClick={handleDismissInstallBanner}
+                  className="absolute top-2.5 right-2.5 p-1 text-slate-400 hover:text-slate-600 rounded-lg sm:hidden cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
             {/* Front-Page Carousel Banner Slider: Fully preserved and rendered (Image 1000155983) */}
             {bannerSliderEnabled && (
               <BannerSlider 
