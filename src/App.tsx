@@ -2599,12 +2599,8 @@ export default function App() {
                       type="button"
                       id="pwa-later-btn"
                       onClick={handleDismissInstallBanner}
-                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold rounded-xl border border-[#417CF4] text-[#3A81F5] hover:opacity-90 active:scale-95 transition-all cursor-pointer text-center"
-                      style={{ 
-                        borderColor: '#417CF4', 
-                        color: '#3A81F5', 
-                        background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.12) 0%, rgba(65, 124, 244, 0.12) 35%, rgba(58, 129, 245, 0.12) 65%, rgba(32, 165, 172, 0.12) 100%)' 
-                      }}
+                      className="flex-1 sm:flex-none px-4 py-1.5 sm:py-2 text-xs sm:text-sm font-bold text-white rounded-xl shadow-xs hover:opacity-95 active:scale-95 transition-all cursor-pointer text-center"
+                      style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                     >
                       Later
                     </button>
