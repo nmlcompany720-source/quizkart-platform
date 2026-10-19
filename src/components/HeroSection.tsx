@@ -17,7 +17,7 @@ import {
   Calendar,
   Bell
 } from 'lucide-react';
-import { DailyPrizeItem, PoolEconomics, ActiveContest } from '../types';
+import { DailyPrizeItem, PoolEconomics, ActiveContest, Question } from '../types';
 import { UPCOMING_PRIZES } from '../data/quizData';
 import { soundFx } from '../utils/audio';
 import { parseTargetTimestamp, getCountdown, formatCountdown } from '../utils/timerUtils';
@@ -47,6 +47,7 @@ interface HeroSectionProps {
   onContestStarted?: (contestId: string) => void;
   onLiveStateChange?: (isLive: boolean) => void;
   contestDurationSeconds?: number;
+  questions?: Question[];
 }
 
 // Full-featured Upcoming Contest Card matching exact Live Card layout
@@ -259,7 +260,8 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   onContestExpired,
   onContestStarted,
   onLiveStateChange,
-  contestDurationSeconds
+  contestDurationSeconds,
+  questions
 }) => {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -507,9 +509,10 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   );
 
   // Dynamic Questions count and Minutes duration from configured contest / database
+  const poolQuestionsCount = questions !== undefined ? questions.length : 0;
   const dynamicQuestionsCount = effectiveContest?.questionIds && effectiveContest.questionIds.length > 0
     ? effectiveContest.questionIds.length
-    : 10;
+    : poolQuestionsCount;
 
   const timerSecs = Number(localStorage.getItem('quizkart_global_quiz_timer')) || 600;
   const scheduledStartMs = effectiveContest?.scheduledTime ? parseTargetTimestamp(effectiveContest.scheduledTime) : 0;
@@ -988,16 +991,8 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
       {/* 4-Step Rules Bar */}
       <section id="how-it-works-section" className="rounded-2xl bg-white border border-slate-200/90 p-5 shadow-sm space-y-4">
         {/* Clean, professional title above the steps */}
-        <div className="flex items-center gap-2.5 pb-2 border-b border-slate-100">
-          <div 
-            className="w-7 h-7 rounded-lg flex items-center justify-center text-white shadow-xs shrink-0"
-            style={{ background: BRAND_GRADIENT }}
-          >
-            <Zap className="w-4 h-4 text-white" />
-          </div>
-          <div>
-            <h3 className="text-sm font-bold text-slate-900 tracking-tight">How It Works</h3>
-          </div>
+        <div className="text-center pb-2 border-b border-slate-100">
+          <h3 className="text-sm font-bold text-slate-900 tracking-tight">How It Works</h3>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3.5">

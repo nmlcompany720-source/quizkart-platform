@@ -41,7 +41,8 @@ service cloud.firestore {
     }
 
     function isValidQuestion(data) {
-      return data.question is string && data.question.size() > 0 && data.question.size() <= 500 &&
+      return (('question' in data && data.question is string && data.question.size() > 0 && data.question.size() <= 1000) ||
+              ('stem' in data && data.stem is string && data.stem.size() > 0 && data.stem.size() <= 1000)) &&
              data.correctIndex is number && data.correctIndex >= 0 && data.correctIndex <= 3 &&
              data.category is string && data.category.size() <= 80 &&
              data.difficulty is string && data.difficulty.size() <= 30;

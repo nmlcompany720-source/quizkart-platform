@@ -20,7 +20,6 @@ import { SupportTicketsPage } from './components/SupportTicketsPage';
 
 import { 
   TODAY_PRIZE, 
-  QUIZ_QUESTIONS, 
   INITIAL_LEADERBOARD, 
   DEFAULT_USER_PROFILE, 
   DEFAULT_REGISTERED_USERS,
@@ -72,7 +71,9 @@ import {
   fetchBannerSlidesFromFirestore,
   saveBannerSlidesToFirestore,
   isFirestoreQuotaExceeded,
-  isWithinRetentionWindow
+  isWithinRetentionWindow,
+  saveQuestionToFirestore,
+  removeQuestionFromFirestore
 } from './firebase';
 import { 
   getNextDepositId, 
@@ -88,6 +89,13 @@ import { parseTargetTimestamp, getCountdown } from './utils/timerUtils';
 import { calculateDynamicPool } from './utils/poolUtils';
 import { sanitizeContestSynchronous } from './utils/imageCompressor';
 import { getActiveDepositQr, setActiveDepositQr } from './utils/qrConfig';
+import { 
+  questionPoolManager, 
+  getAssignedQuestionsForUser, 
+  createRetakeBlockForUser, 
+  canonicalizeUserId,
+  isOldMockQuestion 
+} from './utils/questionPoolManager';
 import { User } from 'firebase/auth';
 import { Bell, X } from 'lucide-react';
 
@@ -1017,28 +1025,52 @@ export default function App() {
 
   const [quizQuestions, setQuizQuestions] = useState<Question[]>(() => {
     try {
+      let deletedIds: number[] = [];
+      try {
+        deletedIds = JSON.parse(localStorage.getItem('quizkart_deleted_question_ids') || '[]');
+      } catch {}
+      const deletedSet = new Set(deletedIds.map(Number));
+
       const saved = localStorage.getItem('quizkart_questions');
-      if (saved) {
+      if (saved !== null) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const valid = parsed.filter((q): q is Question => Boolean(q && q.id != null));
-          if (valid.length > 0) return valid;
+        if (Array.isArray(parsed)) {
+          return parsed.filter((q): q is Question => Boolean(q && q.id != null && !deletedSet.has(Number(q.id))));
         }
       }
-      return QUIZ_QUESTIONS;
+      return [];
     } catch {
-      return QUIZ_QUESTIONS;
+      return [];
     }
   });
 
   const [userProfile, setUserProfile] = useState<UserProfile>(() => {
     try {
       const saved = localStorage.getItem('quizkart_user_profile');
-      return saved ? JSON.parse(saved) : DEFAULT_USER_PROFILE;
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.id) {
+            parsed.id = parsed.id.startsWith('QK-') ? parsed.id : (parsed.id.startsWith('USR-') ? `QK-${parsed.id}` : `QK-USR-${parsed.id}`);
+          } else {
+            parsed.id = 'QK-USR-1001';
+          }
+          if (parsed.uid && !parsed.uid.startsWith('QK-')) {
+            parsed.uid = parsed.id;
+          }
+          return parsed;
+        }
+      }
+      return DEFAULT_USER_PROFILE;
     } catch {
       return DEFAULT_USER_PROFILE;
     }
   });
+
+  // Strictly map User ID only to its assigned questions configured in the Admin Panel
+  const userAssignedQuestions = useMemo(() => {
+    return getAssignedQuestionsForUser(userProfile?.id, quizQuestions);
+  }, [userProfile?.id, quizQuestions]);
 
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(() => {
     try {
@@ -1397,8 +1429,18 @@ export default function App() {
   }, [todayPrize]);
 
   useEffect(() => {
+    questionPoolManager.loadAllQuestions([]).then((loaded) => {
+      if (Array.isArray(loaded)) {
+        setQuizQuestions(loaded);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    questionPoolManager.saveAllQuestions(quizQuestions);
     try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(quizQuestions));
+      localStorage.setItem('quizkart_questions', JSON.stringify(quizQuestions.slice(0, 1000)));
+      localStorage.setItem('quizkart_questions_initialized', 'true');
     } catch {}
   }, [quizQuestions]);
 
@@ -1419,7 +1461,7 @@ export default function App() {
           list[idx] = {
             ...list[idx],
             ...userProfile,
-            id: `USR-${1001 + idx}`,
+            id: `QK-USR-${1001 + idx}`,
             registrationDate: list[idx].registrationDate || userProfile.registrationDate || getCurrentFormattedTimestamp(),
             passwordStatus:
               userProfile.passwordStatus && !userProfile.passwordStatus.includes('••••') && !userProfile.passwordStatus.includes('Secured')
@@ -1431,10 +1473,10 @@ export default function App() {
         } else {
           list.push({
             ...userProfile,
-            id: `USR-${1001 + list.length}`
+            id: `QK-USR-${1001 + list.length}`
           });
         }
-        const reindexed = list.map((u, i) => ({ ...u, id: `USR-${1001 + i}` }));
+        const reindexed = list.map((u, i) => ({ ...u, id: `QK-USR-${1001 + i}` }));
         localStorage.setItem('quizkart_registered_users', JSON.stringify(reindexed));
         window.dispatchEvent(new Event('quizkart_users_updated'));
       }
@@ -1478,14 +1520,15 @@ export default function App() {
         if (cleanEmail) {
           const idx = list.findIndex((u) => u && u.email && u.email.trim().toLowerCase() === cleanEmail);
           if (idx >= 0) {
-            return `USR-${1001 + idx}`;
+            return `QK-USR-${1001 + idx}`;
           }
         }
       } catch {}
-      if (fallbackId && /^USR-\d+$/i.test(fallbackId.trim())) {
-        return fallbackId.trim().toUpperCase();
+      if (fallbackId && /^(?:QK-)?USR-\d+$/i.test(fallbackId.trim())) {
+        const raw = fallbackId.trim().toUpperCase();
+        return raw.startsWith('QK-') ? raw : `QK-${raw}`;
       }
-      return 'USR-1001';
+      return 'QK-USR-1001';
     };
 
     const unsubscribe = subscribeToAuth(async (user) => {
@@ -1565,13 +1608,45 @@ export default function App() {
   useEffect(() => {
     async function loadCloudData() {
       try {
+        const deletedSet = questionPoolManager.getDeletedQuestionIds();
         const cloudQuestions = await fetchQuestionsFromFirestore();
-        if (cloudQuestions && cloudQuestions.length > 0) {
-          const valid = cloudQuestions.filter((q): q is Question => Boolean(q && q.id != null));
-          if (valid.length > 0) {
-            setQuizQuestions(valid);
+        const cleanCloud = (cloudQuestions || []).filter(
+          (q): q is Question => Boolean(q && q.id != null && !deletedSet.has(Number(q.id)) && !isOldMockQuestion(q))
+        );
+
+        setQuizQuestions(currentLocal => {
+          const cleanLocal = (currentLocal || []).filter(
+            q => q && q.id != null && !deletedSet.has(Number(q.id)) && !isOldMockQuestion(q)
+          );
+
+          // Merge by ID: cleanLocal takes precedence for newly imported/custom questions
+          const map = new Map<number, Question>();
+          for (const q of cleanCloud) {
+            map.set(Number(q.id), q);
           }
-        }
+          for (const q of cleanLocal) {
+            map.set(Number(q.id), q);
+          }
+
+          const merged = Array.from(map.values()).sort((a, b) => Number(a.id) - Number(b.id));
+
+          // If local questions had items not in cloud, sync them to cloud in background
+          for (const q of cleanLocal) {
+            if (!cleanCloud.some(cq => Number(cq.id) === Number(q.id))) {
+              saveQuestionToFirestore(q).catch(() => {});
+            }
+          }
+
+          if (merged.length > 0) {
+            questionPoolManager.saveAllQuestions(merged);
+            try {
+              localStorage.setItem('quizkart_questions', JSON.stringify(merged.slice(0, 1000)));
+              localStorage.setItem('quizkart_questions_initialized', 'true');
+            } catch {}
+            return merged;
+          }
+          return cleanLocal;
+        });
       } catch (err) {
         console.warn('Firestore questions load notice:', err);
       }
@@ -1736,7 +1811,7 @@ export default function App() {
 
     if (existingMatch) {
       const matchIdx = existingUsers.indexOf(existingMatch);
-      const canonicalId = `USR-${1001 + (matchIdx >= 0 ? matchIdx : 0)}`;
+      const canonicalId = `QK-USR-${1001 + (matchIdx >= 0 ? matchIdx : 0)}`;
       // RETURNING LOGGED-IN USER: Persist and load their actual real-time database state without resetting
       updatedProfile = {
         ...existingMatch,
@@ -1772,9 +1847,9 @@ export default function App() {
         }
       } catch {}
     } else {
-      // NEW USER REGISTRATION: Sequential ID starting at USR-1001 + 0 for Wallet, Total Won, and Quizzes Played
+      // NEW USER REGISTRATION: Sequential ID starting strictly at QK-USR-1001
       const nextSeqNum = 1001 + existingUsers.length;
-      const sequentialId = `USR-${nextSeqNum}`;
+      const sequentialId = `QK-USR-${nextSeqNum}`;
       updatedProfile = {
         id: sequentialId,
         uid: currentUser?.uid || sequentialId,
@@ -2117,6 +2192,38 @@ export default function App() {
       });
     }
 
+    // RE-JOIN / RETAKE CONTEST RANDOMIZATION LOGIC (Requirement 3):
+    // 1. Automatically create a new dedicated 10-question page/block entry in Admin Question Manager labeled with that User ID.
+    // 2. Generate a fresh set of 10 randomized questions drawn from the contest pool.
+    // 3. Strict Unique Randomization Rule: Avoid exact duplicate sequence or selection as prior attempts.
+    const deletedSet = questionPoolManager.getDeletedQuestionIds();
+    const cleanPool = quizQuestions.filter(q => q && q.id != null && !deletedSet.has(Number(q.id)) && !isOldMockQuestion(q));
+
+    if (cleanPool.length > 0) {
+      const canonicalUserId = canonicalizeUserId(userProfile?.id);
+      const userAttemptsCount = userQuizAttempts.filter(
+        a => (a && (canonicalizeUserId(a.userId) === canonicalUserId || a.userName === userProfile.name))
+      ).length;
+
+      const existingAssigned = getAssignedQuestionsForUser(userProfile?.id, quizQuestions);
+      const hasTakenBefore = userAttemptsCount > 0 || lastQuizResult !== null || Boolean(sessionStorage.getItem(`quizkart_has_taken_${canonicalUserId}`));
+      const isRetakeOrNewJoin = hasTakenBefore || existingAssigned.length === 0;
+
+      if (isRetakeOrNewJoin) {
+        const retakeResult = createRetakeBlockForUser({
+          userId: userProfile?.id,
+          allQuestions: quizQuestions,
+          onQuestionSavedToFirestore: (q) => {
+            saveQuestionToFirestore(q).catch(() => {});
+          }
+        });
+
+        if (retakeResult.newQuestions.length > 0) {
+          setQuizQuestions(retakeResult.updatedPool);
+        }
+      }
+    }
+
     handleLaunchQuiz(isPracticeMode);
   };
 
@@ -2173,11 +2280,6 @@ export default function App() {
       });
     }
 
-    // Random question generation (shuffle questions for unique order per contestant)
-    setQuizQuestions(prev => {
-      const shuffled = [...prev].sort(() => Math.random() - 0.5);
-      return shuffled;
-    });
     setCurrentTab('quiz_arena');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -2212,7 +2314,7 @@ export default function App() {
         localStorage.setItem('quizkart_security_logs', JSON.stringify([newViolation, ...parsed]));
       } catch {}
     } else {
-      (quizQuestions || []).filter(q => q && q.id != null).forEach((q) => {
+      (userAssignedQuestions || []).filter(q => q && q.id != null).forEach((q) => {
         const selected = answers[q.id];
         if (selected !== undefined) {
           if (selected === q.correctIndex) {
@@ -2242,7 +2344,7 @@ export default function App() {
       userName: userProfile.name || 'You',
       avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=120&auto=format&fit=crop&q=80',
       score: calculatedScore,
-      totalQuestions: quizQuestions.length,
+      totalQuestions: userAssignedQuestions.length,
       timeTakenSeconds,
       formattedTime: formatSecs(timeTakenSeconds),
       city: userProfile.address.city || 'Bengaluru',
@@ -2310,17 +2412,24 @@ export default function App() {
 
       if (entry.isCurrentUser) {
         userRank = rank;
-        rewardWonText = rewardText;
-        rewardType = rType;
-        rewardAmount = rAmt;
+        if (securityBreached) {
+          rewardWonText = 'Disqualified (Violation)';
+          rewardType = 'none';
+          rewardAmount = 0;
+        } else {
+          rewardWonText = rewardText;
+          rewardType = rType;
+          rewardAmount = rAmt;
+        }
       }
 
       return {
         ...entry,
         rank,
-        rewardText,
-        rewardType: rType,
-        rewardAmount: rAmt
+        rewardText: (entry.isCurrentUser && securityBreached) ? 'Disqualified (Violation)' : rewardText,
+        rewardType: (entry.isCurrentUser && securityBreached) ? 'none' : rType,
+        rewardAmount: (entry.isCurrentUser && securityBreached) ? 0 : rAmt,
+        securityBreached: entry.isCurrentUser ? securityBreached : false
       };
     });
 
@@ -2349,6 +2458,10 @@ export default function App() {
     };
 
     setLastQuizResult(attemptResult);
+    try {
+      const canonicalUserId = canonicalizeUserId(userProfile?.id);
+      sessionStorage.setItem(`quizkart_has_taken_${canonicalUserId}`, 'true');
+    } catch {}
 
     // Update real-time user quiz attempts immediately (Strict 30-Day Retention Window)
     setUserQuizAttempts(prev => {
@@ -2683,6 +2796,7 @@ export default function App() {
               onContestStarted={handleContestStarted}
               onLiveStateChange={setHeroReportedLive}
               contestDurationSeconds={globalQuizTimer}
+              questions={userAssignedQuestions}
             />
           </div>
         )}
@@ -2693,7 +2807,7 @@ export default function App() {
             {lastQuizResult ? (
               <QuizResult
                 result={lastQuizResult}
-                questions={quizQuestions}
+                questions={userAssignedQuestions}
                 todayPrize={todayPrize}
                 onViewLeaderboard={() => {
                   setCurrentTab('leaderboard');
@@ -2707,7 +2821,7 @@ export default function App() {
               />
             ) : (
               <QuizArena
-                questions={quizQuestions}
+                questions={userAssignedQuestions}
                 onSubmitQuiz={handleQuizSubmit}
                 isPractice={isPracticeMode}
                 todayPrize={todayPrize}

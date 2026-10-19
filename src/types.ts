@@ -1,11 +1,30 @@
+export type QuestionCategory = 'Maths' | 'Reasoning' | 'Science' | 'GK' | 'English';
+
 export interface Question {
   id: number;
-  question: string;
+  stem?: string; // Question text
+  question: string; // Question text (supports both stem and question)
   options: [string, string, string, string];
   correctIndex: number;
-  category: 'General Knowledge' | 'Science & Tech' | 'Indian Heritage' | 'Current Affairs' | 'Geography & Nature';
+  correctKey?: 'A' | 'B' | 'C' | 'D';
+  answer?: {
+    key: 'A' | 'B' | 'C' | 'D';
+    text: string;
+  };
+  category: QuestionCategory | 'General Knowledge' | 'Science & Tech' | 'Indian Heritage' | 'Current Affairs' | 'Geography & Nature' | string;
   explanation: string;
   difficulty: 'Easy' | 'Medium' | 'Hard' | 'Expert';
+  createdAt?: string;
+  updatedAt?: string;
+  sessionUserId?: string;
+  sessionId?: string;
+  slotIndex?: number;
+  isShuffledFallback?: boolean;
+  assignedUserId?: string;
+  isCustom?: boolean;
+  isRetake?: boolean;
+  originalSourceId?: number;
+  subject?: string;
 }
 
 export interface UserAddress {

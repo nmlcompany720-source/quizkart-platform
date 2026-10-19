@@ -1,5 +1,6 @@
-import { Question, ActiveContest, AutoPilotSettings, LeaderboardEntry, UserProfile, DailyPrizeItem } from '../types';
+import { Question, QuestionCategory, ActiveContest, AutoPilotSettings, LeaderboardEntry, UserProfile, DailyPrizeItem } from '../types';
 import { sanitizeContestSynchronous } from './imageCompressor';
+import { normalizeCategory } from './aiQuestionParser';
 
 /**
  * SKILL-BASED QUIZ ENGINE (3-3-3-1 RULE):
@@ -65,12 +66,26 @@ function shuffleArray<T>(array: T[]): T[] {
   }
   return result;
 }
-
+ 
 /**
- * Strictly selects 10 questions according to the 3-3-3-1 Skill-Based Rule:
- * 3 Easy, 3 Medium, 3 Hard, 1 Expert Tie-Breaker.
+ * 10-QUESTION BALANCED SUBJECT ROTATION ENGINE:
+ * Strictly samples:
+ * - 2 Maths Questions
+ * - 2 Reasoning Questions
+ * - 2 Science Questions
+ * - 2 GK Questions
+ * - 2 English Questions
+ *
  * Enforces USER ROTATION LOCK: skips previously answered question IDs unless pool exhausted.
  */
+export const BALANCED_SUBJECT_CONFIG: { category: QuestionCategory; count: number }[] = [
+  { category: 'Maths', count: 2 },
+  { category: 'Reasoning', count: 2 },
+  { category: 'Science', count: 2 },
+  { category: 'GK', count: 2 },
+  { category: 'English', count: 2 }
+];
+
 export const selectSkillBasedQuestions = (
   pool: Question[],
   answeredIds: number[] = getAnsweredQuestionIds()
@@ -78,43 +93,56 @@ export const selectSkillBasedQuestions = (
   if (!pool || pool.length === 0) return [];
 
   const answeredSet = new Set(answeredIds);
+  const selectedQuestions: Question[] = [];
+  const selectedIdSet = new Set<string | number>();
 
-  const easyPool = pool.filter(q => q.difficulty === 'Easy');
-  const mediumPool = pool.filter(q => q.difficulty === 'Medium');
-  const hardPool = pool.filter(q => q.difficulty === 'Hard');
-  const expertPool = pool.filter(q => q.difficulty === 'Expert');
-
-  // Helper to pick N items prioritizing un-answered questions
-  const pickFromTier = (tierPool: Question[], count: number, fallbackLabel: Question['difficulty']): Question[] => {
-    if (!tierPool || tierPool.length === 0) {
-      // Fallback: pick from any available question in pool, mapped to that difficulty
-      const anyPool = (pool || []).filter(q => q && q.difficulty !== fallbackLabel);
-      const safePool = (anyPool.length > 0 ? shuffleArray(anyPool) : shuffleArray(pool || [])) || [];
-      return safePool.slice(0, count);
-    }
-
-    // 1. Unused questions for this user
-    const unused = (tierPool || []).filter(q => q && q.id != null && !answeredSet.has(q.id));
-    const shuffledUnused = shuffleArray(unused) || [];
-
-    if (shuffledUnused.length >= count) {
-      return shuffledUnused.slice(0, count);
-    }
-
-    // 2. If unused is less than count, fill remainder with previously answered from same tier
-    const used = (tierPool || []).filter(q => q && q.id != null && answeredSet.has(q.id));
-    const shuffledUsed = shuffleArray(used) || [];
-    const combined = [...shuffledUnused, ...shuffledUsed];
-    return combined.slice(0, count);
+  // Group pool by the 5 strict subjects
+  const subjectBuckets: Record<QuestionCategory, Question[]> = {
+    Maths: [],
+    Reasoning: [],
+    Science: [],
+    GK: [],
+    English: []
   };
 
-  const selectedEasy = pickFromTier(easyPool, 3, 'Easy');
-  const selectedMedium = pickFromTier(mediumPool, 3, 'Medium');
-  const selectedHard = pickFromTier(hardPool, 3, 'Hard');
-  const selectedExpert = pickFromTier(expertPool, 1, 'Expert');
+  for (const q of pool) {
+    if (!q || q.id == null) continue;
+    const cat = normalizeCategory(q.category, `${q.question || q.stem || ''} ${q.explanation || ''}`);
+    subjectBuckets[cat].push(q);
+  }
 
-  // Progressive difficulty sequence: Easy -> Medium -> Hard -> Expert Tie-Breaker
-  return [...selectedEasy, ...selectedMedium, ...selectedHard, ...selectedExpert];
+  // Sample exactly 2 questions per subject
+  for (const { category, count } of BALANCED_SUBJECT_CONFIG) {
+    const bucket = subjectBuckets[category] || [];
+    
+    // 1. Separate into unused (un-answered) vs previously answered
+    const unused = bucket.filter(q => !answeredSet.has(Number(q.id)) && !selectedIdSet.has(q.id));
+    const used = bucket.filter(q => answeredSet.has(Number(q.id)) && !selectedIdSet.has(q.id));
+
+    const shuffledUnused = shuffleArray(unused);
+    const shuffledUsed = shuffleArray(used);
+
+    const candidates = [...shuffledUnused, ...shuffledUsed];
+    const picked = candidates.slice(0, count);
+
+    for (const q of picked) {
+      selectedQuestions.push(q);
+      selectedIdSet.add(q.id);
+    }
+  }
+
+  // If pool was sparse in any subject and we have fewer than 10, backfill with remaining available questions
+  if (selectedQuestions.length < 10) {
+    const remainingPool = shuffleArray(pool.filter(q => q && q.id != null && !selectedIdSet.has(q.id)));
+    for (const q of remainingPool) {
+      if (selectedQuestions.length >= 10) break;
+      selectedQuestions.push(q);
+      selectedIdSet.add(q.id);
+    }
+  }
+
+  // Return exactly 10 questions in balanced subject rotation
+  return selectedQuestions.slice(0, 10);
 };
 
 /**

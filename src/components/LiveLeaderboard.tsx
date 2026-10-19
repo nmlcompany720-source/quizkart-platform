@@ -11,7 +11,8 @@ import {
   CheckCircle2, 
   Filter,
   Users,
-  ShieldCheck
+  ShieldCheck,
+  ShieldAlert
 } from 'lucide-react';
 import { LeaderboardEntry } from '../types';
 import { soundFx } from '../utils/audio';
@@ -218,8 +219,15 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
               </div>
             </div>
           </div>
-          <div className="text-xs font-bold bg-white px-3 py-1.5 rounded-xl border border-indigo-200 text-emerald-700 flex items-center gap-1.5 self-start sm:self-auto shadow-xs">
-            <span>{userEntry.rewardText}</span>
+          <div className="text-xs font-bold bg-white px-3 py-1.5 rounded-xl border border-indigo-200 flex items-center gap-1.5 self-start sm:self-auto shadow-xs">
+            {userEntry.securityBreached || userEntry.rewardText === 'Disqualified (Violation)' ? (
+              <span className="text-rose-600 flex items-center gap-1 font-semibold">
+                <ShieldAlert className="w-3.5 h-3.5 text-rose-600" />
+                Disqualified (Violation)
+              </span>
+            ) : (
+              <span className="text-emerald-700">{userEntry.rewardText}</span>
+            )}
           </div>
         </div>
       )}
@@ -371,7 +379,12 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
 
                     {/* Reward */}
                     <td className="py-3 px-4">
-                      {isTop1 ? (
+                      {entry.securityBreached || entry.rewardText === 'Disqualified (Violation)' ? (
+                        <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-800 bg-rose-50 px-2.5 py-0.5 rounded-full border border-rose-200">
+                          <ShieldAlert className="w-3.5 h-3.5 text-rose-600" />
+                          Disqualified (Violation)
+                        </span>
+                      ) : isTop1 ? (
                         <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-amber-900 bg-amber-50 px-2.5 py-0.5 rounded-full border border-amber-200">
                           <Gift className="w-3.5 h-3.5 text-amber-600" />
                           {entry.rewardText}

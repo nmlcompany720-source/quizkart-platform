@@ -8,7 +8,6 @@ import {
   Check
 } from 'lucide-react';
 import { Question, DailyPrizeItem, PoolBreakdown } from '../types';
-import { QUIZ_QUESTIONS } from '../data/quizData';
 import { HINDI_QUESTION_MAP } from '../data/quizTranslations';
 import { PreQuizOnboarding } from './PreQuizOnboarding';
 import { soundFx } from '../utils/audio';
@@ -34,7 +33,6 @@ interface QuizArenaProps {
   contestDurationSeconds?: number;
 }
 
-const QUESTION_TIMER_SECONDS = 59; // Strict 59-second per-question timer
 const DEFAULT_MAX_TIME_SECONDS = 600; // 10 mins (600s) locked default master timer
 const BRAND_GRADIENT = 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)';
 
@@ -112,9 +110,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   const [answers, setAnswers] = useState<Record<number, number>>({});
   const [markedForReview, setMarkedForReview] = useState<number[]>([]);
   
-  // Per-Question 10-Second Timer
-  const [questionSecondsRemaining, setQuestionSecondsRemaining] = useState<number>(QUESTION_TIMER_SECONDS);
-  
   // Overall Timer (Locked to Admin Defined Global Timer)
   const [totalSecondsRemaining, setTotalSecondsRemaining] = useState<number>(contestMaxSeconds);
   
@@ -131,7 +126,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   });
 
   const startTimeRef = useRef<number>(Date.now());
-  const questionTimerRef = useRef<NodeJS.Timeout | null>(null);
   const totalTimerRef = useRef<NodeJS.Timeout | null>(null);
   const securityTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isSubmittingRef = useRef<boolean>(false);
@@ -149,11 +143,10 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   onSubmitQuizRef.current = onSubmitQuiz;
 
   const validQuestions = React.useMemo(() => {
-    if (Array.isArray(questions) && questions.length > 0) {
-      const filtered = questions.filter((q): q is Question => Boolean(q && q.id != null));
-      if (filtered.length > 0) return filtered;
+    if (Array.isArray(questions)) {
+      return questions.filter((q): q is Question => Boolean(q && q.id != null));
     }
-    return QUIZ_QUESTIONS;
+    return [];
   }, [questions]);
 
   const currentIndexRef = useRef(currentIndex);
@@ -162,7 +155,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   const questionsRef = useRef(validQuestions);
   questionsRef.current = validQuestions;
 
-  const currentQuestion = validQuestions[currentIndex] || validQuestions[0] || QUIZ_QUESTIONS[0];
+  const currentQuestion = validQuestions[currentIndex] || validQuestions[0] || null;
   const answeredCount = Object.keys(answers).length;
   const unansweredCount = Math.max(0, validQuestions.length - answeredCount);
   const markedCount = markedForReview.length;
@@ -201,8 +194,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     if (isSubmittingRef.current) return;
     isSubmittingRef.current = true;
 
-    // Clear timers
-    if (questionTimerRef.current) clearInterval(questionTimerRef.current);
+    // Clear timer
     if (totalTimerRef.current) clearInterval(totalTimerRef.current);
 
     soundFx.playSecurityAlarm();
@@ -227,7 +219,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     if (isSubmittingRef.current) return;
     isSubmittingRef.current = true;
 
-    if (questionTimerRef.current) clearInterval(questionTimerRef.current);
     if (totalTimerRef.current) clearInterval(totalTimerRef.current);
 
     const elapsed = (Date.now() - startTimeRef.current) / 1000;
@@ -239,7 +230,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   useEffect(() => {
     return () => {
       if (securityTimeoutRef.current) clearTimeout(securityTimeoutRef.current);
-      if (questionTimerRef.current) clearInterval(questionTimerRef.current);
       if (totalTimerRef.current) clearInterval(totalTimerRef.current);
     };
   }, []);
@@ -345,42 +335,6 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   }, [triggerSecurityBreach, preQuizCompleted]);
 
   // -------------------------------------------------------------
-  // 2. PER-QUESTION TIMER (59s STRICT COUNTDOWN & AUTO-ADVANCE)
-  // -------------------------------------------------------------
-  // Interval tick: purely decrements question timer without side-effects
-  useEffect(() => {
-    if (!preQuizCompleted) return;
-
-    setQuestionSecondsRemaining(QUESTION_TIMER_SECONDS);
-
-    if (questionTimerRef.current) clearInterval(questionTimerRef.current);
-
-    questionTimerRef.current = setInterval(() => {
-      setQuestionSecondsRemaining((prev) => (prev > 0 ? prev - 1 : 0));
-    }, 1000);
-
-    return () => {
-      if (questionTimerRef.current) clearInterval(questionTimerRef.current);
-    };
-  }, [currentIndex, preQuizCompleted]);
-
-  // Effect: Handle question timer expiry & auto-advance when 59s timer reaches 00:00
-  useEffect(() => {
-    if (!preQuizCompleted) return;
-
-    if (questionSecondsRemaining === 0) {
-      soundFx.playTimerTick();
-      if (currentIndexRef.current < questionsRef.current.length - 1) {
-        const nextIdx = currentIndexRef.current + 1;
-        setCurrentIndex(nextIdx);
-        setQuestionSecondsRemaining(QUESTION_TIMER_SECONDS);
-      } else {
-        handleStandardSubmit();
-      }
-    } else if (questionSecondsRemaining <= 3 && questionSecondsRemaining > 0) {
-      soundFx.playTimerTick();
-    }
-  }, [questionSecondsRemaining, preQuizCompleted, handleStandardSubmit]);
 
   // -------------------------------------------------------------
   // 3. OVERALL ARENA TIMER (10-MINUTE MASTER TIMER)
@@ -487,24 +441,31 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     >
       {/* SECURITY BREACH OVERLAY ALERT BANNER */}
       {securityAlert.show && (
-        <div className="fixed inset-0 z-50 bg-rose-950/90 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="max-w-md w-full bg-white rounded-3xl p-6 sm:p-8 text-center space-y-4 shadow-2xl border-4 border-rose-500 animate-in zoom-in-95 duration-200">
-            <div className="w-16 h-16 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center mx-auto ring-8 ring-rose-50">
-              <ShieldAlert className="w-10 h-10 animate-bounce" />
+        <div 
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-sm"
+          style={{ backgroundColor: 'rgba(15, 23, 42, 0.75)' }}
+        >
+          <div 
+            className="max-w-md w-full rounded-2xl p-6 sm:p-8 text-center space-y-4 shadow-xl animate-in zoom-in-95 duration-200"
+            style={{ 
+              backgroundColor: '#FFFFFF',
+              border: '1px solid rgba(239, 68, 68, 0.2)',
+              boxShadow: '0 20px 25px -5px rgba(15, 23, 42, 0.1), 0 8px 10px -6px rgba(15, 23, 42, 0.1)'
+            }}
+          >
+            <div 
+              className="w-16 h-16 rounded-full flex items-center justify-center mx-auto text-[#EF4444]"
+              style={{ backgroundColor: '#FEF2F2' }}
+            >
+              <ShieldAlert className="w-9 h-9" />
             </div>
-            <div>
-              <h2 className="text-xl font-black text-slate-900 tracking-tight">SECURITY PROTOCOL TRIGGERED</h2>
-              <p className="text-xs font-bold text-rose-600 uppercase tracking-widest mt-1">Live Camera / External Tool Detected</p>
-            </div>
-            <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl text-xs text-rose-900 leading-relaxed font-semibold">
-              {securityAlert.reason}
-            </div>
-            <p className="text-xs text-slate-600">
-              Your test has been automatically locked & submitted. Unanswered questions are scored as 0.
-            </p>
-            <div className="flex items-center justify-center gap-2 text-xs font-bold text-rose-600">
-              <span className="w-2 h-2 rounded-full bg-rose-600 animate-ping" />
-              <span>Transmitting security breach report to server...</span>
+            <div className="space-y-1.5">
+              <h2 className="text-xl font-bold tracking-tight" style={{ color: '#0F172A' }}>
+                SECURITY ALERT: TRIGGERED
+              </h2>
+              <p className="text-sm font-bold" style={{ color: '#DC2626' }}>
+                Tab Switch / Screen Leave Detected
+              </p>
             </div>
           </div>
         </div>
@@ -619,7 +580,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     className="text-xs font-bold text-white px-3 py-1 rounded-full shadow-xs border border-white/20 shrink-0 inline-flex items-center justify-center tracking-wide"
                     style={{ background: BRAND_GRADIENT }}
                   >
-                    {currentIndex + 1} / {validQuestions.length}
+                    {validQuestions.length === 0 ? '0 / 0' : `${currentIndex + 1} / ${validQuestions.length}`}
                   </span>
 
                   {/* Badge 2: [Category Name] with Pure White (#FFFFFF) Background */}
@@ -627,7 +588,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     className="text-xs font-bold text-slate-800 px-3 py-1 rounded-full border border-slate-200/90 shrink-0 inline-flex items-center justify-center shadow-2xs"
                     style={{ background: '#FFFFFF' }}
                   >
-                    {translateCategory(currentQuestion.category, selectedLanguage)}
+                    {currentQuestion ? translateCategory(currentQuestion.category, selectedLanguage) : 'No Category'}
                   </span>
 
                   {/* Badge 3: [Difficulty] with Pure White (#FFFFFF) Background */}
@@ -635,7 +596,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     className="text-xs font-bold text-slate-800 px-3 py-1 rounded-full border border-slate-200/90 shrink-0 inline-flex items-center justify-center shadow-2xs"
                     style={{ background: '#FFFFFF' }}
                   >
-                    {translateDifficulty(currentQuestion.difficulty || 'Medium', selectedLanguage)}
+                    {currentQuestion ? translateDifficulty(currentQuestion.difficulty || 'Medium', selectedLanguage) : 'None'}
                   </span>
 
                   {/* Badge 4: [-0.33] in light-red warning tag */}
@@ -676,85 +637,99 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     {selectedLanguage === 'Hindi' ? 'Switch to English' : 'हिन्दी में बदलें'}
                   </button>
                 </div>
-                <h2 className="text-xl sm:text-2xl lg:text-3xl font-bold text-slate-900 leading-relaxed tracking-tight">
-                  <span className="mr-2 font-black">{currentIndex + 1}.</span>
-                  {selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
-                    ? HINDI_QUESTION_MAP[currentQuestion.id].question
-                    : currentQuestion.question}
-                </h2>
+
+                {currentQuestion ? (
+                  <h2 className="text-xl sm:text-2xl lg:text-3xl font-bold text-slate-900 leading-relaxed tracking-tight">
+                    <span className="mr-2 font-black">{currentIndex + 1}.</span>
+                    {selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
+                      ? HINDI_QUESTION_MAP[currentQuestion.id].question
+                      : currentQuestion.question}
+                  </h2>
+                ) : (
+                  <div className="py-8 text-center space-y-3">
+                    <h2 className="text-2xl font-bold text-slate-900">
+                      0 Active Questions
+                    </h2>
+                    <p className="text-xs sm:text-sm text-slate-500 max-w-md mx-auto">
+                      The Question Library currently has 0 active questions in live rotation. Please import questions in the Admin Panel to activate this contest.
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* 4 Option Cards (A, B, C, D): Pure White (#FFFFFF) background always. When selected, Primary Brand Gradient applied strictly to OUTLINE BORDER only */}
-              <div className="space-y-3 pt-1">
-                {(selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
-                  ? HINDI_QUESTION_MAP[currentQuestion.id].options
-                  : currentQuestion.options
-                ).map((optText, optIdx) => {
-                  const isSelected = selectedOption === optIdx;
-                  const letter = String.fromCharCode(65 + optIdx);
+              {currentQuestion && (
+                <div className="space-y-3 pt-1">
+                  {(selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
+                    ? HINDI_QUESTION_MAP[currentQuestion.id].options
+                    : currentQuestion.options
+                  ).map((optText, optIdx) => {
+                    const isSelected = selectedOption === optIdx;
+                    const letter = String.fromCharCode(65 + optIdx);
 
-                  return (
-                    <button
-                      key={optIdx}
-                      type="button"
-                      id={`quiz-option-${letter}`}
-                      onClick={() => handleSelectOption(optIdx)}
-                      className={`w-full p-4 sm:p-5 rounded-2xl text-left transition-all flex items-center gap-4 cursor-pointer active:scale-[0.99] shadow-xs`}
-                      style={
-                        isSelected
-                          ? { 
-                              border: '2px solid transparent',
-                              background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box',
-                              color: '#0F172A',
-                              boxShadow: '0 4px 14px rgba(65, 124, 244, 0.18)'
-                            }
-                          : { 
-                              background: '#FFFFFF', 
-                              border: '2px solid #E2E8F0', 
-                              color: '#1E293B' 
-                            }
-                      }
-                    >
-                      {/* Option Letter (A, B, C, D): Internal background strictly pure white (#FFFFFF) across all question views */}
-                      <span 
-                        className={`w-10 h-10 rounded-xl font-black text-base flex items-center justify-center shrink-0 border transition-all ${
+                    return (
+                      <button
+                        key={optIdx}
+                        type="button"
+                        id={`quiz-option-${letter}`}
+                        onClick={() => handleSelectOption(optIdx)}
+                        className={`w-full p-4 sm:p-5 rounded-2xl text-left transition-all flex items-center gap-4 cursor-pointer active:scale-[0.99] shadow-xs`}
+                        style={
                           isSelected
-                            ? 'border-blue-500 text-blue-600 shadow-xs'
-                            : 'border-slate-300 text-slate-700'
+                            ? { 
+                                border: '2px solid transparent',
+                                background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box',
+                                color: '#0F172A',
+                                boxShadow: '0 4px 14px rgba(65, 124, 244, 0.18)'
+                              }
+                            : { 
+                                background: '#FFFFFF', 
+                                border: '2px solid #E2E8F0', 
+                                color: '#1E293B' 
+                              }
+                        }
+                      >
+                        {/* Option Letter (A, B, C, D): Internal background strictly pure white (#FFFFFF) across all question views */}
+                        <span 
+                          className={`w-10 h-10 rounded-xl font-black text-base flex items-center justify-center shrink-0 border transition-all ${
+                            isSelected
+                              ? 'border-blue-500 text-blue-600 shadow-xs'
+                              : 'border-slate-300 text-slate-700'
+                          }`}
+                          style={{ background: '#FFFFFF' }}
+                        >
+                          {letter}
+                        </span>
+
+                        {/* Option Choice Text - Bold & Larger typography */}
+                        <span className={`text-base sm:text-lg font-bold leading-snug flex-1 ${
+                          isSelected ? 'text-slate-900 font-extrabold' : 'text-slate-800'
+                        }`}>
+                          {optText}
+                        </span>
+
+                        {/* Selection Checkmark Indicator: Stays visible when marked for review */}
+                        <span className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-all ${
+                          isSelected ? 'border-transparent text-white' : 'border-2 border-slate-300 bg-white'
                         }`}
-                        style={{ background: '#FFFFFF' }}
-                      >
-                        {letter}
-                      </span>
+                        style={isSelected ? { background: BRAND_GRADIENT } : undefined}
+                        >
+                          {isSelected && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
 
-                      {/* Option Choice Text - Bold & Larger typography */}
-                      <span className={`text-base sm:text-lg font-bold leading-snug flex-1 ${
-                        isSelected ? 'text-slate-900 font-extrabold' : 'text-slate-800'
-                      }`}>
-                        {optText}
-                      </span>
-
-                      {/* Selection Checkmark Indicator: Stays visible when marked for review */}
-                      <span className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-all ${
-                        isSelected ? 'border-transparent text-white' : 'border-2 border-slate-300 bg-white'
-                      }`}
-                      style={isSelected ? { background: BRAND_GRADIENT } : undefined}
-                      >
-                        {isSelected && <Check className="w-3.5 h-3.5 stroke-[3]" />}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Question Footer Actions */}
-              <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-100">
-                <div className="flex items-center gap-2">
-                  {/* 'Mark for Review' Button: No left icon, clean dark black outline style (#000000) */}
+              {/* Question Footer Actions - STRICTLY STACKED IN TWO ROWS */}
+              <div className="flex flex-col gap-3 pt-4 border-t border-slate-100 w-full">
+                {/* Row 1 (Dedicated Top Row): 'Mark for Review' / 'Marked for Review' */}
+                <div className="w-full">
                   <button
                     id="mark-review-btn"
                     onClick={handleToggleMarkForReview}
-                    className="px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer bg-white text-black border border-black hover:bg-black/5"
+                    className="w-full py-2.5 px-4 rounded-xl text-xs font-bold transition-all cursor-pointer bg-white text-black border border-black hover:bg-black/5 flex items-center justify-center text-center"
                     style={{ background: '#FFFFFF', borderColor: '#000000', color: '#000000' }}
                   >
                     <span>
@@ -765,13 +740,13 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                   </button>
                 </div>
 
-                <div className="flex items-center gap-2.5">
-                  {/* 'Previous' Button: No arrow icon, Primary Website Brand Gradient Background */}
+                {/* Row 2 (Separate Second Row): 'Previous' and 'Next Question' side-by-side (50% width each) */}
+                <div className="grid grid-cols-2 gap-3 w-full">
                   <button
                     id="prev-question-btn"
                     disabled={currentIndex === 0}
                     onClick={handlePrev}
-                    className={`px-5 py-2.5 rounded-xl text-white text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-95 ${
+                    className={`w-full py-2.5 px-4 rounded-xl text-white text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-95 flex items-center justify-center text-center ${
                       currentIndex === 0
                         ? 'opacity-40 cursor-not-allowed'
                         : 'hover:opacity-95'
@@ -781,11 +756,10 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     <span>{selectedLanguage === 'Hindi' ? 'पिछला' : 'Previous'}</span>
                   </button>
 
-                  {/* 'Next Question' Button: No arrow icon, Primary Website Brand Gradient Background */}
                   <button
                     id="next-question-btn"
                     onClick={handleNext}
-                    className="px-5 py-2.5 rounded-xl text-white text-xs font-bold shadow-xs active:scale-95 transition-all cursor-pointer hover:opacity-95"
+                    className="w-full py-2.5 px-4 rounded-xl text-white text-xs font-bold shadow-xs active:scale-95 transition-all cursor-pointer hover:opacity-95 flex items-center justify-center text-center"
                     style={{ background: BRAND_GRADIENT }}
                   >
                     <span>
@@ -812,13 +786,18 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                 {selectedLanguage === 'Hindi' ? 'प्रश्न ग्रिड' : 'Question Grid'}
               </h3>
               <span className="text-xs font-bold text-slate-500">
-                {answeredCount}/{questions.length} {selectedLanguage === 'Hindi' ? 'उत्तर दिए' : 'Answered'}
+                {answeredCount}/{validQuestions.length} {selectedLanguage === 'Hindi' ? 'उत्तर दिए' : 'Answered'}
               </span>
             </div>
 
             {/* Matrix Grid: Unattempted Pure White (#FFFFFF), Active Question Primary Brand Gradient */}
             <div className="grid grid-cols-5 gap-2 mb-3">
-              {validQuestions.map((q, idx) => {
+              {validQuestions.length === 0 ? (
+                <div className="col-span-5 py-6 text-center text-xs text-slate-400 font-medium">
+                  0 questions in palette
+                </div>
+              ) : (
+                validQuestions.map((q, idx) => {
                 if (!q || q.id == null) return null;
                 const isCurrent = idx === currentIndex;
                 const hasAnswered = answers[q.id] !== undefined;
@@ -862,7 +841,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                     {idx + 1}
                   </button>
                 );
-              })}
+              }))}
             </div>
 
             {/* Matrix Legend: Answered (Green), Marked (Yellow), Unanswered (White/Grey), Current (Primary Brand Gradient) */}
@@ -905,7 +884,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
                 <span>{selectedLanguage === 'Hindi' ? 'अंतिम उत्तर सबमिट करें' : 'Submit Final Answers'}</span>
               </button>
 
-              {onQuitQuiz && (
+              {onQuitQuiz && validQuestions.length > 0 && (
                 <button
                   id="quit-quiz-btn"
                   onClick={() => {
@@ -1003,7 +982,7 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
       )}
 
       {/* Pre-Quiz Two-Step Onboarding Modal: Step 1 Language Selection & Step 2 Paper Pattern Instructions */}
-      {!preQuizCompleted && (
+      {!preQuizCompleted && validQuestions.length > 0 && (
         <PreQuizOnboarding
           selectedLanguage={selectedLanguage}
           onSelectLanguage={handleUpdateLanguage}

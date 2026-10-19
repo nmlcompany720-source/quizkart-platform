@@ -28,6 +28,8 @@ import {
   Lock,
   ChevronDown,
   ChevronUp,
+  ChevronLeft,
+  ChevronRight,
   Download,
   Terminal,
   Layers,
@@ -54,6 +56,7 @@ import {
 } from 'lucide-react';
 import { 
   Question, 
+  QuestionCategory,
   DailyPrizeItem, 
   LeaderboardEntry, 
   PoolEconomics, 
@@ -68,7 +71,6 @@ import {
 } from '../types';
 import { 
   TODAY_PRIZE, 
-  QUIZ_QUESTIONS, 
   INITIAL_LEADERBOARD, 
   INITIAL_POOL_ECONOMICS, 
   UPCOMING_PRIZES,
@@ -83,11 +85,18 @@ import { AnnouncementBar } from './AnnouncementBar';
 import { BannerSlider } from './BannerSlider';
 import { soundFx } from '../utils/audio';
 import { 
-  parseAIBulkText, 
+  parseAIBulkText,
+  validateAIQuestionJson,
   SAMPLE_AI_BULK_INPUT, 
   CHATGPT_PROMPT_TEMPLATE,
-  ParsedBulkQuestion 
+  ParsedBulkQuestion,
+  normalizeCategory,
+  toAllowedSubject,
+  VALID_SUBJECTS,
+  ALLOWED_SUBJECTS,
+  ALLOWED_DIFFICULTIES
 } from '../utils/aiQuestionParser';
+import { questionPoolManager, getBlockAssignedUserId, createInitialUserBlocksFromPool } from '../utils/questionPoolManager';
 import { ContestManagerTab } from './ContestManagerTab';
 import { safeCopyToClipboard } from '../utils/clipboard';
 import { compressImage, normalizeImageUrl, isGifImage } from '../utils/imageCompressor';
@@ -104,7 +113,9 @@ import {
   deleteSupportTicketFromFirestore,
   fetchSupportTicketsFromFirestore,
   saveSupportTicketToFirestore,
-  saveBannerSlidesToFirestore
+  saveBannerSlidesToFirestore,
+  saveQuestionToFirestore,
+  removeQuestionFromFirestore
 } from '../firebase';
 import { 
   formatDepositId, 
@@ -464,7 +475,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     return new Date().toISOString().split('T')[0];
   };
 
-  // Helper to strictly deduplicate real registered users (purging all demo/dummy seed users) and assign sequential USR-1001+ IDs
+  // Helper to strictly deduplicate real registered users (purging all demo/dummy seed users) and assign sequential QK-USR-1001+ IDs
   const deduplicateRegisteredUsers = (users: UserProfile[]): UserProfile[] => {
     const result: UserProfile[] = [];
 
@@ -474,7 +485,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
       const normEmail = (u.email || '').trim().toLowerCase();
       const rawId = (u.id || '').trim().toUpperCase();
-      const validUsrId = /^USR-\d+$/i.test(rawId) ? rawId : '';
+      const validUsrId = /^(?:QK-)?USR-\d+$/i.test(rawId) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
 
       // Priority 1: Match by email
       let existingIdx = -1;
@@ -482,7 +493,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         existingIdx = result.findIndex((item) => (item.email || '').trim().toLowerCase() === normEmail);
       }
 
-      // Priority 2: Match by valid USR-XXXX ID only if emails do not belong to different users
+      // Priority 2: Match by valid QK-USR-XXXX ID only if emails do not belong to different users
       if (existingIdx === -1 && validUsrId) {
         existingIdx = result.findIndex((item) => {
           const itemId = (item.id || '').trim().toUpperCase();
@@ -509,10 +520,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       }
     });
 
-    // Guarantee every real registered entry has a strictly sequential USR-1001, USR-1002... ID
+    // Guarantee every real registered entry has a strictly sequential QK-USR-1001, QK-USR-1002... ID
     return result.map((u, idx) => ({
       ...u,
-      id: `USR-${1001 + idx}`
+      id: `QK-USR-${1001 + idx}`
     }));
   };
 
@@ -544,7 +555,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         ? list.findIndex((u) => (u?.email || '').trim().toLowerCase() === targetEmail)
         : -1;
 
-      const canonicalId = `USR-${1001 + (idx >= 0 ? idx : list.length)}`;
+      const canonicalId = `QK-USR-${1001 + (idx >= 0 ? idx : list.length)}`;
 
       const syncedActiveUser: UserProfile = {
         ...(idx >= 0 ? list[idx] : {}),
@@ -959,104 +970,291 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [qOptionC, setQOptionC] = useState<string>('');
   const [qOptionD, setQOptionD] = useState<string>('');
   const [qCorrectIdx, setQCorrectIdx] = useState<number>(0);
-  const [qCategory, setQCategory] = useState<Question['category']>('General Knowledge');
-  const [qDifficulty, setQDifficulty] = useState<Question['difficulty']>('Medium');
+  const [qCategory, setQCategory] = useState<string>('');
+  const [qDifficulty, setQDifficulty] = useState<string>('');
   const [qExplanation, setQExplanation] = useState<string>('');
+  const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [isSavingQuestion, setIsSavingQuestion] = useState<boolean>(false);
   const [questionSearch, setQuestionSearch] = useState<string>('');
+  const [questionCategoryFilter, setQuestionCategoryFilter] = useState<string>('all');
+  const [questionDifficultyFilter, setQuestionDifficultyFilter] = useState<string>('all');
+  const [questionPage, setQuestionPage] = useState<number>(1);
+  const QUESTION_PAGE_SIZE = 10;
+  const [selectedQuestionIds, setSelectedQuestionIds] = useState<number[]>([]);
+  const [expandedQuestionIds, setExpandedQuestionIds] = useState<number[]>([]);
+
+  // 10-Question Block Masked User ID State
+  const [unmaskedBlockIds, setUnmaskedBlockIds] = useState<number[]>([]);
+  const [passcodeModalBlock, setPasscodeModalBlock] = useState<{ blockNumber: number; userId: string } | null>(null);
+  const [passcodeInput, setPasscodeInput] = useState<string>('');
+  const [passcodeError, setPasscodeError] = useState<string>('');
 
   // Bulk AI Importer State
   const [bulkInputText, setBulkInputText] = useState<string>('');
-  const [bulkDefaultCategory, setBulkDefaultCategory] = useState<Question['category']>('General Knowledge');
-  const [bulkDefaultDifficulty, setBulkDefaultDifficulty] = useState<Question['difficulty']>('Medium');
+  const [bulkDefaultCategory, setBulkDefaultCategory] = useState<QuestionCategory>('Maths');
+  const [bulkDefaultDifficulty, setBulkDefaultDifficulty] = useState<'Easy' | 'Medium' | 'Hard'>('Medium');
   const [bulkParsedResults, setBulkParsedResults] = useState<ParsedBulkQuestion[]>([]);
+  const [bulkJsonError, setBulkJsonError] = useState<string | null>(null);
+  const [bulkFilterTab, setBulkFilterTab] = useState<'all' | 'valid' | 'invalid'>('all');
   const [hasParsedBulk, setHasParsedBulk] = useState<boolean>(false);
   const [copiedPromptSuccess, setCopiedPromptSuccess] = useState<boolean>(false);
+  const [aiPromptQuestionCount, setAiPromptQuestionCount] = useState<number>(10);
 
-  const handleSaveQuestion = (e: React.FormEvent) => {
+  const getDynamicPromptText = (count: number) => {
+    const displayCount = count > 0 ? count : 10;
+    return `Generate ${displayCount} competitive multiple choice quiz questions for QuizKart in clean, plain natural text format.
+
+FORMAT FOR EACH QUESTION:
+Question: [Write the clear question stem here]
+A) [Option A text]
+B) [Option B text]
+C) [Option C text]
+D) [Option D text]
+Correct Answer: [A / B / C / D]
+Subject: [Choose one: Maths, Reasoning, Science, GK, English]
+Difficulty: [Choose one: Easy, Medium, Hard, Expert]
+Explanation: [Clear step-by-step explanation]
+
+RULES:
+- Provide exactly 4 options (A, B, C, D) for every question.
+- Do NOT use JSON, HTML, or markdown code fences.
+- Separate each question with a blank line.`;
+  };
+
+  // Manual Question Form Validation
+  const validateManualForm = (): boolean => {
+    const errors: Record<string, string> = {};
+
+    if (!qText.trim()) {
+      errors.qText = 'Question text is required.';
+    }
+
+    if (!qOptionA.trim()) {
+      errors.qOptionA = 'Option A is required.';
+    }
+
+    if (!qOptionB.trim()) {
+      errors.qOptionB = 'Option B is required.';
+    }
+
+    if (!qOptionC.trim()) {
+      errors.qOptionC = 'Option C is required.';
+    }
+
+    if (!qOptionD.trim()) {
+      errors.qOptionD = 'Option D is required.';
+    }
+
+    // Correct Answer validation: must be 0, 1, 2, or 3, and the corresponding option text must not be empty
+    if (qCorrectIdx == null || qCorrectIdx < 0 || qCorrectIdx > 3) {
+      errors.qCorrect = 'Please select a correct answer option (A, B, C, or D).';
+    } else {
+      const optionsArr = [qOptionA.trim(), qOptionB.trim(), qOptionC.trim(), qOptionD.trim()];
+      const letter = ['A', 'B', 'C', 'D'][qCorrectIdx];
+      if (!optionsArr[qCorrectIdx]) {
+        errors.qCorrect = `Selected correct answer (Option ${letter}) is blank. Please enter text for Option ${letter}.`;
+      }
+    }
+
+    // Subject validation
+    if (!qCategory || !ALLOWED_SUBJECTS.includes(qCategory as any)) {
+      errors.qCategory = 'Please select an allowed subject from the dropdown.';
+    }
+
+    // Difficulty validation
+    if (!qDifficulty || !ALLOWED_DIFFICULTIES.includes(qDifficulty as any)) {
+      errors.qDifficulty = 'Please select an allowed difficulty level from the dropdown.';
+    }
+
+    // Explanation validation
+    if (!qExplanation.trim()) {
+      errors.qExplanation = 'Explanation is required.';
+    }
+
+    setFormErrors(errors);
+    return Object.keys(errors).length === 0;
+  };
+
+  const handleSaveQuestion = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!qText.trim() || !qOptionA.trim() || !qOptionB.trim() || !qOptionC.trim() || !qOptionD.trim()) {
-      showToast('Please fill all question and option fields.', 'info');
+    if (isSavingQuestion) return;
+
+    if (!validateManualForm()) {
+      showToast('Please resolve all highlighted field errors before saving.', 'info');
+      soundFx.playWrong();
       return;
     }
 
+    setIsSavingQuestion(true);
     const options: [string, string, string, string] = [
       qOptionA.trim(), 
       qOptionB.trim(), 
       qOptionC.trim(), 
       qOptionD.trim()
     ];
+    const correctLetter = (['A', 'B', 'C', 'D'][qCorrectIdx] as 'A' | 'B' | 'C' | 'D') || 'A';
+    const correctText = options[qCorrectIdx];
 
-    if (editingId !== null) {
-      // Update existing question
-      const updated = (questions || []).filter(q => q && q.id != null).map((q) => {
-        if (q.id === editingId) {
-          return {
-            ...q,
-            question: qText.trim(),
-            options,
-            correctIndex: qCorrectIdx,
-            category: qCategory,
-            difficulty: qDifficulty,
-            explanation: qExplanation.trim() || 'Verified answer from standard reference.'
-          };
+    try {
+      if (editingId !== null) {
+        // Update existing question
+        const currentQuestions = questions || [];
+        const questionExists = currentQuestions.some(q => q && q.id === editingId);
+        if (!questionExists) {
+          throw new Error(`Question #${editingId} was not found in the question library.`);
         }
-        return q;
-      });
-      onUpdateQuestions(updated);
-      try {
-        localStorage.setItem('quizkart_questions', JSON.stringify(updated));
-      } catch {}
-      showToast(`Question #${editingId} successfully updated!`);
-      setEditingId(null);
-    } else {
-      // Create new question
-      const validQuestions = (questions || []).filter(q => q && q.id != null);
-      const validIds = validQuestions.map(q => Number(q.id)).filter(id => !isNaN(id));
-      const newId = validIds.length > 0 ? Math.max(...validIds) + 1 : 1;
-      const newQ: Question = {
-        id: newId,
-        question: qText.trim(),
-        options,
-        correctIndex: qCorrectIdx,
-        category: qCategory,
-        difficulty: qDifficulty,
-        explanation: qExplanation.trim() || 'Standard general knowledge fact.'
-      };
-      const updated = [...validQuestions, newQ];
-      onUpdateQuestions(updated);
-      try {
-        localStorage.setItem('quizkart_questions', JSON.stringify(updated));
-      } catch {}
-      showToast(`New question #${newId} added to active quiz pool!`);
-    }
 
-    // Reset Single Form
-    setQText('');
-    setQOptionA('');
-    setQOptionB('');
-    setQOptionC('');
-    setQOptionD('');
-    setQCorrectIdx(0);
-    setQExplanation('');
-    soundFx.playSuccess();
+        const updated = currentQuestions.map((q) => {
+          if (q.id === editingId) {
+            return {
+              ...q,
+              stem: qText.trim(),
+              question: qText.trim(),
+              options,
+              correctIndex: qCorrectIdx,
+              correctKey: correctLetter,
+              answer: {
+                key: correctLetter,
+                text: correctText
+              },
+              category: qCategory as QuestionCategory,
+              difficulty: qDifficulty as 'Easy' | 'Medium' | 'Hard' | 'Expert',
+              explanation: qExplanation.trim(),
+              updatedAt: new Date().toISOString()
+            };
+          }
+          return q;
+        });
+
+        await questionPoolManager.saveAllQuestions(updated);
+        onUpdateQuestions(updated);
+        try {
+          localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
+        } catch {}
+
+        const editedQ = updated.find(q => q && q.id === editingId);
+        if (editedQ) {
+          saveQuestionToFirestore(editedQ).catch(e => console.warn('Firestore question update error:', e));
+        }
+
+        showToast(`Question #${editingId} successfully updated!`);
+        soundFx.playSuccess();
+        setEditingId(null);
+      } else {
+        // Create new question with unique ID guaranteed not to collide with deleted IDs
+        const deletedSet = questionPoolManager.getDeletedQuestionIds();
+        const validQuestions = (questions || []).filter(q => q && q.id != null && !deletedSet.has(Number(q.id)));
+        const validIds = validQuestions.map(q => Number(q.id)).filter(id => !isNaN(id));
+        const maxUsedId = Math.max(0, ...validIds, ...Array.from(deletedSet));
+        const newId = maxUsedId + 1;
+        questionPoolManager.unrecordDeletedQuestionId(newId);
+
+        const targetBlock = safeQuestionPage;
+        const targetUserId = getBlockAssignedUserId(targetBlock, paginatedQuestions, registeredUsersList);
+
+        const newQ: Question = {
+          id: newId,
+          stem: qText.trim(),
+          question: qText.trim(),
+          options,
+          correctIndex: qCorrectIdx,
+          correctKey: correctLetter,
+          answer: {
+            key: correctLetter,
+            text: correctText
+          },
+          category: qCategory as QuestionCategory,
+          difficulty: qDifficulty as 'Easy' | 'Medium' | 'Hard' | 'Expert',
+          explanation: qExplanation.trim(),
+          assignedUserId: targetUserId,
+          isCustom: true,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        const updated = [...validQuestions, newQ];
+        await questionPoolManager.saveAllQuestions(updated);
+        onUpdateQuestions(updated);
+        try {
+          localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
+          localStorage.setItem('quizkart_questions_initialized', 'true');
+        } catch {}
+
+        saveQuestionToFirestore(newQ).catch(e => console.warn('Firestore question save error:', e));
+
+        showToast(`Question #${newId} saved successfully!`);
+        soundFx.playSuccess();
+      }
+
+      // Reset Single Form to empty defaults
+      setQText('');
+      setQOptionA('');
+      setQOptionB('');
+      setQOptionC('');
+      setQOptionD('');
+      setQCorrectIdx(0);
+      setQCategory('');
+      setQDifficulty('');
+      setQExplanation('');
+      setFormErrors({});
+    } catch (err: any) {
+      console.error('Failed to save question:', err);
+      showToast(`Storage failure: ${err?.message || 'Unable to persist question.'}`, 'info');
+      soundFx.playWrong();
+    } finally {
+      setIsSavingQuestion(false);
+    }
   };
 
   const handleEditQuestion = (q: Question) => {
     setBuilderMode('form');
-    setEditingId(q.id);
-    setQText(q.question);
-    setQOptionA(q.options[0] || '');
-    setQOptionB(q.options[1] || '');
-    setQOptionC(q.options[2] || '');
-    setQOptionD(q.options[3] || '');
-    setQCorrectIdx(q.correctIndex);
-    setQCategory(q.category);
-    setQDifficulty(q.difficulty);
+    setEditingId(Number(q.id));
+    setQText(q.stem || q.question || '');
+    setQOptionA(q.options?.[0] || '');
+    setQOptionB(q.options?.[1] || '');
+    setQOptionC(q.options?.[2] || '');
+    setQOptionD(q.options?.[3] || '');
+
+    // Determine correct index
+    let idx = 0;
+    if (q.correctIndex != null && q.correctIndex >= 0 && q.correctIndex <= 3) {
+      idx = q.correctIndex;
+    } else if (q.correctKey) {
+      const found = ['A', 'B', 'C', 'D'].indexOf(q.correctKey);
+      if (found >= 0) idx = found;
+    } else if ((q as any).answer?.key) {
+      const found = ['A', 'B', 'C', 'D'].indexOf((q as any).answer.key);
+      if (found >= 0) idx = found;
+    }
+    setQCorrectIdx(idx);
+
+    // Normalize subject to one of the 6 allowed subjects
+    const normSubject = toAllowedSubject(q.category);
+    setQCategory(normSubject);
+
+    // Difficulty
+    const diff = q.difficulty;
+    if (diff === 'Easy' || diff === 'Medium' || diff === 'Hard' || diff === 'Expert') {
+      setQDifficulty(diff);
+    } else {
+      setQDifficulty('Medium');
+    }
+
     setQExplanation(q.explanation || '');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    setFormErrors({});
+    
+    // Smooth scroll to manual form
+    const formElement = document.getElementById('manual-question-form');
+    if (formElement) {
+      formElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    showToast(`Loaded Question #${q.id} for editing.`, 'info');
   };
 
   const handleCancelEdit = () => {
+    const cancelledId = editingId;
     setEditingId(null);
     setQText('');
     setQOptionA('');
@@ -1064,107 +1262,247 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     setQOptionC('');
     setQOptionD('');
     setQCorrectIdx(0);
+    setQCategory('');
+    setQDifficulty('');
     setQExplanation('');
+    setFormErrors({});
+    if (cancelledId !== null) {
+      showToast(`Editing cancelled. Question #${cancelledId} remains unchanged.`, 'info');
+    }
   };
 
-  const handleDeleteQuestion = (id: number) => {
-    const validQuestions = (questions || []).filter(q => q && q.id != null);
-    if (validQuestions.length <= 5) {
-      showToast('Minimum 5 questions required in quiz pool.', 'info');
-      return;
-    }
-    if (confirm(`Are you sure you want to delete question #${id}?`)) {
-      const updated = validQuestions.filter(q => q.id !== id);
+  const handleDeleteQuestion = async (id: number) => {
+    const numericId = Number(id);
+    try {
+      questionPoolManager.recordDeletedQuestionId(numericId);
+      const updated = (questions || []).filter(q => q && Number(q.id) !== numericId);
       onUpdateQuestions(updated);
+      await questionPoolManager.saveAllQuestions(updated);
       try {
-        localStorage.setItem('quizkart_questions', JSON.stringify(updated));
+        localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
       } catch {}
-      showToast(`Question #${id} removed.`);
-      if (editingId === id) handleCancelEdit();
+
+      // Permanently purge from Firestore so it NEVER reappears (Requirement 4)
+      removeQuestionFromFirestore(numericId).catch(e => console.warn('Firestore question delete error:', e));
+
+      setSelectedQuestionIds(prev => prev.filter(selectedId => selectedId !== numericId));
+      if (editingId === numericId) {
+        handleCancelEdit();
+      }
+      soundFx.playClick();
+      showToast(`Question #${numericId} permanently deleted.`);
+    } catch (err: any) {
+      console.error('Failed to permanently delete question:', err);
+      const updated = (questions || []).filter(q => q && Number(q.id) !== numericId);
+      onUpdateQuestions(updated);
+      setSelectedQuestionIds(prev => prev.filter(selectedId => selectedId !== numericId));
+      showToast(`Question #${numericId} permanently deleted.`);
     }
   };
 
-  // AI Bulk Importer Handlers
-  const handleParseBulkInput = () => {
-    if (!bulkInputText.trim()) {
-      showToast('Please paste raw questions from ChatGPT or Gemini first.', 'info');
+  const handleToggleSelectQuestion = (id: number) => {
+    setSelectedQuestionIds(prev =>
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  };
+
+  const handleClearSelectedQuestions = () => {
+    setSelectedQuestionIds([]);
+  };
+
+  const handleDeleteSelectedQuestions = async () => {
+    if (selectedQuestionIds.length === 0) {
+      showToast('No questions selected to delete.', 'info');
       return;
     }
 
-    const parsed = parseAIBulkText(bulkInputText, bulkDefaultCategory, bulkDefaultDifficulty);
-    setBulkParsedResults(parsed);
-    setHasParsedBulk(true);
+    const idsToDelete = [...selectedQuestionIds].map(Number);
+    const count = idsToDelete.length;
 
-    if (parsed.length === 0) {
-      soundFx.playWrong();
-      showToast('Could not find recognizable question patterns in pasted text.', 'info');
-    } else {
+    try {
+      for (const id of idsToDelete) {
+        questionPoolManager.recordDeletedQuestionId(id);
+        // Permanently purge each from Firestore so they NEVER reappear (Requirement 4)
+        removeQuestionFromFirestore(id).catch(e => console.warn('Firestore question delete error:', e));
+      }
+      const updated = (questions || []).filter(q => q && !idsToDelete.includes(Number(q.id)));
+      onUpdateQuestions(updated);
+      await questionPoolManager.saveAllQuestions(updated);
+      try {
+        localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
+      } catch {}
+
+      if (editingId !== null && idsToDelete.includes(editingId)) {
+        handleCancelEdit();
+      }
+
+      setSelectedQuestionIds([]);
       soundFx.playClick();
-      const validCount = parsed.filter(p => p.isValid).length;
-      showToast(`Parsed ${parsed.length} questions (${validCount} valid and ready to import).`);
+      showToast(`Permanently deleted ${count} selected question${count > 1 ? 's' : ''}.`);
+    } catch (err: any) {
+      console.error('Bulk delete failed:', err);
+      const updated = (questions || []).filter(q => q && !idsToDelete.includes(Number(q.id)));
+      onUpdateQuestions(updated);
+      setSelectedQuestionIds([]);
+      showToast(`Permanently deleted ${count} selected question${count > 1 ? 's' : ''}.`);
     }
   };
 
-  const handleLoadSampleBulkData = () => {
-    setBulkInputText(SAMPLE_AI_BULK_INPUT);
-    const parsed = parseAIBulkText(SAMPLE_AI_BULK_INPUT, bulkDefaultCategory, bulkDefaultDifficulty);
-    setBulkParsedResults(parsed);
-    setHasParsedBulk(true);
-    soundFx.playClick();
-    showToast('Loaded 10 standard ChatGPT/Gemini questions into parser!');
+  // AI Bulk Importer Handlers - Direct Natural Text Extractor in Single Click
+  const handleParseBulkInput = async () => {
+    if (!bulkInputText.trim()) {
+      showToast('Please paste questions to validate.', 'info');
+      return;
+    }
+
+    const report = validateAIQuestionJson(bulkInputText);
+    const validQuestions = report.questions.filter(p => p.isValid);
+
+    if (validQuestions.length === 0) {
+      soundFx.playWrong();
+      showToast('No questions could be extracted. Please ensure questions match the format.', 'info');
+      return;
+    }
+
+    const deletedSet = questionPoolManager.getDeletedQuestionIds();
+    const validPool = (questions || []).filter(q => q && q.id != null && !deletedSet.has(Number(q.id)));
+
+    // AUTOMATIC USER-BLOCK CREATION & 10-QUESTION LIMIT RULE (Requirement 1 & 2):
+    // 1. Checks total count of registered User IDs (e.g. 5 registered users)
+    // 2. Immediately creates 5 distinct blocks/pages in the Question Manager—one dedicated block for each registered User ID
+    // 3. STRICT 10-QUESTION BLOCK LIMIT: Each block contains EXACTLY 10 questions (never 20 questions in a single block)
+    // 4. Question Randomization & Exact Index Mapping: For each block, draws from base pool to create randomized question sequences
+    // 5. STRICT SYNC RULE: The exact sequence of 10 questions generated inside a specific User ID's block in the Admin Panel
+    //    MUST be the EXACT 10 questions presented in that user's live test session.
+    const baseFormatted: Question[] = validQuestions.map((v, i) => ({
+      id: i + 1,
+      stem: v.stem,
+      question: v.stem || v.question,
+      options: v.options,
+      correctIndex: v.correctIndex,
+      correctKey: v.correctKey,
+      category: v.category,
+      subject: v.subject || v.category,
+      difficulty: v.difficulty,
+      explanation: v.explanation,
+      isCustom: true
+    }));
+
+    const { allBlockQuestions, distinctUsers } = createInitialUserBlocksFromPool({
+      baseQuestions: baseFormatted,
+      registeredUsers: registeredUsersList,
+      existingQuestions: validPool,
+      onQuestionSavedToFirestore: (q) => {
+        saveQuestionToFirestore(q).catch(e => console.warn('Firestore question save error:', e));
+      }
+    });
+
+    const finalPool = allBlockQuestions;
+    onUpdateQuestions(finalPool);
+    await questionPoolManager.saveAllQuestions(finalPool);
+    try {
+      localStorage.setItem('quizkart_questions', JSON.stringify(finalPool.slice(0, 1000)));
+      localStorage.setItem('quizkart_questions_initialized', 'true');
+    } catch {}
+
+    soundFx.playCelebration();
+    showToast(`Successfully created ${distinctUsers.length} dedicated 10-question blocks (${allBlockQuestions.length} questions) for all registered users!`);
+    setBulkInputText('');
+    setBulkParsedResults([]);
+    setBulkJsonError(null);
+    setHasParsedBulk(false);
+  };
+
+  const handleVerifyPasscode = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (passcodeInput.trim() === 'password1') {
+      soundFx.playCelebration();
+      if (passcodeModalBlock) {
+        setUnmaskedBlockIds(prev => Array.from(new Set([...prev, passcodeModalBlock.blockNumber])));
+        showToast(`Registration ID unmasked: ${passcodeModalBlock.userId}`);
+      }
+      setPasscodeModalBlock(null);
+      setPasscodeInput('');
+      setPasscodeError('');
+    } else {
+      soundFx.playWrong();
+      setPasscodeError('Incorrect passcode. Please try again.');
+    }
   };
 
   const handleCopyPromptTemplate = async () => {
     soundFx.playClick();
-    const success = await safeCopyToClipboard(CHATGPT_PROMPT_TEMPLATE);
+    const promptText = getDynamicPromptText(aiPromptQuestionCount);
+    const success = await safeCopyToClipboard(promptText);
     if (success) {
       setCopiedPromptSuccess(true);
-      showToast('AI Prompt Template copied to clipboard! Paste it into ChatGPT or Gemini.');
+      showToast(`AI Prompt Template (${aiPromptQuestionCount} Questions) copied!`);
       setTimeout(() => setCopiedPromptSuccess(false), 3000);
     } else {
-      showToast('Copy failed. Please copy manually from the instructions.');
+      showToast('Copy failed. Please copy manually from the prompt box.');
     }
   };
 
-  const handleSaveBulkQuestions = (mode: 'replace' | 'append') => {
+  const handleSaveBulkQuestions = async (mode: 'replace' | 'append') => {
     const validQuestions = bulkParsedResults.filter(p => p.isValid);
     if (validQuestions.length === 0) {
-      showToast('No valid questions found to import.', 'info');
+      showToast('No valid questions to save. Please fix validation errors first.', 'info');
       return;
     }
 
-    const validPool = (questions || []).filter(q => q && q.id != null);
-    const validIds = validPool.map(q => Number(q.id)).filter(id => !isNaN(id));
-    const startingId = mode === 'append' && validIds.length > 0 
-      ? Math.max(...validIds) + 1 
-      : 1;
+    const confirmationMessage = mode === 'replace'
+      ? `Are you sure you want to REPLACE the active question pool with these ${validQuestions.length} validated questions?\n\nExisting questions in the pool will be replaced.`
+      : `Are you sure you want to APPEND ${validQuestions.length} validated questions to the Question Library?`;
 
-    const formatted: Question[] = validQuestions.map((v, i) => ({
-      id: startingId + i,
-      question: v.question,
+    if (!window.confirm(confirmationMessage)) {
+      return;
+    }
+
+    const deletedSet = questionPoolManager.getDeletedQuestionIds();
+    const validPool = (questions || []).filter(q => q && q.id != null && !deletedSet.has(Number(q.id)));
+
+    const baseFormatted: Question[] = validQuestions.map((v, i) => ({
+      id: i + 1,
+      stem: v.stem,
+      question: v.stem || v.question,
       options: v.options,
       correctIndex: v.correctIndex,
+      correctKey: v.correctKey,
       category: v.category,
+      subject: v.subject || v.category,
       difficulty: v.difficulty,
-      explanation: v.explanation
+      explanation: v.explanation,
+      isCustom: true
     }));
 
-    const finalPool = mode === 'replace' ? formatted : [...validPool, ...formatted];
+    const { allBlockQuestions, distinctUsers } = createInitialUserBlocksFromPool({
+      baseQuestions: baseFormatted,
+      registeredUsers: registeredUsersList,
+      existingQuestions: mode === 'replace' ? [] : validPool,
+      onQuestionSavedToFirestore: (q) => {
+        saveQuestionToFirestore(q).catch(e => console.warn('Firestore question save error:', e));
+      }
+    });
+
+    const finalPool = mode === 'replace' ? allBlockQuestions : [...validPool, ...allBlockQuestions];
     onUpdateQuestions(finalPool);
+    await questionPoolManager.saveAllQuestions(finalPool);
     try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(finalPool));
+      localStorage.setItem('quizkart_questions', JSON.stringify(finalPool.slice(0, 1000)));
+      localStorage.setItem('quizkart_questions_initialized', 'true');
     } catch {}
 
     soundFx.playCelebration();
     showToast(
       mode === 'replace'
-        ? `Replaced pool with ${formatted.length} AI-imported questions!`
-        : `Appended ${formatted.length} questions! Total active pool is now ${finalPool.length}.`
+        ? `Replaced pool with ${distinctUsers.length} dedicated 10-question blocks (${finalPool.length} questions) for registered users!`
+        : `Appended ${distinctUsers.length} dedicated 10-question blocks (${allBlockQuestions.length} questions)! Total pool is now ${finalPool.length}.`
     );
 
     // Reset Bulk State
     setBulkInputText('');
     setBulkParsedResults([]);
+    setBulkJsonError(null);
     setHasParsedBulk(false);
     setBuilderMode('form');
   };
@@ -2088,12 +2426,24 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }, 1000);
   };
 
-  // Filtered Questions for Tab 1 Table
-  const filteredQuestions = (questions || []).filter(q => 
-    q && q.id != null && (
-      (q.question || '').toLowerCase().includes(questionSearch.toLowerCase()) ||
-      (q.category || '').toLowerCase().includes(questionSearch.toLowerCase())
-    )
+  // Filtered Questions for Tab 1 Table with High-Capacity Indexing
+  const filteredQuestions = (questions || []).filter(q => {
+    if (!q || q.id == null) return false;
+
+    if (questionSearch.trim()) {
+      const s = questionSearch.toLowerCase().trim();
+      const searchable = `${q.id} ${q.stem || ''} ${q.question || ''} ${q.category || ''} ${q.explanation || ''}`.toLowerCase();
+      if (!searchable.includes(s)) return false;
+    }
+
+    return true;
+  });
+
+  const totalQuestionPages = Math.max(1, Math.ceil(filteredQuestions.length / QUESTION_PAGE_SIZE));
+  const safeQuestionPage = Math.min(Math.max(1, questionPage), totalQuestionPages);
+  const paginatedQuestions = filteredQuestions.slice(
+    (safeQuestionPage - 1) * QUESTION_PAGE_SIZE,
+    safeQuestionPage * QUESTION_PAGE_SIZE
   );
 
   // Filtered Deposits for Tab 3
@@ -2271,18 +2621,19 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             </span>
           </button>
 
-          {/* Tab 2: Question Bank */}
+          {/* Tab 2: Question Manager */}
           <button
             id="admin-tab-questions"
             onClick={() => setActiveTab('questions')}
             className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
               activeTab === 'questions'
-                ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-md shadow-blue-500/20'
+                ? 'text-white shadow-md'
                 : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
             }`}
+            style={activeTab === 'questions' ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' } : undefined}
           >
             <HelpCircle className="w-4 h-4" />
-            <span>Question Bank</span>
+            <span>Question Manager</span>
           </button>
 
           {/* Tab 3: Contest Banner & Timer */}
@@ -2719,7 +3070,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
                       if (!userSearchQuery.trim()) return true;
                       const q = userSearchQuery.toLowerCase();
-                      const seqId = (u.id || `USR-${1001 + idx}`).toLowerCase();
+                      const seqId = (u.id || `QK-USR-${1001 + idx}`).toLowerCase();
                       return (
                         (u.name || '').toLowerCase().includes(q) ||
                         (u.email || '').toLowerCase().includes(q) ||
@@ -2743,7 +3094,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       const isActiveCurrentUser = isUserSessionActive(u);
                       const cleanPasswordText = normalizePlainPassword(u.passwordStatus);
                       const dateOnlyRegTimestamp = normalizeRegistrationTimestamp(u.registrationDate);
-                      const sequentialRegId = u.id || `USR-${1001 + idx}`;
+                      const sequentialRegId = u.id || `QK-USR-${1001 + idx}`;
 
                       return (
                         <tr
@@ -2900,7 +3251,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                               <div className="leading-tight">
                                 <div className="font-semibold text-slate-900 text-xs">{du.name}</div>
                                 <div className="text-[10px] text-slate-400 font-mono mt-0.5">
-                                  ID: {du.id || `USR-${1001 + dIdx}`}
+                                  ID: {du.id || `QK-USR-${1001 + dIdx}`}
                                 </div>
                               </div>
                             </div>
@@ -2934,154 +3285,122 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         {/* ========================================================= */}
         {activeTab === 'questions' && (
           <div className="space-y-8">
-            {/* Mode Switcher Banner: Single Question Form vs Bulk AI Importer */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
+            {/* Mode Switcher Banner: Add Manually vs Bulk AI Importer */}
+            <div className="bg-white rounded-2xl border border-[#EAECF0] p-4 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
               <div>
-                <h2 className="text-base font-black text-slate-900">Question Pool Manager</h2>
-                <p className="text-xs text-slate-500">
-                  {questions.length} active questions in live rotation. Add questions manually or bulk-import 10 at once via ChatGPT/Gemini.
-                </p>
+                <h2 className="text-base font-black text-slate-900">Question Library</h2>
               </div>
-              <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-xl border border-slate-200">
+              <div className="flex items-center gap-2.5">
                 <button
                   type="button"
                   onClick={() => setBuilderMode('form')}
-                  className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs ${
                     builderMode === 'form'
-                      ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                      ? 'text-white'
+                      : 'text-slate-900 bg-white hover:bg-slate-50 border border-[#EAECF0]'
                   }`}
+                  style={builderMode === 'form' ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' } : { backgroundColor: '#FFFFFF' }}
                 >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Manual Form</span>
+                  <span>Add Manually</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setBuilderMode('ai_bulk')}
-                  className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs ${
                     builderMode === 'ai_bulk'
-                      ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                      ? 'text-white'
+                      : 'text-slate-900 bg-white hover:bg-slate-50 border border-[#EAECF0]'
                   }`}
+                  style={builderMode === 'ai_bulk' ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' } : { backgroundColor: '#FFFFFF' }}
                 >
-                  <Zap className="w-3.5 h-3.5 text-amber-300" />
-                  <span>Bulk AI Import (ChatGPT/Gemini)</span>
+                  <span>Bulk AI Importer</span>
                 </button>
               </div>
             </div>
 
             {/* SUB-VIEW A: BULK AI IMPORTER */}
             {builderMode === 'ai_bulk' && (
-              <div className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 shadow-sm space-y-6">
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-100">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-indigo-50 border border-indigo-100 text-indigo-600 flex items-center justify-center shrink-0">
-                      <Sparkles className="w-5 h-5" />
-                    </div>
-                    <div>
-                      <h3 className="text-base font-bold text-slate-900">AI Bulk Question Importer</h3>
-                      <p className="text-xs text-slate-500">
-                        Paste 10 formatted questions generated by ChatGPT or Gemini. Our intelligent parser extracts stems, choices A-D, answers, and explanations.
-                      </p>
-                    </div>
+              <div className="bg-white rounded-3xl border border-[#EAECF0] p-6 sm:p-8 shadow-sm space-y-6">
+                <div className="flex items-center justify-between gap-4 pb-4 border-b border-[#EAECF0]">
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900">Bulk AI Importer</h3>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-2">
                     <button
                       type="button"
                       onClick={handleCopyPromptTemplate}
-                      className="px-3.5 py-2 rounded-xl bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-bold flex items-center gap-1.5 border border-slate-200 transition-all cursor-pointer"
+                      title={copiedPromptSuccess ? 'Prompt Copied!' : 'Copy AI Prompt'}
+                      aria-label="Copy AI Prompt"
+                      className="w-10 h-10 rounded-xl text-white flex items-center justify-center shadow-xs transition-all cursor-pointer active:scale-95"
+                      style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)', color: '#FFFFFF' }}
                     >
-                      {copiedPromptSuccess ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
-                      <span>{copiedPromptSuccess ? 'Prompt Copied!' : 'Copy AI Prompt Template'}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleLoadSampleBulkData}
-                      className="px-3.5 py-2 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center gap-1.5 border border-indigo-200 transition-all cursor-pointer"
-                    >
-                      <Zap className="w-3.5 h-3.5 text-indigo-600" />
-                      <span>Load 10 Sample Questions</span>
+                      {copiedPromptSuccess ? <Check className="w-4 h-4 text-white" /> : <Copy className="w-4 h-4 text-white" />}
                     </button>
                   </div>
                 </div>
 
-                {/* Expected Format Notice Box */}
-                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 text-xs space-y-2">
-                  <p className="font-bold text-slate-700 flex items-center gap-1.5">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    <span>Supported AI Output Format:</span>
-                  </p>
-                  <pre className="font-mono text-[11px] text-slate-600 p-2.5 bg-white rounded-xl border border-slate-200 overflow-x-auto">
-{`1. Question Text Here
-A) Option 1
-B) Option 2
-C) Option 3
-D) Option 4
-Answer: B) Option 2
-Explanation: Explanation details for the contestant.`}
+                {/* DYNAMIC AI PROMPT TEMPLATE BOX (Pure White Card #FFFFFF) */}
+                <div 
+                  className="rounded-2xl border border-[#EAECF0] p-4 sm:p-5 shadow-xs space-y-3 bg-white"
+                  style={{ backgroundColor: '#FFFFFF' }}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <span className="text-xs font-bold text-slate-800">Target Question Count:</span>
+
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={1}
+                        max={50000}
+                        value={aiPromptQuestionCount}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          setAiPromptQuestionCount(isNaN(val) || val <= 0 ? 10 : val);
+                        }}
+                        className="w-20 px-2.5 py-1.5 rounded-lg border border-[#EAECF0] text-xs font-bold text-slate-900 text-center focus:outline-none focus:border-[#4A7DF3] bg-white shadow-2xs"
+                        title="Enter custom question count (e.g. 10, 100, 1000)"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleCopyPromptTemplate}
+                        className="px-3.5 py-1.5 rounded-lg text-white font-bold text-xs flex items-center gap-1.5 shadow-xs transition-all cursor-pointer active:scale-95"
+                        style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                      >
+                        {copiedPromptSuccess ? <Check className="w-3.5 h-3.5 text-white" /> : <Copy className="w-3.5 h-3.5 text-white" />}
+                        <span>{copiedPromptSuccess ? 'Copied' : 'Copy'}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Clean, ready-to-copy AI Prompt Template */}
+                  <pre 
+                    className="p-4 rounded-xl border border-[#EAECF0] text-[11px] font-mono text-slate-800 whitespace-pre-wrap leading-relaxed max-h-56 overflow-y-auto selection:bg-blue-100 bg-white"
+                    style={{ backgroundColor: '#FFFFFF' }}
+                  >
+                    {getDynamicPromptText(aiPromptQuestionCount)}
                   </pre>
                 </div>
 
-                {/* Textarea Input */}
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">
-                      Paste Raw ChatGPT / Gemini Text
-                    </label>
-                    <span className="text-[11px] text-slate-400">
-                      {bulkInputText ? `${bulkInputText.split('\n').length} lines pasted` : 'Empty'}
-                    </span>
-                  </div>
+                {/* Clean Textarea Input without top label, without indicator, without placeholder */}
+                <div>
                   <textarea
-                    rows={12}
+                    rows={10}
                     value={bulkInputText}
                     onChange={(e) => setBulkInputText(e.target.value)}
-                    placeholder="Paste 10 questions here directly from ChatGPT or Gemini..."
-                    className="w-full p-4 rounded-2xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs font-mono bg-white leading-relaxed placeholder:text-slate-400"
+                    className="w-full p-4 rounded-2xl border border-[#EAECF0] focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20 text-xs font-mono bg-white text-slate-900 leading-relaxed shadow-2xs"
                   />
                 </div>
 
-                {/* Default Category and Difficulty for this batch */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">Default Category for Batch</label>
-                    <select
-                      value={bulkDefaultCategory}
-                      onChange={(e) => setBulkDefaultCategory(e.target.value as Question['category'])}
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs bg-white cursor-pointer"
-                    >
-                      <option value="General Knowledge">General Knowledge</option>
-                      <option value="Science & Tech">Science & Tech</option>
-                      <option value="Indian Heritage">Indian Heritage</option>
-                      <option value="Current Affairs">Current Affairs</option>
-                      <option value="Geography & Nature">Geography & Nature</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">Default Difficulty</label>
-                    <select
-                      value={bulkDefaultDifficulty}
-                      onChange={(e) => setBulkDefaultDifficulty(e.target.value as Question['difficulty'])}
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs bg-white cursor-pointer"
-                    >
-                      <option value="Easy">Easy (10s)</option>
-                      <option value="Medium">Medium (10s)</option>
-                      <option value="Hard">Hard (8s)</option>
-                      <option value="Expert">Expert (5s Tie-Breaker)</option>
-                    </select>
-                  </div>
-                </div>
-
-                {/* Actions: Parse Button */}
-                <div className="flex flex-wrap items-center gap-3 pt-2">
+                {/* Actions: Bold Validate Questions Button (NO Gemini icon) */}
+                <div className="flex flex-wrap items-center gap-3 pt-1">
                   <button
                     type="button"
                     onClick={handleParseBulkInput}
-                    className="px-5 py-3 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold text-xs shadow-md shadow-blue-500/20 flex items-center gap-2 transition-all cursor-pointer active:scale-95"
+                    className="px-6 py-3 rounded-xl text-white font-bold text-xs shadow-md shadow-blue-500/20 flex items-center justify-center transition-all cursor-pointer active:scale-95"
+                    style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                   >
-                    <Sparkles className="w-4 h-4" />
-                    <span>Parse & Validate Questions</span>
+                    <span>Validate Questions</span>
                   </button>
                   {bulkInputText && (
                     <button
@@ -3089,81 +3408,171 @@ Explanation: Explanation details for the contestant.`}
                       onClick={() => {
                         setBulkInputText('');
                         setBulkParsedResults([]);
+                        setBulkJsonError(null);
                         setHasParsedBulk(false);
                       }}
-                      className="px-4 py-3 rounded-xl text-slate-600 hover:text-slate-900 text-xs font-bold border border-slate-200 hover:bg-slate-50 transition-all cursor-pointer"
+                      className="px-4 py-3 rounded-xl text-slate-700 hover:text-slate-900 text-xs font-bold border border-[#EAECF0] bg-white hover:bg-slate-50 transition-all cursor-pointer"
                     >
                       Clear Text
                     </button>
                   )}
                 </div>
 
-                {/* PARSED PREVIEW SECTION */}
-                {hasParsedBulk && (
+                {/* Intermediate review cards removed per directive - direct single-click import to table */}
+                {false && (
                   <div className="mt-8 pt-8 border-t border-slate-200 space-y-6">
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-indigo-50/70 border border-indigo-100">
-                      <div>
-                        <h4 className="text-sm font-bold text-indigo-950 flex items-center gap-2">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                          <span>Parser Results: {bulkParsedResults.length} Questions Identified</span>
-                        </h4>
-                        <p className="text-xs text-indigo-700 mt-0.5">
-                          {bulkParsedResults.filter(p => p.isValid).length} ready for competitive arena • {bulkParsedResults.filter(p => !p.isValid).length} with issues
-                        </p>
+                    {/* Validation Summary Header Bar */}
+                    <div className="p-4 rounded-2xl bg-white border border-[#EAECF0] shadow-xs space-y-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div>
+                          <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                            <CheckCircle2 className="w-4 h-4 text-[#20A5AC]" />
+                            <span>Validation Summary</span>
+                          </h4>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            Real-time validation against QuizKart schema and rules
+                          </p>
+                        </div>
+
+                        {/* Safe Import Action Buttons */}
+                        {bulkParsedResults.filter(p => p.isValid).length > 0 && (
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleSaveBulkQuestions('replace')}
+                              className="px-4 py-2.5 rounded-xl bg-[#D14343] hover:bg-red-700 text-white text-xs font-bold shadow-sm transition-all cursor-pointer"
+                            >
+                              Replace Pool ({bulkParsedResults.filter(p => p.isValid).length})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleSaveBulkQuestions('append')}
+                              className="px-4 py-2.5 rounded-xl text-white text-xs font-bold shadow-md shadow-blue-500/20 transition-all cursor-pointer"
+                              style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                            >
+                              Append to Pool (+{bulkParsedResults.filter(p => p.isValid).length})
+                            </button>
+                          </div>
+                        )}
                       </div>
 
-                      {bulkParsedResults.filter(p => p.isValid).length > 0 && (
+                      {/* Summary Metrics & Filter Tabs */}
+                      <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-[#EAECF0]">
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
-                            onClick={() => handleSaveBulkQuestions('replace')}
-                            className="px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold shadow-sm transition-all cursor-pointer"
+                            onClick={() => setBulkFilterTab('all')}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                              bulkFilterTab === 'all' 
+                                ? 'text-white' 
+                                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                            }`}
+                            style={bulkFilterTab === 'all' ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' } : {}}
                           >
-                            Replace Pool ({bulkParsedResults.filter(p => p.isValid).length})
+                            All ({bulkParsedResults.length})
                           </button>
                           <button
                             type="button"
-                            onClick={() => handleSaveBulkQuestions('append')}
-                            className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold shadow-md shadow-blue-500/20 transition-all cursor-pointer"
+                            onClick={() => setBulkFilterTab('valid')}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                              bulkFilterTab === 'valid'
+                                ? 'bg-emerald-600 text-white'
+                                : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                            }`}
                           >
-                            Append to Pool (+{bulkParsedResults.filter(p => p.isValid).length})
+                            Valid ({bulkParsedResults.filter(p => p.isValid).length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setBulkFilterTab('invalid')}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                              bulkFilterTab === 'invalid'
+                                ? 'bg-[#D14343] text-white'
+                                : 'bg-red-50 text-red-700 hover:bg-red-100'
+                            }`}
+                          >
+                            Invalid ({bulkParsedResults.filter(p => !p.isValid).length})
                           </button>
                         </div>
-                      )}
+
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {bulkParsedResults.filter(p => p.isValid).length === bulkParsedResults.length ? (
+                            <span className="text-emerald-600 font-bold">All questions ready for import</span>
+                          ) : (
+                            <span>{bulkParsedResults.filter(p => !p.isValid).length} question(s) require review</span>
+                          )}
+                        </div>
+                      </div>
                     </div>
 
-                    {/* Cards Preview */}
-                    <div className="grid grid-cols-1 gap-4 max-h-[500px] overflow-y-auto pr-1">
-                      {bulkParsedResults.map((q, idx) => (
+                    {/* Question Cards Preview */}
+                    <div className="grid grid-cols-1 gap-4 max-h-[550px] overflow-y-auto pr-1">
+                      {bulkParsedResults
+                        .filter(q => {
+                          if (bulkFilterTab === 'valid') return q.isValid;
+                          if (bulkFilterTab === 'invalid') return !q.isValid;
+                          return true;
+                        })
+                        .map((q, idx) => (
                         <div 
                           key={q.id || idx}
                           className={`p-4 rounded-2xl border bg-white space-y-3 transition-all ${
-                            q.isValid ? 'border-slate-200 hover:border-indigo-200' : 'border-amber-300 bg-amber-50/40'
+                            q.isValid ? 'border-[#EAECF0] hover:border-indigo-200' : 'border-red-300 bg-red-50/20'
                           }`}
                         >
                           <div className="flex items-start justify-between gap-3">
                             <div className="flex items-start gap-2.5">
-                              <span className="w-6 h-6 rounded-lg bg-slate-100 text-slate-700 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">
+                              <span className={`w-6 h-6 rounded-lg text-xs font-bold flex items-center justify-center shrink-0 mt-0.5 ${
+                                q.isValid ? 'bg-slate-100 text-slate-700' : 'bg-red-100 text-red-700'
+                              }`}>
                                 {idx + 1}
                               </span>
                               <div>
-                                <h5 className="text-xs font-bold text-slate-900 leading-snug">{q.question}</h5>
-                                <div className="flex items-center gap-2 mt-1">
-                                  <span className="text-[10px] font-semibold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md">
-                                    {q.category}
+                                <h5 className="text-xs font-bold text-slate-900 leading-snug">{q.question || <span className="text-red-500 italic">Empty Question Text</span>}</h5>
+                                <div className="flex flex-wrap items-center gap-2 mt-1">
+                                  <span className="text-[10px] font-semibold text-slate-800">
+                                    Subject: {q.subject || q.category || 'None'}
                                   </span>
-                                  <span className="text-[10px] font-semibold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md">
-                                    {q.difficulty}
+                                  <span className="text-slate-300">•</span>
+                                  <span className="text-[10px] font-semibold text-slate-600">
+                                    Difficulty: {q.difficulty || 'None'}
                                   </span>
-                                  {!q.isValid && (
-                                    <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md">
-                                      ⚠️ {q.validationError}
+                                  <span className="text-slate-300">•</span>
+                                  {q.isValid ? (
+                                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                      <Check className="w-3 h-3 text-emerald-600" />
+                                      Valid
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] font-bold text-red-700 bg-red-100 border border-red-200 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                      <AlertCircle className="w-3 h-3 text-red-600" />
+                                      Invalid ({q.validationErrors?.length || 1} error{(q.validationErrors?.length || 1) > 1 ? 's' : ''})
                                     </span>
                                   )}
                                 </div>
                               </div>
                             </div>
                           </div>
+
+                          {/* Specific Field Errors Display */}
+                          {!q.isValid && q.validationErrors && q.validationErrors.length > 0 && (
+                            <div className="p-3 rounded-xl bg-red-50/80 border border-red-200 space-y-1.5 text-[11px]">
+                              <p className="font-bold text-red-900 flex items-center gap-1">
+                                <AlertCircle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                                <span>Validation Issues (Field Specific):</span>
+                              </p>
+                              <div className="space-y-1 pl-1">
+                                {q.validationErrors.map((err, errIdx) => (
+                                  <div key={errIdx} className="flex items-start gap-1.5 text-red-700">
+                                    <span className="font-mono font-bold text-[10px] px-1.5 py-0.5 rounded bg-red-200/80 text-red-900 shrink-0">
+                                      {err.field}
+                                    </span>
+                                    <span>{err.message}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
 
                           {/* Options pills */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
@@ -3175,25 +3584,30 @@ Explanation: Explanation details for the contestant.`}
                                   key={optIdx}
                                   className={`px-3 py-2 rounded-xl text-xs flex items-center gap-2 border transition-all ${
                                     isCorrect 
-                                      ? 'bg-emerald-50 border-emerald-300 text-emerald-900 font-bold' 
-                                      : 'bg-slate-50 border-slate-200 text-slate-700'
+                                      ? 'bg-emerald-50 border-emerald-300 text-[#15803d] font-bold' 
+                                      : 'bg-white border-[#EAECF0] text-slate-700'
                                   }`}
                                 >
                                   <span className={`w-4 h-4 rounded-md flex items-center justify-center text-[10px] font-black shrink-0 ${
-                                    isCorrect ? 'bg-emerald-600 text-white' : 'bg-slate-200 text-slate-600'
+                                    isCorrect ? 'bg-[#15803d] text-white' : 'bg-slate-200 text-slate-600'
                                   }`}>
                                     {letter}
                                   </span>
-                                  <span className="truncate">{opt}</span>
-                                  {isCorrect && <Check className="w-3.5 h-3.5 text-emerald-600 ml-auto shrink-0" />}
+                                  <span className="truncate">{opt || <span className="text-red-400 italic">Empty</span>}</span>
+                                  {isCorrect && <Check className="w-3.5 h-3.5 text-[#15803d] ml-auto shrink-0" />}
                                 </div>
                               );
                             })}
                           </div>
 
-                          {q.explanation && (
-                            <p className="text-[11px] text-slate-500 italic bg-slate-50 p-2.5 rounded-xl border border-slate-100">
-                              <span className="font-semibold text-slate-700 not-italic">Reference:</span> {q.explanation}
+                          {/* Explanation */}
+                          {q.explanation ? (
+                            <p className="text-[11px] text-slate-600 italic bg-[#F8FAFC] p-2.5 rounded-xl border border-[#EAECF0]">
+                              <span className="font-semibold text-slate-800 not-italic">Explanation:</span> {q.explanation}
+                            </p>
+                          ) : (
+                            <p className="text-[11px] text-red-600 italic bg-red-50/50 p-2 rounded-xl border border-red-200">
+                              <span className="font-semibold text-red-800 not-italic">Explanation:</span> Missing explanation
                             </p>
                           )}
                         </div>
@@ -3206,205 +3620,689 @@ Explanation: Explanation details for the contestant.`}
 
             {/* SUB-VIEW B: SINGLE QUESTION MANUAL FORM */}
             {builderMode === 'form' && (
-              <form onSubmit={handleSaveQuestion} className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 shadow-sm space-y-6">
-                <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+              <form 
+                id="manual-question-form"
+                noValidate
+                onSubmit={handleSaveQuestion} 
+                className="bg-white rounded-3xl border border-[#EAECF0] p-6 sm:p-8 shadow-sm space-y-6"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-[#EAECF0]">
                   <div>
-                    <h3 className="text-base font-bold text-slate-900">
-                      {editingId !== null ? `Edit Question #${editingId}` : 'Add Single Question'}
+                    <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                      <span>{editingId !== null ? `Edit Question #${editingId}` : 'Add Question'}</span>
+                      {editingId !== null && (
+                        <span className="px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200 text-[11px] font-semibold">
+                          Editing Mode
+                        </span>
+                      )}
                     </h3>
-                    <p className="text-xs text-slate-500">
-                      Define the stem, four multiple choices, assign correct key, and fact check source.
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {editingId !== null 
+                        ? `Update the details below. Saving will update Question #${editingId} in the library.`
+                        : 'Define the question text, four choices, correct answer, subject, difficulty, and explanation.'}
                     </p>
                   </div>
                   {editingId !== null && (
                     <button
                       type="button"
                       onClick={handleCancelEdit}
-                      className="px-3.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-all cursor-pointer"
+                      className="px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold border border-[#EAECF0] transition-all cursor-pointer shadow-xs self-start sm:self-auto"
                     >
                       Cancel Edit
                     </button>
                   )}
                 </div>
 
-                {/* Question Stem */}
+                {/* Form-Level Validation Error Alert */}
+                {Object.keys(formErrors).length > 0 && (
+                  <div className="p-3.5 rounded-2xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-start gap-2.5 shadow-xs animate-in fade-in">
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-bold text-red-800">Please correct the following errors before saving:</p>
+                      <ul className="list-disc list-inside mt-1 space-y-0.5 text-[11px] text-red-700">
+                        {Object.entries(formErrors).map(([key, msg]) => (
+                          <li key={key}>{msg}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
+                {/* Question Text */}
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
-                    Question Stem
-                  </label>
-                  <input
-                    type="text"
-                    required
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-xs font-bold text-slate-900 uppercase tracking-wider">
+                      Question Text <span className="text-red-500">*</span>
+                    </label>
+                    <span className="text-[11px] text-slate-400">Clear question stem</span>
+                  </div>
+                  <textarea
+                    rows={2}
                     value={qText}
-                    onChange={(e) => setQText(e.target.value)}
+                    onChange={(e) => {
+                      setQText(e.target.value);
+                      if (formErrors.qText) setFormErrors(prev => ({ ...prev, qText: '' }));
+                    }}
                     placeholder="e.g. Which layer of the Earth's atmosphere contains the Ozone Layer?"
-                    className="w-full px-4 py-3 rounded-2xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs text-slate-900 bg-white"
+                    className={`w-full px-4 py-3 rounded-2xl border text-xs text-slate-900 bg-white placeholder:text-slate-400 focus:outline-none transition-all ${
+                      formErrors.qText 
+                        ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20' 
+                        : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
+                    }`}
                   />
+                  {formErrors.qText && (
+                    <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+                      <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
+                      {formErrors.qText}
+                    </p>
+                  )}
                 </div>
 
-                {/* 4 Choices A, B, C, D */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {[
-                    { label: 'Option A', val: qOptionA, setter: setQOptionA, idx: 0 },
-                    { label: 'Option B', val: qOptionB, setter: setQOptionB, idx: 1 },
-                    { label: 'Option C', val: qOptionC, setter: setQOptionC, idx: 2 },
-                    { label: 'Option D', val: qOptionD, setter: setQOptionD, idx: 3 }
-                  ].map((opt) => (
-                    <div 
-                      key={opt.idx}
-                      className={`p-3.5 rounded-2xl border transition-all ${
-                        qCorrectIdx === opt.idx ? 'border-emerald-300 bg-emerald-50/40 ring-1 ring-emerald-300' : 'border-slate-200 bg-white'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between mb-2">
-                        <label className="text-xs font-bold text-slate-700">{opt.label}</label>
-                        <button
-                          type="button"
-                          onClick={() => setQCorrectIdx(opt.idx)}
-                          className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer ${
-                            qCorrectIdx === opt.idx
-                              ? 'bg-emerald-600 text-white shadow-xs'
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                {/* 4 Choices: A, B, C, D */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold text-slate-900 uppercase tracking-wider">
+                      Answer Choices <span className="text-red-500">*</span>
+                    </label>
+                    <span className="text-[11px] text-slate-500">
+                      Provide 4 options and mark which one is the correct answer
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {[
+                      { letter: 'A', label: 'Option A', val: qOptionA, setter: setQOptionA, idx: 0, errKey: 'qOptionA' },
+                      { letter: 'B', label: 'Option B', val: qOptionB, setter: setQOptionB, idx: 1, errKey: 'qOptionB' },
+                      { letter: 'C', label: 'Option C', val: qOptionC, setter: setQOptionC, idx: 2, errKey: 'qOptionC' },
+                      { letter: 'D', label: 'Option D', val: qOptionD, setter: setQOptionD, idx: 3, errKey: 'qOptionD' }
+                    ].map((opt) => {
+                      const isCorrect = qCorrectIdx === opt.idx;
+                      const hasErr = Boolean(formErrors[opt.errKey]);
+
+                      return (
+                        <div 
+                          key={opt.idx}
+                          className={`p-4 rounded-2xl border transition-all ${
+                            isCorrect 
+                              ? 'border-emerald-400 bg-emerald-50/40 ring-1 ring-emerald-300 shadow-xs' 
+                              : hasErr
+                                ? 'border-red-300 bg-red-50/10'
+                                : 'border-[#EAECF0] bg-white'
                           }`}
                         >
-                          {qCorrectIdx === opt.idx ? '✓ Correct Answer' : 'Set as Correct'}
-                        </button>
-                      </div>
-                      <input
-                        type="text"
-                        required
-                        value={opt.val}
-                        onChange={(e) => opt.setter(e.target.value)}
-                        placeholder={`Enter ${opt.label} text...`}
-                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs text-slate-900 bg-white"
-                      />
-                    </div>
-                  ))}
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-2">
+                              <span className={`w-6 h-6 rounded-lg text-xs font-black flex items-center justify-center shrink-0 ${
+                                isCorrect 
+                                  ? 'bg-emerald-600 text-white' 
+                                  : 'bg-slate-100 text-slate-700 border border-slate-200'
+                              }`}>
+                                {opt.letter}
+                              </span>
+                              <label className="text-xs font-bold text-slate-900">{opt.label}</label>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setQCorrectIdx(opt.idx);
+                                if (formErrors.qCorrect) {
+                                  setFormErrors(prev => ({ ...prev, qCorrect: '' }));
+                                }
+                              }}
+                              className={`px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1 ${
+                                isCorrect
+                                  ? 'bg-emerald-600 text-white shadow-xs'
+                                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                              }`}
+                              title={`Set Option ${opt.letter} as the correct answer`}
+                            >
+                              {isCorrect ? (
+                                <>
+                                  <Check className="w-3 h-3 text-white" />
+                                  <span>✓ Correct Answer</span>
+                                </>
+                              ) : (
+                                <span>Select Correct</span>
+                              )}
+                            </button>
+                          </div>
+
+                          <input
+                            type="text"
+                            value={opt.val}
+                            onChange={(e) => {
+                              opt.setter(e.target.value);
+                              if (formErrors[opt.errKey]) {
+                                setFormErrors(prev => ({ ...prev, [opt.errKey]: '' }));
+                              }
+                              if (formErrors.qCorrect && isCorrect) {
+                                setFormErrors(prev => ({ ...prev, qCorrect: '' }));
+                              }
+                            }}
+                            placeholder={`Enter ${opt.label} text...`}
+                            className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white placeholder:text-slate-400 focus:outline-none transition-all ${
+                              hasErr 
+                                ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20' 
+                                : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
+                            }`}
+                          />
+                          {hasErr && (
+                            <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+                              <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
+                              {formErrors[opt.errKey]}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
 
-                {/* Metadata Row: Category, Difficulty, Explanation */}
+                {/* Correct Answer Selection Bar */}
+                <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#EAECF0] space-y-2">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <span className="text-xs font-bold text-slate-900 uppercase tracking-wider block">
+                        Correct Answer Selection <span className="text-red-500">*</span>
+                      </span>
+                      <p className="text-[11px] text-slate-500">
+                        Choose the designated correct choice. The answer text matches the selected option.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      {(['A', 'B', 'C', 'D'] as const).map((letter, idx) => {
+                        const isSelected = qCorrectIdx === idx;
+                        return (
+                          <button
+                            key={letter}
+                            type="button"
+                            onClick={() => {
+                              setQCorrectIdx(idx);
+                              if (formErrors.qCorrect) {
+                                setFormErrors(prev => ({ ...prev, qCorrect: '' }));
+                              }
+                            }}
+                            className={`w-9 h-9 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center ${
+                              isSelected
+                                ? 'bg-emerald-600 text-white shadow-xs scale-105'
+                                : 'bg-white text-slate-700 hover:bg-slate-50 border border-[#EAECF0]'
+                            }`}
+                          >
+                            {letter}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="text-xs text-[#15803d] font-semibold flex items-center gap-2 pt-1 border-t border-[#EAECF0]">
+                    <span className="w-5 h-5 rounded-md bg-emerald-100 text-[#15803d] flex items-center justify-center text-[10px] font-black shrink-0">
+                      {['A', 'B', 'C', 'D'][qCorrectIdx]}
+                    </span>
+                    <span className="truncate">
+                      Selected: Option {['A', 'B', 'C', 'D'][qCorrectIdx]} —{' '}
+                      <span className="font-bold">
+                        {[qOptionA, qOptionB, qOptionC, qOptionD][qCorrectIdx].trim() || '(Option is currently blank)'}
+                      </span>
+                    </span>
+                  </div>
+
+                  {formErrors.qCorrect && (
+                    <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+                      <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
+                      {formErrors.qCorrect}
+                    </p>
+                  )}
+                </div>
+
+                {/* Metadata Row: Subject, Difficulty, Explanation */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  {/* Subject */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">Category</label>
+                    <label className="block text-xs font-bold text-slate-900 mb-1.5 uppercase tracking-wider">
+                      Subject <span className="text-red-500">*</span>
+                    </label>
                     <select
                       value={qCategory}
-                      onChange={(e) => setQCategory(e.target.value as Question['category'])}
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs bg-white cursor-pointer"
+                      onChange={(e) => {
+                        setQCategory(e.target.value);
+                        if (formErrors.qCategory) setFormErrors(prev => ({ ...prev, qCategory: '' }));
+                      }}
+                      className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white cursor-pointer focus:outline-none transition-all ${
+                        formErrors.qCategory
+                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20'
+                          : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
+                      }`}
                     >
+                      <option value="">Select Subject...</option>
+                      <option value="Reasoning">Reasoning</option>
+                      <option value="Hindi">Hindi</option>
+                      <option value="English">English</option>
+                      <option value="Mathematics">Mathematics</option>
                       <option value="General Knowledge">General Knowledge</option>
-                      <option value="Science & Tech">Science & Tech</option>
-                      <option value="Indian Heritage">Indian Heritage</option>
-                      <option value="Current Affairs">Current Affairs</option>
-                      <option value="Geography & Nature">Geography & Nature</option>
+                      <option value="General Science">General Science</option>
                     </select>
+                    {formErrors.qCategory && (
+                      <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
+                        {formErrors.qCategory}
+                      </p>
+                    )}
                   </div>
 
+                  {/* Difficulty */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">Difficulty</label>
+                    <label className="block text-xs font-bold text-slate-900 mb-1.5 uppercase tracking-wider">
+                      Difficulty <span className="text-red-500">*</span>
+                    </label>
                     <select
                       value={qDifficulty}
-                      onChange={(e) => setQDifficulty(e.target.value as Question['difficulty'])}
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs bg-white cursor-pointer"
+                      onChange={(e) => {
+                        setQDifficulty(e.target.value);
+                        if (formErrors.qDifficulty) setFormErrors(prev => ({ ...prev, qDifficulty: '' }));
+                      }}
+                      className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white cursor-pointer focus:outline-none transition-all ${
+                        formErrors.qDifficulty
+                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20'
+                          : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
+                      }`}
                     >
-                      <option value="Easy">Easy (10s)</option>
-                      <option value="Medium">Medium (10s)</option>
-                      <option value="Hard">Hard (8s)</option>
-                      <option value="Expert">Expert (5s Tie-Breaker)</option>
+                      <option value="">Select Difficulty...</option>
+                      <option value="Easy">Easy</option>
+                      <option value="Medium">Medium</option>
+                      <option value="Hard">Hard</option>
+                      <option value="Expert">Expert</option>
                     </select>
+                    {formErrors.qDifficulty && (
+                      <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
+                        {formErrors.qDifficulty}
+                      </p>
+                    )}
                   </div>
 
+                  {/* Explanation */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1.5">Explanation / Reference</label>
+                    <label className="block text-xs font-bold text-slate-900 mb-1.5 uppercase tracking-wider">
+                      Explanation <span className="text-red-500">*</span>
+                    </label>
                     <input
                       type="text"
                       value={qExplanation}
-                      onChange={(e) => setQExplanation(e.target.value)}
-                      placeholder="e.g. Stratosphere is located above troposphere."
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-xs bg-white"
+                      onChange={(e) => {
+                        setQExplanation(e.target.value);
+                        if (formErrors.qExplanation) setFormErrors(prev => ({ ...prev, qExplanation: '' }));
+                      }}
+                      placeholder="e.g. Detailed step-by-step solution..."
+                      className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white placeholder:text-slate-400 focus:outline-none transition-all ${
+                        formErrors.qExplanation
+                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20'
+                          : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
+                      }`}
                     />
+                    {formErrors.qExplanation && (
+                      <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
+                        {formErrors.qExplanation}
+                      </p>
+                    )}
                   </div>
                 </div>
 
-                <div className="flex items-center justify-end gap-3 pt-2">
+                {/* Submit Actions */}
+                <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#EAECF0]">
+                  {editingId !== null && (
+                    <button
+                      type="button"
+                      onClick={handleCancelEdit}
+                      disabled={isSavingQuestion}
+                      className="px-5 py-2.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs border border-[#EAECF0] transition-all cursor-pointer shadow-xs disabled:opacity-50"
+                    >
+                      Cancel Edit
+                    </button>
+                  )}
+
                   <button
                     type="submit"
-                    className="px-6 py-3 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold text-xs shadow-md shadow-blue-500/20 flex items-center gap-2 transition-all cursor-pointer active:scale-95"
+                    disabled={isSavingQuestion}
+                    className="px-6 py-2.5 rounded-xl text-white font-bold text-xs shadow-md shadow-blue-500/20 flex items-center gap-2 transition-all cursor-pointer active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                    style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                   >
-                    <Save className="w-4 h-4" />
-                    <span>{editingId !== null ? 'Update Question' : 'Save Question to Pool'}</span>
+                    {isSavingQuestion ? (
+                      <>
+                        <Loader2 className="w-4 h-4 text-white animate-spin" />
+                        <span>{editingId !== null ? 'Updating Question...' : 'Saving Question...'}</span>
+                      </>
+                    ) : (
+                      <>
+                        <Save className="w-4 h-4 text-white" />
+                        <span>{editingId !== null ? 'Update Question' : 'Save Question'}</span>
+                      </>
+                    )}
                   </button>
                 </div>
               </form>
             )}
 
-            {/* Questions Table */}
-            <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-sm space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <h3 className="text-sm font-bold text-slate-900">
-                  Active Question Pool ({questions.length} Items)
-                </h3>
-                <div className="relative w-full sm:w-72">
-                  <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    value={questionSearch}
-                    onChange={(e) => setQuestionSearch(e.target.value)}
-                    placeholder="Search by keyword or category..."
-                    className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 bg-white"
-                  />
+            {/* Question Library CMS */}
+            <div className="bg-white rounded-3xl border border-[#EAECF0] p-6 shadow-sm space-y-4">
+              {/* Header, Search Bar & Prominent Red 'Delete Selected' Button */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-3 border-b border-[#EAECF0]">
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    Question Library
+                  </h3>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
+                  {/* Prominent Red Button "Delete Selected" activates when checkboxes are checked */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleDeleteSelectedQuestions();
+                    }}
+                    disabled={selectedQuestionIds.length === 0}
+                    className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap shadow-xs ${
+                      selectedQuestionIds.length > 0
+                        ? 'bg-[#D14343] hover:bg-red-700 text-white cursor-pointer active:scale-95'
+                        : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-[#EAECF0]'
+                    }`}
+                    title={selectedQuestionIds.length > 0 ? `Delete ${selectedQuestionIds.length} selected question(s)` : 'Select questions with checkboxes below to delete'}
+                  >
+                    Delete Selected{selectedQuestionIds.length > 0 ? ` (${selectedQuestionIds.length})` : ''}
+                  </button>
+
+                  <div className="relative w-full sm:w-80">
+                    <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      value={questionSearch}
+                      onChange={(e) => {
+                        setQuestionSearch(e.target.value);
+                        setQuestionPage(1);
+                      }}
+                      placeholder="Search Question Library..."
+                      className="w-full pl-10 pr-4 py-3 rounded-xl border border-[#EAECF0] text-xs sm:text-sm focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20 bg-white text-slate-900 placeholder:text-slate-400 shadow-2xs transition-all"
+                    />
+                  </div>
                 </div>
               </div>
 
-              <div className="overflow-x-auto rounded-2xl border border-slate-200">
-                <table className="w-full text-left text-xs border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-700">
-                      <th className="py-3 px-4 font-bold w-12">#</th>
-                      <th className="py-3 px-4 font-bold">Question Stem</th>
-                      <th className="py-3 px-4 font-bold">Category</th>
-                      <th className="py-3 px-4 font-bold">Correct Key</th>
-                      <th className="py-3 px-4 font-bold text-right">Actions</th>
+              {/* Clean Question Library Table with Strictly Pure White Headers */}
+              <div className="overflow-x-auto rounded-2xl border border-[#EAECF0] bg-white">
+                <table className="w-full text-left text-xs border-collapse bg-white">
+                  <thead className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                    <tr className="bg-white border-b border-[#EAECF0]" style={{ backgroundColor: '#FFFFFF' }}>
+                      {/* Square Select All Checkbox */}
+                      <th className="py-3.5 px-3.5 w-10 text-center bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                        <input
+                          type="checkbox"
+                          checked={paginatedQuestions.length > 0 && paginatedQuestions.every(q => selectedQuestionIds.includes(Number(q.id)))}
+                          onChange={() => {
+                            const pageIds = paginatedQuestions.map(q => Number(q.id));
+                            const allPageSelected = pageIds.length > 0 && pageIds.every(id => selectedQuestionIds.includes(id));
+                            if (allPageSelected) {
+                              setSelectedQuestionIds(prev => prev.filter(id => !pageIds.includes(id)));
+                            } else {
+                              setSelectedQuestionIds(prev => Array.from(new Set([...prev, ...pageIds])));
+                            }
+                          }}
+                          className="w-4 h-4 rounded text-[#4A7DF3] focus:ring-[#4A7DF3] border-[#EAECF0] cursor-pointer accent-[#4A7DF3] align-middle"
+                          title="Select / deselect all visible on this page"
+                        />
+                      </th>
+                      <th className="py-3.5 px-4 font-bold w-28 bg-white text-slate-900 text-xs" style={{ backgroundColor: '#FFFFFF', color: '#000000' }}>
+                        Subject
+                      </th>
+                      <th className="py-3.5 px-4 font-bold bg-white text-slate-900 text-xs" style={{ backgroundColor: '#FFFFFF', color: '#000000' }}>
+                        Question
+                      </th>
+                      <th className="py-3.5 px-4 font-bold w-64 bg-white text-slate-900 text-xs" style={{ backgroundColor: '#FFFFFF', color: '#000000' }}>
+                        Correct Answer
+                      </th>
+                      <th className="py-3.5 px-4 font-bold w-28 bg-white text-slate-900 text-xs" style={{ backgroundColor: '#FFFFFF', color: '#000000' }}>
+                        Difficulty
+                      </th>
+                      <th className="py-3.5 px-4 font-bold text-right w-24 bg-white text-slate-900 text-xs" style={{ backgroundColor: '#FFFFFF', color: '#000000' }}>
+                        Actions
+                      </th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {filteredQuestions.map((q) => (
-                      <tr key={q.id} className="hover:bg-slate-50/70 transition-colors">
-                        <td className="py-3 px-4 font-bold text-slate-400">{q.id}</td>
-                        <td className="py-3 px-4 font-semibold text-slate-900 max-w-md truncate">
-                          {q.question}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 font-semibold text-[11px]">
-                            {q.category}
-                          </span>
-                        </td>
-                        <td className="py-3 px-4 font-bold text-emerald-700">
-                          {['A', 'B', 'C', 'D'][q.correctIndex]}) {q.options[q.correctIndex]}
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          <div className="flex items-center justify-end gap-2">
-                            <button
-                              type="button"
-                              onClick={() => handleEditQuestion(q)}
-                              className="p-1.5 rounded-lg text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 transition-colors cursor-pointer"
-                              title="Edit Question"
-                            >
-                              <Edit3 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteQuestion(q.id)}
-                              className="p-1.5 rounded-lg text-slate-600 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
-                              title="Delete Question"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
+                  <tbody className="divide-y divide-[#EAECF0] bg-white">
+                    {/* Masked User ID Bar: Top-left of each 10-question block just below table header */}
+                    {paginatedQuestions.length > 0 && (() => {
+                      const blockNumber = safeQuestionPage;
+                      const assignedUserId = getBlockAssignedUserId(blockNumber, paginatedQuestions, registeredUsersList);
+                      const isUnmasked = unmaskedBlockIds.includes(blockNumber);
+
+                      return (
+                        <tr className="bg-white border-b border-[#EAECF0]" style={{ backgroundColor: '#FFFFFF' }}>
+                          <td colSpan={6} className="py-2 px-4 text-left bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                            <div className="flex items-center justify-between bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-semibold text-slate-700">
+                                  User ID:
+                                </span>
+                                {isUnmasked ? (
+                                  <div className="flex items-center gap-2">
+                                    <span 
+                                      className="font-bold text-xs tracking-wider font-mono inline-block"
+                                      style={{ 
+                                        background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
+                                        WebkitBackgroundClip: 'text',
+                                        WebkitTextFillColor: 'transparent',
+                                        color: '#3A81F5'
+                                      }}
+                                    >
+                                      {assignedUserId}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => setUnmaskedBlockIds(prev => prev.filter(b => b !== blockNumber))}
+                                      className="text-[9px] font-medium text-slate-500 hover:text-slate-800 px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50/80 hover:bg-slate-100 shadow-2xs transition-all cursor-pointer inline-flex items-center gap-1 active:scale-95 leading-none"
+                                      title="Hide / re-mask ID"
+                                    >
+                                      (Hide / Re-mask)
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setPasscodeModalBlock({ blockNumber, userId: assignedUserId });
+                                      setPasscodeInput('');
+                                      setPasscodeError('');
+                                    }}
+                                    className="font-bold text-sm tracking-widest hover:opacity-80 transition-opacity cursor-pointer font-mono inline-flex items-center"
+                                    style={{ 
+                                      background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
+                                      WebkitBackgroundClip: 'text',
+                                      WebkitTextFillColor: 'transparent',
+                                      color: '#3A81F5'
+                                    }}
+                                    title="Click to enter passcode and unmask ID"
+                                  >
+                                    <span>********</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })()}
+
+                    {paginatedQuestions.length === 0 ? (
+                      <tr className="bg-white">
+                        <td colSpan={6} className="py-10 text-center text-slate-400 text-xs bg-white">
+                          No questions matching the search query.
                         </td>
                       </tr>
-                    ))}
+                    ) : (
+                      paginatedQuestions.map((q) => {
+                        const normCat = normalizeCategory(q.category);
+                        const isSelected = selectedQuestionIds.includes(Number(q.id));
+                        const correctLetter = q.correctKey || ['A', 'B', 'C', 'D'][q.correctIndex] || 'A';
+                        const rawOptionText = q.options ? q.options[q.correctIndex != null && q.correctIndex >= 0 ? q.correctIndex : Math.max(0, ['A', 'B', 'C', 'D'].indexOf(correctLetter))] : '';
+                        const cleanOptionText = (rawOptionText || '').replace(/^[A-Da-d][).:\s-]+/, '').trim();
+                        const fullAnswerString = `${correctLetter}) ${cleanOptionText || rawOptionText}`;
+
+                        return (
+                          <tr 
+                            key={q.id} 
+                            className={`transition-colors ${isSelected ? 'bg-indigo-50/50 hover:bg-indigo-50/70' : 'bg-white hover:bg-slate-50/70'}`}
+                            style={{ backgroundColor: isSelected ? undefined : '#FFFFFF' }}
+                          >
+                            {/* Far left square selection checkbox */}
+                            <td className="py-3.5 px-3.5 text-center">
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => handleToggleSelectQuestion(Number(q.id))}
+                                className="w-4 h-4 rounded text-[#4A7DF3] focus:ring-[#4A7DF3] border-[#EAECF0] cursor-pointer accent-[#4A7DF3] align-middle"
+                                title={`Select question #${q.id}`}
+                              />
+                            </td>
+
+                            {/* Subject tag: Styled in primary website brand gradient */}
+                            <td className="py-3.5 px-4 whitespace-nowrap">
+                              <span 
+                                className="font-bold text-xs uppercase tracking-wider inline-block"
+                                style={{ 
+                                  background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
+                                  WebkitBackgroundClip: 'text',
+                                  WebkitTextFillColor: 'transparent'
+                                }}
+                              >
+                                {normCat}
+                              </span>
+                            </td>
+
+                            {/* Question Stem: Clean dark text with neat truncation and 'more...' */}
+                            <td className="py-3.5 px-4 max-w-md">
+                              {(() => {
+                                const stemText = q.stem || q.question || '';
+                                const isLong = stemText.length > 85;
+                                const isExpanded = expandedQuestionIds.includes(Number(q.id));
+                                const displayText = isLong && !isExpanded ? `${stemText.slice(0, 85).trim()}...` : stemText;
+                                return (
+                                  <div className="font-medium text-xs leading-relaxed text-slate-900 break-words" title={stemText}>
+                                    <span>{displayText}</span>
+                                    {isLong && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setExpandedQuestionIds(prev => 
+                                            isExpanded ? prev.filter(id => id !== Number(q.id)) : [...prev, Number(q.id)]
+                                          );
+                                        }}
+                                        className="font-bold ml-1 cursor-pointer hover:opacity-80 inline-block align-baseline"
+                                        style={{ 
+                                          background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)',
+                                          WebkitBackgroundClip: 'text',
+                                          WebkitTextFillColor: 'transparent',
+                                          color: '#3A81F5'
+                                        }}
+                                        title={isExpanded ? 'Show less' : 'Show full question'}
+                                      >
+                                        {isExpanded ? ' less' : ' more...'}
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                            </td>
+
+                            {/* Correct Answer: FULL string in green text (e.g. "C) Chandrayaan-3") */}
+                            <td className="py-3.5 px-4 whitespace-nowrap">
+                              <span className="font-bold text-xs text-[#15803d] truncate max-w-[240px] inline-block align-middle" title={fullAnswerString}>
+                                {fullAnswerString}
+                              </span>
+                            </td>
+
+                            {/* Dedicated Difficulty Column */}
+                            <td className="py-3.5 px-4 whitespace-nowrap">
+                              <span className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase tracking-wider inline-block ${
+                                q.difficulty === 'Easy'
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                  : q.difficulty === 'Medium'
+                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                  : q.difficulty === 'Hard'
+                                  ? 'bg-orange-50 text-orange-700 border border-orange-200'
+                                  : 'bg-purple-50 text-purple-700 border border-purple-200'
+                              }`}>
+                                {q.difficulty || 'Medium'}
+                              </span>
+                            </td>
+
+                            {/* Actions: Edit in brand gradient with white pencil, permanent delete with red trash */}
+                            <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleEditQuestion(q)}
+                                  className="w-8 h-8 rounded-lg flex items-center justify-center text-white shadow-xs hover:opacity-90 active:scale-95 transition-all cursor-pointer"
+                                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                                  title="Edit Question"
+                                >
+                                  <Edit3 className="w-4 h-4 text-white" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    handleDeleteQuestion(Number(q.id));
+                                  }}
+                                  className="w-8 h-8 rounded-lg flex items-center justify-center text-[#D14343] hover:text-red-700 hover:bg-red-50 transition-colors cursor-pointer"
+                                  title="Permanently Delete Question"
+                                >
+                                  <Trash2 className="w-4 h-4 text-[#D14343]" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
                   </tbody>
                 </table>
+              </div>
+
+              {/* Exact Unified Single-Pill Capsule Pagination: `< X / Y >` inside ONE single brand gradient container at bottom right */}
+              <div className="flex items-center justify-end pt-3 border-t border-[#EAECF0]">
+                <div 
+                  className="inline-flex items-center rounded-full text-white font-bold text-xs shadow-md overflow-hidden select-none"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                >
+                  <button
+                    type="button"
+                    disabled={safeQuestionPage <= 1}
+                    onClick={() => setQuestionPage(prev => Math.max(1, prev - 1))}
+                    className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+                    title="Previous Page"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5 text-white" />
+                  </button>
+
+                  <span className="px-3 py-2 text-white font-bold text-xs tracking-wider min-w-[56px] text-center">
+                    {safeQuestionPage} / {totalQuestionPages}
+                  </span>
+
+                  <button
+                    type="button"
+                    disabled={safeQuestionPage >= totalQuestionPages}
+                    onClick={() => setQuestionPage(prev => Math.min(totalQuestionPages, prev + 1))}
+                    className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+                    title="Next Page"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5 text-white" />
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -5634,6 +6532,62 @@ Explanation: Explanation details for the contestant.`}
                 </div>
               </form>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 10-Question Block Registration ID Passcode Verification Modal */}
+      {passcodeModalBlock && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-[#EAECF0] space-y-4">
+            <div className="space-y-1">
+              <h3 className="text-base font-bold text-slate-900">
+                Security Verification
+              </h3>
+            </div>
+
+            <form onSubmit={handleVerifyPasscode} className="space-y-4">
+              <div>
+                <input
+                  type="password"
+                  value={passcodeInput}
+                  onChange={(e) => {
+                    setPasscodeInput(e.target.value);
+                    if (passcodeError) setPasscodeError('');
+                  }}
+                  autoFocus
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#EAECF0] text-sm text-slate-900 focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20"
+                />
+                {passcodeError && (
+                  <p className="text-xs text-rose-600 font-semibold mt-1.5 flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    <span>{passcodeError}</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPasscodeModalBlock(null);
+                    setPasscodeInput('');
+                    setPasscodeError('');
+                  }}
+                  className="flex-1 py-2.5 px-4 rounded-xl text-white text-xs font-bold shadow-md hover:opacity-95 active:scale-[0.99] transition-all cursor-pointer"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2.5 px-4 rounded-xl text-white text-xs font-bold shadow-md hover:opacity-95 active:scale-[0.99] transition-all cursor-pointer"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                >
+                  Unlock ID
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

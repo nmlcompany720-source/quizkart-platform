@@ -28,20 +28,77 @@ interface PreQuizOnboardingProps {
 
 // Category Subject Translations for Hindi/English
 const translateSubject = (name: string, lang: 'English' | 'Hindi'): string => {
-  if (lang !== 'Hindi') return name;
-  const map: Record<string, string> = {
-    'Science': 'विज्ञान',
-    'Science & Tech': 'विज्ञान और प्रौद्योगिकी',
-    'Geography': 'भूगोल',
-    'Geography & Nature': 'भूगोल और प्रकृति',
-    'History': 'इतिहास',
-    'Indian Heritage': 'भारतीय विरासत व इतिहास',
-    'GK & CA': 'सामान्य ज्ञान व समसामयिकी',
-    'General Knowledge': 'सामान्य ज्ञान',
-    'Current Affairs': 'समसामयिकी',
-    'Tie-Breaker': 'टाई-ब्रेकर'
+  const clean = (name || '').trim();
+
+  // If Hindi selected: translate all English subjects to Hindi
+  if (lang === 'Hindi') {
+    const hindiMap: Record<string, string> = {
+      'Mathematics': 'गणित',
+      'Maths': 'गणित',
+      'Math': 'गणित',
+      'Reasoning': 'तर्कशक्ति',
+      'General Science': 'सामान्य विज्ञान',
+      'Science': 'सामान्य विज्ञान',
+      'Science & Tech': 'विज्ञान और प्रौद्योगिकी',
+      'English': 'अंग्रेजी',
+      'General Knowledge': 'सामान्य ज्ञान',
+      'GK': 'सामान्य ज्ञान',
+      'GK & CA': 'सामान्य ज्ञान व समसामयिकी',
+      'Current Affairs': 'समसामयिकी',
+      'History': 'इतिहास',
+      'Geography': 'भूगोल',
+      'Geography & Nature': 'भूगोल और प्रकृति',
+      'Indian Heritage': 'भारतीय विरासत व इतिहास',
+      'Tie-Breaker': 'टाई-ब्रेकर',
+      'गणित': 'गणित',
+      'तर्कशक्ति': 'तर्कशक्ति',
+      'सामान्य विज्ञान': 'सामान्य विज्ञान',
+      'अंग्रेजी': 'अंग्रेजी',
+      'सामान्य ज्ञान': 'सामान्य ज्ञान'
+    };
+    if (hindiMap[clean]) return hindiMap[clean];
+
+    const lower = clean.toLowerCase();
+    for (const [key, val] of Object.entries(hindiMap)) {
+      if (key.toLowerCase() === lower) return val;
+    }
+    return clean;
+  }
+
+  // If English selected: ensure all subjects are displayed strictly in English
+  const englishMap: Record<string, string> = {
+    'गणित': 'Mathematics',
+    'तर्कशक्ति': 'Reasoning',
+    'सामान्य विज्ञान': 'General Science',
+    'विज्ञान': 'General Science',
+    'विज्ञान और प्रौद्योगिकी': 'Science & Tech',
+    'अंग्रेजी': 'English',
+    'सामान्य ज्ञान': 'General Knowledge',
+    'सामान्य ज्ञान व समसामयिकी': 'General Knowledge',
+    'समसामयिकी': 'Current Affairs',
+    'इतिहास': 'History',
+    'भूगोल': 'Geography',
+    'भूगोल और प्रकृति': 'Geography & Nature',
+    'भारतीय विरासत व इतिहास': 'Indian Heritage',
+    'टाई-ब्रेकर': 'Tie-Breaker',
+    'Maths': 'Mathematics',
+    'Math': 'Mathematics',
+    'Mathematics': 'Mathematics',
+    'Reasoning': 'Reasoning',
+    'General Science': 'General Science',
+    'English': 'English',
+    'General Knowledge': 'General Knowledge',
+    'GK': 'General Knowledge',
+    'Science': 'General Science'
   };
-  return map[name] || name;
+
+  if (englishMap[clean]) return englishMap[clean];
+
+  const lower = clean.toLowerCase();
+  for (const [key, val] of Object.entries(englishMap)) {
+    if (key.toLowerCase() === lower) return val;
+  }
+  return clean;
 };
 
 export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
@@ -63,8 +120,9 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
     if (questions && questions.length > 0) {
       const map: Record<string, number> = {};
       questions.forEach((q) => {
-        const cat = q.category || 'General Knowledge';
-        map[cat] = (map[cat] || 0) + 1;
+        const raw = q.subject || q.category || 'General Knowledge';
+        const canonicalEnglish = translateSubject(raw, 'English');
+        map[canonicalEnglish] = (map[canonicalEnglish] || 0) + 1;
       });
       return Object.entries(map).map(([name, count]) => ({
         name,
@@ -72,19 +130,19 @@ export const PreQuizOnboarding: React.FC<PreQuizOnboardingProps> = ({
         marks: count * 1,
       }));
     }
-    // Default standard breakdown
+    // Fallback standard syllabus distribution when questions not yet populated
     return [
-      { name: 'Science', questions: 4, marks: 4 },
-      { name: 'Geography', questions: 4, marks: 4 },
-      { name: 'History', questions: 4, marks: 4 },
-      { name: 'GK & CA', questions: 4, marks: 4 },
-      { name: 'Tie-Breaker', questions: 3, marks: 3 },
+      { name: 'Mathematics', questions: 2, marks: 2 },
+      { name: 'Reasoning', questions: 2, marks: 2 },
+      { name: 'General Science', questions: 2, marks: 2 },
+      { name: 'General Knowledge', questions: 2, marks: 2 },
+      { name: 'English', questions: 2, marks: 2 }
     ];
   }, [questions]);
 
   const totalQuestionsCalculated = subjectList.reduce((acc, s) => acc + s.questions, 0);
   const totalMarksCalculated = subjectList.reduce((acc, s) => acc + s.marks, 0);
-  const effectiveTotalQuestions = questions.length > 0 ? questions.length : (totalQuestions || totalQuestionsCalculated);
+  const effectiveTotalQuestions = questions !== undefined ? questions.length : (totalQuestions || totalQuestionsCalculated);
   const effectiveTotalMarks = totalMarksCalculated || effectiveTotalQuestions;
 
   // Persist user selected language preference globally across session

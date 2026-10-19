@@ -185,7 +185,8 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
   const displayRegistrationId = (() => {
     const targetEmail = (userProfile.email || editEmail || '').trim().toLowerCase();
     const targetMobile = (userProfile.mobile || editMobile || '').replace(/\D/g, '');
-    const targetId = (userProfile.id && /^USR-\d+$/i.test(userProfile.id.trim())) ? userProfile.id.trim().toUpperCase() : '';
+    const rawId = (userProfile.id || '').trim().toUpperCase();
+    const targetId = (/^(?:QK-)?USR-\d+$/i.test(rawId)) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
 
     try {
       const regRaw = localStorage.getItem('quizkart_registered_users');
@@ -201,7 +202,7 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
           return u.email.trim().toLowerCase() === targetEmail;
         });
         if (emailIdx >= 0) {
-          return `USR-${1001 + emailIdx}`;
+          return `QK-USR-${1001 + emailIdx}`;
         }
       }
 
@@ -216,27 +217,29 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
           return true;
         });
         if (mobIdx >= 0) {
-          return `USR-${1001 + mobIdx}`;
+          return `QK-USR-${1001 + mobIdx}`;
         }
       }
 
-      // Priority 3: Match by valid USR-XXXX ID only if emails do not conflict
+      // Priority 3: Match by valid QK-USR-XXXX ID only if emails do not conflict
       if (targetId) {
         const idIdx = list.findIndex((u) => {
           if (!u || !u.id) return false;
           const uId = u.id.trim().toUpperCase();
+          const cleanUId = uId.startsWith('QK-') ? uId : `QK-${uId}`;
           const uEmail = (u.email || '').trim().toLowerCase();
-          if (uId !== targetId) return false;
+          if (cleanUId !== targetId) return false;
           if (targetEmail && uEmail && targetEmail !== uEmail) return false;
           return true;
         });
         if (idIdx >= 0) {
-          return `USR-${1001 + idIdx}`;
+          return `QK-USR-${1001 + idIdx}`;
         }
+        return targetId;
       }
     } catch {}
 
-    return 'USR-1001';
+    return 'QK-USR-1001';
   })();
 
   // Instant local device image upload

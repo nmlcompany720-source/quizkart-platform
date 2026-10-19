@@ -124,16 +124,26 @@
           "type": "number",
           "description": "0-based index of the correct option (0 to 3)"
         },
+        "stem": {
+          "type": "string",
+          "description": "The question stem text",
+          "maxLength": 1000
+        },
+        "correctKey": {
+          "type": "string",
+          "enum": ["A", "B", "C", "D"],
+          "description": "Correct answer letter indicator"
+        },
         "category": {
           "type": "string",
-          "enum": ["General Knowledge", "Science & Tech", "Indian Heritage", "Current Affairs", "Geography & Nature"],
-          "description": "Question category",
+          "enum": ["Maths", "Reasoning", "Science", "GK", "English", "General Knowledge", "Science & Tech", "Indian Heritage", "Current Affairs", "Geography & Nature"],
+          "description": "Question subject category",
           "maxLength": 50
         },
         "explanation": {
           "type": "string",
           "description": "Educational reasoning for the answer",
-          "maxLength": 500
+          "maxLength": 1000
         },
         "difficulty": {
           "type": "string",
