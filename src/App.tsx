@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Navbar } from './components/Navbar';
 import { HeroSection } from './components/HeroSection';
 import { WalletEntryConfirmModal } from './components/WalletEntryConfirmModal';
@@ -73,7 +73,8 @@ import {
   isFirestoreQuotaExceeded,
   isWithinRetentionWindow,
   saveQuestionToFirestore,
-  removeQuestionFromFirestore
+  removeQuestionFromFirestore,
+  updateUserPresenceInFirestore
 } from './firebase';
 import { 
   getNextDepositId, 
@@ -93,8 +94,12 @@ import {
   questionPoolManager, 
   getAssignedQuestionsForUser, 
   createRetakeBlockForUser, 
+  autoAssignNextBlockToUser,
   canonicalizeUserId,
-  isOldMockQuestion 
+  isOldMockQuestion,
+  getUserInitialAssignedQuestions,
+  getUserInitialBlockNumber,
+  sanitizeAndEnsureInitialBlockMapping
 } from './utils/questionPoolManager';
 import { User } from 'firebase/auth';
 import { Bell, X } from 'lucide-react';
@@ -1035,7 +1040,8 @@ export default function App() {
       if (saved !== null) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          return parsed.filter((q): q is Question => Boolean(q && q.id != null && !deletedSet.has(Number(q.id))));
+          const valid = parsed.filter((q): q is Question => Boolean(q && q.id != null && !deletedSet.has(Number(q.id))));
+          return sanitizeAndEnsureInitialBlockMapping(valid);
         }
       }
       return [];
@@ -1431,7 +1437,8 @@ export default function App() {
   useEffect(() => {
     questionPoolManager.loadAllQuestions([]).then((loaded) => {
       if (Array.isArray(loaded)) {
-        setQuizQuestions(loaded);
+        const sanitized = sanitizeAndEnsureInitialBlockMapping(loaded);
+        setQuizQuestions(sanitized);
       }
     });
   }, []);
@@ -1912,10 +1919,27 @@ export default function App() {
       localStorage.setItem('quizkart_registered_users', JSON.stringify(existingUsers));
     } catch {}
 
+    // NEW USER REGISTRATION AUTO-ASSIGNMENT LOGIC (Requirement 3):
+    // As soon as a NEW user registers, immediately map next available unassigned block (e.g. Block 6)
+    // and label top with new User ID so first test loads those exact 10 questions
+    try {
+      const assignRes = autoAssignNextBlockToUser({
+        userId: updatedProfile.id,
+        allQuestions: quizQuestions,
+        onQuestionsUpdated: setQuizQuestions,
+        onQuestionSavedToFirestore: (q) => saveQuestionToFirestore(q).catch(() => {})
+      });
+      if (assignRes.updatedQuestions.length > 0) {
+        setQuizQuestions(assignRes.updatedQuestions);
+      }
+    } catch (err) {
+      console.warn('Auto block assign on registration error:', err);
+    }
+
     setCurrentTab('home');
     await syncUserProfile(updatedProfile);
     handleShowNotice(`Welcome ${updatedProfile.name}!`);
-  }, [userProfile, currentUser, handleShowNotice, userQuizAttempts]);
+  }, [userProfile, currentUser, handleShowNotice, userQuizAttempts, quizQuestions]);
 
   // Handler when user updates their Email from Edit Profile -> Initial Auth Screen
   const handleUpdateEmailOnly = useCallback(async (newEmail: string) => {
@@ -1981,7 +2005,9 @@ export default function App() {
     syncUserProfile(updated).catch(err => console.warn('Sync profile error:', err));
   }, []);
 
-  // Real-time Active User Session Presence Tracker (strictly linked to User Email Address while browser tab/session is open)
+  const lastFirestorePresencePingRef = useRef<number>(0);
+
+  // Real-time Active User Session Presence Tracker (Firebase Firestore + Local Channel)
   useEffect(() => {
     const emailKey = (userProfile?.email || '').trim().toLowerCase();
     const isSessionLoggedOut = !isUserAuthenticated || (isAuthModalOpen && !isEmailChangeMode) || isDemoSeedUser(userProfile);
@@ -2023,6 +2049,18 @@ export default function App() {
         localStorage.setItem('quizkart_active_sessions', JSON.stringify(sessions));
         notifyPresenceChannel();
       } catch {}
+
+      // Global Firebase Firestore presence heartbeat
+      if (!isSessionLoggedOut && isOnline && !userProfile?.isBlocked && !userProfile?.isDeleted) {
+        const now = Date.now();
+        if (now - lastFirestorePresencePingRef.current > 20000) {
+          lastFirestorePresencePingRef.current = now;
+          updateUserPresenceInFirestore(userProfile, true).catch(() => {});
+        }
+      } else {
+        lastFirestorePresencePingRef.current = 0;
+        updateUserPresenceInFirestore(userProfile, false).catch(() => {});
+      }
     };
 
     if (isSessionLoggedOut) {
@@ -2033,6 +2071,9 @@ export default function App() {
       return;
     }
 
+    // Initial online presence ping
+    lastFirestorePresencePingRef.current = Date.now();
+    updateUserPresenceInFirestore(userProfile, true).catch(() => {});
     updateSessionPresence(document.visibilityState !== 'hidden');
 
     const heartbeatInterval = setInterval(() => {
@@ -2040,10 +2081,18 @@ export default function App() {
     }, 1500);
 
     const handleVisibilityChange = () => {
-      updateSessionPresence(document.visibilityState !== 'hidden');
+      const isVis = document.visibilityState !== 'hidden';
+      if (isVis) {
+        lastFirestorePresencePingRef.current = Date.now();
+        updateUserPresenceInFirestore(userProfile, true).catch(() => {});
+      } else {
+        updateUserPresenceInFirestore(userProfile, false).catch(() => {});
+      }
+      updateSessionPresence(isVis);
     };
 
     const handleUnload = () => {
+      updateUserPresenceInFirestore(userProfile, false).catch(() => {});
       updateSessionPresence(false);
     };
 
@@ -2062,12 +2111,12 @@ export default function App() {
     };
   }, [userProfile?.email, userProfile?.isBlocked, userProfile?.isDeleted, isUserAuthenticated, isAuthModalOpen, isEmailChangeMode]);
 
-  // Sync user profile updates to Firestore
+  // Sync user profile updates to centralized Firebase Firestore collection globally
   useEffect(() => {
-    if (currentUser && !isFirestoreQuotaExceeded() && userProfile?.isRegistered && !userProfile?.isDeleted) {
+    if (!isFirestoreQuotaExceeded() && userProfile?.isRegistered && !userProfile?.isDeleted && userProfile?.email) {
       syncUserProfile(userProfile).catch(() => {});
     }
-  }, [userProfile?.walletBalance, userProfile?.totalWonAmount, userProfile?.name, userProfile?.email, currentUser]);
+  }, [userProfile?.walletBalance, userProfile?.totalWonAmount, userProfile?.name, userProfile?.email, userProfile?.isBlocked, userProfile?.isRegistered]);
 
   // JavaScript Dynamic URL & Hash Listener for Secret Admin Route (#admin-gate-99)
   useEffect(() => {
@@ -2202,14 +2251,19 @@ export default function App() {
     if (cleanPool.length > 0) {
       const canonicalUserId = canonicalizeUserId(userProfile?.id);
       const userAttemptsCount = userQuizAttempts.filter(
-        a => (a && (canonicalizeUserId(a.userId) === canonicalUserId || a.userName === userProfile.name))
+        a => (a && ((a as any).userId ? canonicalizeUserId((a as any).userId) === canonicalUserId : (a as any).userName === userProfile.name))
       ).length;
 
-      const existingAssigned = getAssignedQuestionsForUser(userProfile?.id, quizQuestions);
-      const hasTakenBefore = userAttemptsCount > 0 || lastQuizResult !== null || Boolean(sessionStorage.getItem(`quizkart_has_taken_${canonicalUserId}`));
-      const isRetakeOrNewJoin = hasTakenBefore || existingAssigned.length === 0;
+      // FIRST JOIN RULE vs RE-JOIN / RETAKE RULE (Requirement 1):
+      // - FIRST JOIN RULE: If it is the user's first time taking the test (userAttemptsCount === 0),
+      //   the system MUST load their original, pre-allocated initial block (e.g., Box 1) containing
+      //   their designated questions. Do NOT create a new block or assign a secondary block on the very first attempt.
+      // - RE-JOIN / RETAKE RULE: Only when the user completes their first test (userAttemptsCount > 0)
+      //   and explicitly clicks Re-join to take the test a second time, the system should assign the next
+      //   available unassigned block (or generate a new dynamic block if initial blocks are exhausted) mapped to their User ID.
+      const isRetake = userAttemptsCount > 0;
 
-      if (isRetakeOrNewJoin) {
+      if (isRetake) {
         const retakeResult = createRetakeBlockForUser({
           userId: userProfile?.id,
           allQuestions: quizQuestions,
@@ -2220,6 +2274,36 @@ export default function App() {
 
         if (retakeResult.newQuestions.length > 0) {
           setQuizQuestions(retakeResult.updatedPool);
+        }
+      } else {
+        // FIRST JOIN RULE: Load original pre-allocated initial block (Box 1)
+        const initialQs = getUserInitialAssignedQuestions(userProfile?.id, quizQuestions);
+        if (initialQs.length === 0) {
+          const assignResult = autoAssignNextBlockToUser({
+            userId: userProfile?.id,
+            allQuestions: quizQuestions,
+            onQuestionsUpdated: setQuizQuestions,
+            onQuestionSavedToFirestore: (q) => {
+              saveQuestionToFirestore(q).catch(() => {});
+            }
+          });
+
+          if (assignResult.updatedQuestions.length > 0) {
+            setQuizQuestions(assignResult.updatedQuestions);
+          }
+        } else {
+          // Strictly anchor active block mapping to the user's initial block
+          const initBlockNum = getUserInitialBlockNumber(userProfile?.id, quizQuestions);
+          try {
+            localStorage.setItem(
+              `quizkart_active_user_assigned_block_${canonicalUserId}`,
+              JSON.stringify({
+                blockNumber: initBlockNum,
+                questionIds: initialQs.map(q => q.id),
+                timestamp: Date.now()
+              })
+            );
+          } catch {}
         }
       }
     }
@@ -2435,9 +2519,13 @@ export default function App() {
 
     setLeaderboard(rankedLeaderboard);
 
+    const canonicalUserId = canonicalizeUserId(userProfile?.id);
+
     // 3. Build Result Object
     const attemptResult: QuizAttemptResult = {
       attemptId: `att-${Date.now()}`,
+      userId: canonicalUserId,
+      userName: userProfile.name,
       quizDate: new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
       score: calculatedScore,
       totalQuestions: quizQuestions.length,
@@ -2797,6 +2885,11 @@ export default function App() {
               onLiveStateChange={setHeroReportedLive}
               contestDurationSeconds={globalQuizTimer}
               questions={userAssignedQuestions}
+              hasCompletedBefore={
+                userQuizAttempts.some(
+                  a => a && (canonicalizeUserId(a.userId) === canonicalizeUserId(userProfile?.id) || a.userName === userProfile.name)
+                )
+              }
             />
           </div>
         )}
@@ -2817,6 +2910,10 @@ export default function App() {
                   setLastQuizResult(null);
                   setCurrentTab('home');
                   window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+                onRejoinContest={() => {
+                  setLastQuizResult(null);
+                  handleStartRealQuiz();
                 }}
               />
             ) : (

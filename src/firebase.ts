@@ -296,16 +296,18 @@ export function subscribeToAuth(callback: (user: User | null) => void) {
 export async function syncUserProfile(profile: UserProfile): Promise<void> {
   if (!profile || isDemoSeedUser(profile) || isFirestoreQuotaExceeded()) return;
   const currentUser = auth.currentUser;
-  const docId = currentUser?.uid || profile.uid || profile.id || (profile.email ? profile.email.replace(/[^a-zA-Z0-9_-]/g, '_') : null);
+  const cleanEmail = (profile.email || currentUser?.email || '').trim().toLowerCase();
+  const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : null;
+  const docId = safeEmailDocId || profile.uid || profile.id || (currentUser?.uid ?? null);
   if (!docId) return;
 
   const path = `users/${docId}`;
   try {
     await setDoc(doc(db, 'users', docId), {
-      uid: docId,
+      uid: profile.uid || currentUser?.uid || docId,
       id: profile.id || docId,
       name: profile.name || currentUser?.displayName || 'Player',
-      email: profile.email || currentUser?.email || '',
+      email: cleanEmail,
       mobile: profile.mobile || '',
       countryCode: profile.countryCode || '+91',
       avatarUrl: profile.avatarUrl || currentUser?.photoURL || '',
@@ -317,7 +319,7 @@ export async function syncUserProfile(profile: UserProfile): Promise<void> {
       isRegistered: profile.isRegistered ?? true,
       isBlocked: Boolean(profile.isBlocked),
       blockReason: profile.blockReason || '',
-      registrationDate: profile.registrationDate || new Date().toISOString(),
+      registrationDate: profile.registrationDate || new Date().toISOString().split('T')[0],
       passwordStatus: (profile.passwordStatus && !profile.passwordStatus.includes('••••') && !profile.passwordStatus.includes('Secured')) ? profile.passwordStatus : 'player@123',
       hasPassword: profile.hasPassword ?? true,
       kycStatus: profile.kycStatus || 'Unverified',
@@ -325,8 +327,18 @@ export async function syncUserProfile(profile: UserProfile): Promise<void> {
     }, { merge: true });
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
-    // Gracefully log if unauthenticated in preview mode
     console.warn('Firestore user sync notice:', error);
+  }
+}
+
+export async function deleteUserProfileFromFirestore(emailOrId: string): Promise<void> {
+  if (!emailOrId || isFirestoreQuotaExceeded()) return;
+  const cleanEmail = emailOrId.trim().toLowerCase();
+  const safeDocId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
+  try {
+    await deleteDoc(doc(db, 'users', safeDocId));
+  } catch (error) {
+    handlePossibleQuotaError(error);
   }
 }
 
@@ -347,6 +359,7 @@ export async function fetchAllUsersFromFirestore(): Promise<UserProfile[]> {
     });
     return list;
   } catch (error) {
+    console.warn('fetchAllUsersFromFirestore error:', error);
     return [];
   }
 }
@@ -370,7 +383,83 @@ export function subscribeToAllUsersFromFirestore(callback: (users: UserProfile[]
         });
         callback(list);
       },
-      () => {}
+      (error) => {
+        console.warn('Firestore users subscription warning:', error);
+      }
+    );
+  } catch {
+    return () => {};
+  }
+}
+
+// Global Real-Time User Presence Management (Firebase Firestore)
+export async function updateUserPresenceInFirestore(
+  user: { email?: string; id?: string; uid?: string; name?: string } | null,
+  isOnline: boolean
+): Promise<void> {
+  if (!user || !user.email || isFirestoreQuotaExceeded()) return;
+  const cleanEmail = user.email.trim().toLowerCase();
+  if (!cleanEmail || cleanEmail === 'player@quizkart.in') return;
+  const docId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  try {
+    const presenceRef = doc(db, 'user_presence', docId);
+    if (!isOnline) {
+      await setDoc(
+        presenceRef,
+        {
+          email: cleanEmail,
+          userId: user.id || user.uid || '',
+          name: user.name || '',
+          isOnline: false,
+          lastSeen: Date.now(),
+          updatedAt: new Date().toISOString()
+        },
+        { merge: true }
+      );
+    } else {
+      await setDoc(
+        presenceRef,
+        {
+          email: cleanEmail,
+          userId: user.id || user.uid || '',
+          name: user.name || '',
+          isOnline: true,
+          lastSeen: Date.now(),
+          updatedAt: new Date().toISOString()
+        },
+        { merge: true }
+      );
+    }
+  } catch (error) {
+    handlePossibleQuotaError(error);
+  }
+}
+
+export function subscribeToUserPresenceFromFirestore(
+  callback: (presenceMap: Record<string, { isOnline: boolean; lastSeen: number }>) => void
+): () => void {
+  const path = 'user_presence';
+  try {
+    return onSnapshot(
+      collection(db, path),
+      (snap) => {
+        const map: Record<string, { isOnline: boolean; lastSeen: number }> = {};
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data && data.email) {
+            const emailKey = String(data.email).trim().toLowerCase();
+            map[emailKey] = {
+              isOnline: Boolean(data.isOnline),
+              lastSeen: Number(data.lastSeen) || 0
+            };
+          }
+        });
+        callback(map);
+      },
+      (error) => {
+        console.warn('User presence subscription warning:', error);
+      }
     );
   } catch {
     return () => {};

@@ -1,4 +1,5 @@
 import { UserProfile } from '../types';
+import { syncUserProfile } from '../firebase';
 
 export const INITIAL_REGISTERED_USERS: UserProfile[] = [
   {
@@ -183,6 +184,7 @@ export function upsertRegisteredUser(user: Partial<UserProfile> & { email: strin
     };
     users[index] = updated;
     saveStoredRegisteredUsers(users);
+    syncUserProfile(updated).catch(() => {});
     return users;
   } else {
     const newUser: UserProfile = {
@@ -214,6 +216,7 @@ export function upsertRegisteredUser(user: Partial<UserProfile> & { email: strin
     };
     const updated = [newUser, ...users];
     saveStoredRegisteredUsers(updated);
+    syncUserProfile(newUser).catch(() => {});
     return updated;
   }
 }
@@ -236,6 +239,10 @@ export function toggleUserBlockInStorage(emailOrUid: string): { updatedUsers: Us
   });
 
   saveStoredRegisteredUsers(updatedUsers);
+
+  if (targetUser) {
+    syncUserProfile(targetUser).catch(() => {});
+  }
 
   // Dispatch custom event for real-time app reactivity
   if (typeof window !== 'undefined' && targetUser) {

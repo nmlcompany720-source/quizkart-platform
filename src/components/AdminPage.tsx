@@ -105,6 +105,7 @@ import {
   syncUserProfile, 
   fetchAllUsersFromFirestore,
   subscribeToAllUsersFromFirestore,
+  subscribeToUserPresenceFromFirestore,
   deleteDepositFromFirestore, 
   saveDepositQrToFirestore,
   saveQuizTimerToFirestore,
@@ -336,7 +337,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     return [];
   });
 
-  // Real-Time Active Browser Session Tracker (marks user ACTIVE only while browser tab/session is open)
+  // Real-Time Active Browser Session Tracker (Firebase Firestore + local sessions)
   const [activeSessionsMap, setActiveSessionsMap] = useState<Record<string, { email: string; id?: string; mobile?: string; lastSeen: number }>>(() => {
     try {
       const raw = localStorage.getItem('quizkart_active_sessions');
@@ -344,9 +345,20 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     } catch {}
     return {};
   });
-  const [isTabVisible, setIsTabVisible] = useState<boolean>(() =>
+  const [firebasePresenceMap, setFirebasePresenceMap] = useState<Record<string, { isOnline: boolean; lastSeen: number }>>({});
+  const [, setIsTabVisible] = useState<boolean>(() =>
     typeof document !== 'undefined' ? document.visibilityState !== 'hidden' : true
   );
+
+  // Real-time Firebase Firestore global presence listener (tracks online users across all devices)
+  useEffect(() => {
+    const unsub = subscribeToUserPresenceFromFirestore((presenceMap) => {
+      setFirebasePresenceMap(presenceMap);
+    });
+    return () => {
+      unsub();
+    };
+  }, []);
 
   useEffect(() => {
     const syncPresence = () => {
@@ -395,14 +407,20 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     };
   }, []);
 
-  // Strictly link Active User Status ONLY to the User Email Address (never phone number or fallback ID)
+  // Real-Time Active User Status: Dynamically attaches blue ACTIVE badge ONLY when user is actively online in real time
   const isUserSessionActive = (u: UserProfile): boolean => {
     if (!u || u.isBlocked || u.isDeleted) return false;
     const uEmail = (u.email || '').trim().toLowerCase();
     if (!uEmail) return false;
     const now = Date.now();
 
-    // Check active email sessions from open browser tabs in real time
+    // 1. Check Global Real-Time Firebase Presence Listener (active within 70 seconds)
+    const globalPresence = firebasePresenceMap[uEmail];
+    if (globalPresence && globalPresence.isOnline && (now - globalPresence.lastSeen < 70000)) {
+      return true;
+    }
+
+    // 2. Check active email sessions from open browser tabs in real time (fallback)
     const sessions = Object.values(activeSessionsMap) as Array<{ email: string; lastSeen: number }>;
     for (const session of sessions) {
       if (!session || now - session.lastSeen > 6000) continue;
@@ -588,10 +606,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   }, [userProfile]);
 
   useEffect(() => {
+    // 1. Initial fetch from centralized Firebase Firestore collection
     fetchAllUsersFromFirestore().then((cloudUsers) => {
       if (cloudUsers && cloudUsers.length > 0) {
         setRegisteredUsersList((prev) => {
-          const merged = deduplicateRegisteredUsers([...prev, ...cloudUsers]);
+          const merged = deduplicateRegisteredUsers([...cloudUsers, ...prev]);
           try {
             localStorage.setItem('quizkart_registered_users', JSON.stringify(merged));
           } catch {}
@@ -600,15 +619,33 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       }
     }).catch(() => {});
 
+    // 2. Real-time Firebase Firestore listener for users registered across all devices/apps
     const unsubscribeUsers = subscribeToAllUsersFromFirestore((cloudUsers) => {
-      setRegisteredUsersList((prev) => {
-        const merged = deduplicateRegisteredUsers([...prev, ...(cloudUsers || [])]);
-        try {
-          localStorage.setItem('quizkart_registered_users', JSON.stringify(merged));
-        } catch {}
-        return merged;
-      });
+      if (cloudUsers && cloudUsers.length > 0) {
+        setRegisteredUsersList((prev) => {
+          const merged = deduplicateRegisteredUsers([...cloudUsers, ...prev]);
+          try {
+            localStorage.setItem('quizkart_registered_users', JSON.stringify(merged));
+          } catch {}
+          return merged;
+        });
+      }
     });
+
+    // 3. Automatically sync any local registered users to Firestore if not yet uploaded
+    try {
+      const raw = localStorage.getItem('quizkart_registered_users');
+      if (raw) {
+        const localUsers: UserProfile[] = JSON.parse(raw);
+        if (Array.isArray(localUsers)) {
+          localUsers.forEach((lu) => {
+            if (lu && lu.email && lu.isRegistered && !isDemoSeedUser(lu)) {
+              syncUserProfile(lu).catch(() => {});
+            }
+          });
+        }
+      }
+    } catch {}
 
     return () => {
       unsubscribeUsers();
@@ -1388,7 +1425,7 @@ RULES:
       isCustom: true
     }));
 
-    const { allBlockQuestions, distinctUsers } = createInitialUserBlocksFromPool({
+    const { allBlockQuestions, distinctUsers, totalBlocks } = createInitialUserBlocksFromPool({
       baseQuestions: baseFormatted,
       registeredUsers: registeredUsersList,
       existingQuestions: validPool,
@@ -1406,7 +1443,13 @@ RULES:
     } catch {}
 
     soundFx.playCelebration();
-    showToast(`Successfully created ${distinctUsers.length} dedicated 10-question blocks (${allBlockQuestions.length} questions) for all registered users!`);
+    const assignedCount = distinctUsers.length;
+    const queueCount = Math.max(0, totalBlocks - assignedCount);
+    showToast(
+      queueCount > 0
+        ? `Created ${totalBlocks} blocks (${allBlockQuestions.length} questions): Blocks 1-${assignedCount} assigned to users, Blocks ${assignedCount + 1}-${totalBlocks} reserved in queue!`
+        : `Successfully created ${totalBlocks} dedicated 10-question blocks (${allBlockQuestions.length} questions) for registered users!`
+    );
     setBulkInputText('');
     setBulkParsedResults([]);
     setBulkJsonError(null);
@@ -1475,7 +1518,7 @@ RULES:
       isCustom: true
     }));
 
-    const { allBlockQuestions, distinctUsers } = createInitialUserBlocksFromPool({
+    const { allBlockQuestions, distinctUsers, totalBlocks } = createInitialUserBlocksFromPool({
       baseQuestions: baseFormatted,
       registeredUsers: registeredUsersList,
       existingQuestions: mode === 'replace' ? [] : validPool,
@@ -1493,10 +1536,12 @@ RULES:
     } catch {}
 
     soundFx.playCelebration();
+    const assignedCount = distinctUsers.length;
+    const queueCount = Math.max(0, totalBlocks - assignedCount);
     showToast(
       mode === 'replace'
-        ? `Replaced pool with ${distinctUsers.length} dedicated 10-question blocks (${finalPool.length} questions) for registered users!`
-        : `Appended ${distinctUsers.length} dedicated 10-question blocks (${allBlockQuestions.length} questions)! Total pool is now ${finalPool.length}.`
+        ? `Replaced pool with ${totalBlocks} blocks (${finalPool.length} questions): Blocks 1-${assignedCount} assigned to users, Blocks ${assignedCount + 1}-${totalBlocks} in queue!`
+        : `Appended ${totalBlocks} blocks (${allBlockQuestions.length} questions): Blocks 1-${assignedCount} assigned to users, Blocks ${assignedCount + 1}-${totalBlocks} in queue!`
     );
 
     // Reset Bulk State
@@ -2617,7 +2662,7 @@ RULES:
             <Users className="w-4 h-4" />
             <span>Registered Users</span>
             <span className="px-2 py-0.5 text-[10px] bg-white text-slate-900 font-black rounded-full">
-              {registeredUsersList.filter((u) => isUserSessionActive(u)).length}
+              {registeredUsersList.length}
             </span>
           </button>
 
@@ -2816,10 +2861,17 @@ RULES:
                   <Users className="w-5 h-5" />
                 </div>
                 <div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <h3 className="text-base font-black text-slate-900">
                       Registered Users
                     </h3>
+                    <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-blue-100 text-blue-800 border border-blue-200">
+                      Total: {registeredUsersList.length}
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-xs font-bold text-white flex items-center gap-1.5 shadow-2xs" style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}>
+                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
+                      Active: {registeredUsersList.filter((u) => isUserSessionActive(u)).length}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -3120,9 +3172,10 @@ RULES:
                                   <span>{u.name}</span>
                                   {isActiveCurrentUser && !u.isBlocked && (
                                     <span
-                                      className="px-1.5 py-0.5 rounded text-white text-[9px] font-black uppercase tracking-wide"
+                                      className="px-1.5 py-0.5 rounded text-white text-[9px] font-black uppercase tracking-wide inline-flex items-center gap-1"
                                       style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                                     >
+                                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
                                       ACTIVE
                                     </span>
                                   )}
@@ -4086,7 +4139,12 @@ RULES:
                                 <span className="text-xs font-semibold text-slate-700">
                                   User ID:
                                 </span>
-                                {isUnmasked ? (
+                                {assignedUserId.includes('Unassigned') ? (
+                                  <span className="font-semibold text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 inline-flex items-center gap-1.5">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                    Unassigned
+                                  </span>
+                                ) : isUnmasked ? (
                                   <div className="flex items-center gap-2">
                                     <span 
                                       className="font-bold text-xs tracking-wider font-mono inline-block"

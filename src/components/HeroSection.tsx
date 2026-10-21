@@ -48,6 +48,7 @@ interface HeroSectionProps {
   onLiveStateChange?: (isLive: boolean) => void;
   contestDurationSeconds?: number;
   questions?: Question[];
+  hasCompletedBefore?: boolean;
 }
 
 // Full-featured Upcoming Contest Card matching exact Live Card layout
@@ -261,7 +262,8 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   onContestStarted,
   onLiveStateChange,
   contestDurationSeconds,
-  questions
+  questions,
+  hasCompletedBefore = false
 }) => {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -886,7 +888,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                       opacity: (isUpcoming || !hasRealActiveContest) ? 0.9 : (isLivePoolFull ? 0.75 : 1),
                     }}
                   >
-                    {(isUpcoming || !hasRealActiveContest) ? 'Coming Soon' : (isLivePoolFull ? 'CONTEST FULL' : 'Join Now')}
+                    {(isUpcoming || !hasRealActiveContest) ? 'Coming Soon' : (isLivePoolFull ? 'CONTEST FULL' : (hasCompletedBefore ? 'Re-join Contest' : 'Join Now'))}
                   </button>
                 </div>
               </div>

@@ -142,11 +142,28 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   const onSubmitQuizRef = useRef(onSubmitQuiz);
   onSubmitQuizRef.current = onSubmitQuiz;
 
+  // STRICT NO-DUPLICATE WITHIN SINGLE TEST SESSION (Requirement 1):
+  // Enforces an absolute uniqueness constraint within each 10-question test session.
+  // NEVER allows the same question to repeat or appear twice in a single test session for any user.
   const validQuestions = React.useMemo(() => {
-    if (Array.isArray(questions)) {
-      return questions.filter((q): q is Question => Boolean(q && q.id != null));
+    if (!Array.isArray(questions)) return [];
+    const seenStems = new Set<string>();
+    const seenIds = new Set<string | number>();
+    const unique: Question[] = [];
+
+    for (const q of questions) {
+      if (!q || q.id == null) continue;
+      const stemNorm = (q.stem || q.question || '').trim().toLowerCase();
+      const idNorm = String(q.id);
+
+      if (stemNorm && seenStems.has(stemNorm)) continue;
+      if (idNorm && seenIds.has(idNorm)) continue;
+
+      if (stemNorm) seenStems.add(stemNorm);
+      if (idNorm) seenIds.add(idNorm);
+      unique.push(q);
     }
-    return [];
+    return unique;
   }, [questions]);
 
   const currentIndexRef = useRef(currentIndex);

@@ -436,12 +436,53 @@
         }
       },
       "required": ["id", "userEmail", "category", "status"]
+    },
+    "UserPresence": {
+      "title": "User Presence",
+      "description": "Real-time user online presence and activity tracking",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address",
+          "maxLength": 150
+        },
+        "userId": {
+          "type": "string",
+          "description": "User identifier",
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "description": "User display name",
+          "maxLength": 100
+        },
+        "isOnline": {
+          "type": "boolean",
+          "description": "Real-time active online status"
+        },
+        "lastSeen": {
+          "type": "number",
+          "description": "Timestamp ms of last active heartbeat"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp string",
+          "maxLength": 50
+        }
+      },
+      "required": ["email", "isOnline", "lastSeen"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserProfile" },
       "description": "User profile, balance, and KYC status"
+    },
+    "/user_presence/{presenceId}": {
+      "schema": { "$ref": "#/entities/UserPresence" },
+      "description": "Real-time user online activity and presence heartbeat"
     },
     "/deposits/{depositId}": {
       "schema": { "$ref": "#/entities/DepositRequest" },

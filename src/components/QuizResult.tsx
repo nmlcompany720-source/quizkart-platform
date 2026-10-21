@@ -11,7 +11,8 @@ import {
   ShieldCheck, 
   ShieldAlert, 
   ChevronDown, 
-  ChevronUp
+  ChevronUp,
+  RotateCcw
 } from 'lucide-react';
 import { Question, QuizAttemptResult, DailyPrizeItem } from '../types';
 import { soundFx } from '../utils/audio';
@@ -23,6 +24,7 @@ interface QuizResultProps {
   todayPrize: DailyPrizeItem;
   onViewLeaderboard: () => void;
   onRetakeOrHome: () => void;
+  onRejoinContest?: () => void;
 }
 
 export const QuizResult: React.FC<QuizResultProps> = ({
@@ -30,7 +32,8 @@ export const QuizResult: React.FC<QuizResultProps> = ({
   questions,
   todayPrize,
   onViewLeaderboard,
-  onRetakeOrHome
+  onRetakeOrHome,
+  onRejoinContest
 }) => {
   const [showDetailedReview, setShowDetailedReview] = useState<boolean>(true);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
@@ -316,6 +319,22 @@ export const QuizResult: React.FC<QuizResultProps> = ({
             >
               {copiedLink ? <CheckCircle2 className="w-4 h-4 text-white" /> : <Share2 className="w-4 h-4 text-white" />}
               <span>{copiedLink ? 'Score Shared / Copied!' : 'Share your Score'}</span>
+            </button>
+
+            <button
+              id="rejoin-contest-btn"
+              onClick={() => {
+                soundFx.playClick();
+                if (onRejoinContest) {
+                  onRejoinContest();
+                } else {
+                  onRetakeOrHome();
+                }
+              }}
+              className="px-4 py-2.5 rounded-xl text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-300 font-bold text-xs flex items-center gap-1.5 shadow-2xs active:scale-98 cursor-pointer transition-all"
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-amber-700" />
+              <span>Re-join Contest</span>
             </button>
           </div>
 

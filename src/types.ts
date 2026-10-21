@@ -25,6 +25,8 @@ export interface Question {
   isRetake?: boolean;
   originalSourceId?: number;
   subject?: string;
+  blockNumber?: number;
+  isDynamicBlock?: boolean;
 }
 
 export interface UserAddress {
@@ -199,6 +201,8 @@ export interface LeaderboardEntry {
 
 export interface QuizAttemptResult {
   attemptId: string;
+  userId?: string;
+  userName?: string;
   quizDate: string;
   score: number;
   totalQuestions: number;

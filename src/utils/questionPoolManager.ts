@@ -1,4 +1,5 @@
 import { Question, QuestionCategory } from '../types';
+import { normalizeCategory } from './aiQuestionParser';
 
 /**
  * HIGH-CAPACITY QUESTION BANK POOL MANAGER
@@ -413,7 +414,55 @@ export function canonicalizeUserId(userId?: string | number): string {
 }
 
 /**
+ * STRICT NO-DUPLICATE CONSTRAINT (Requirement 1):
+ * Enforces an absolute uniqueness constraint within each 10-question test session/block.
+ * NEVER allows the same question to repeat or appear twice in a single test session for any user.
+ * Every generated set of 10 questions MUST consist of 10 completely unique questions.
+ */
+export function ensureStrictUniqueQuestions(questions: Question[], fallbackPool: Question[] = []): Question[] {
+  if (!questions || questions.length === 0) return [];
+
+  const seenStems = new Set<string>();
+  const seenIds = new Set<string | number>();
+  const uniqueList: Question[] = [];
+
+  for (const q of questions) {
+    if (!q) continue;
+    const stemNorm = (q.stem || q.question || '').trim().toLowerCase();
+    const idNorm = q.id != null ? String(q.id) : '';
+
+    if (stemNorm && seenStems.has(stemNorm)) continue;
+    if (idNorm && seenIds.has(idNorm)) continue;
+
+    if (stemNorm) seenStems.add(stemNorm);
+    if (idNorm) seenIds.add(idNorm);
+    uniqueList.push(q);
+  }
+
+  // If deduplication left fewer than 10 questions, draw unique items from fallback pool
+  if (uniqueList.length < 10 && fallbackPool && fallbackPool.length > 0) {
+    for (const poolQ of fallbackPool) {
+      if (!poolQ) continue;
+      const stemNorm = (poolQ.stem || poolQ.question || '').trim().toLowerCase();
+      const idNorm = poolQ.id != null ? String(poolQ.id) : '';
+
+      if (stemNorm && seenStems.has(stemNorm)) continue;
+      if (idNorm && seenIds.has(idNorm)) continue;
+
+      if (stemNorm) seenStems.add(stemNorm);
+      if (idNorm) seenIds.add(idNorm);
+      uniqueList.push(poolQ);
+
+      if (uniqueList.length >= 10) break;
+    }
+  }
+
+  return uniqueList.slice(0, 10);
+}
+
+/**
  * Gets the assigned User ID for a specific 10-question page/block in the Admin Question Manager
+ * Returns exact User ID if assigned, or 'Unassigned' if reserved in queue awaiting registration
  */
 export function getBlockAssignedUserId(
   blockNumber: number,
@@ -424,7 +473,11 @@ export function getBlockAssignedUserId(
   if (questionsInBlock && questionsInBlock.length > 0) {
     const explicitQ = questionsInBlock.find(q => q && (q as any).assignedUserId);
     if (explicitQ && (explicitQ as any).assignedUserId) {
-      return (explicitQ as any).assignedUserId;
+      const val = String((explicitQ as any).assignedUserId).trim();
+      if (!val || val === 'unassigned' || val.toLowerCase().includes('unassigned')) {
+        return 'Unassigned';
+      }
+      return val;
     }
   }
 
@@ -433,20 +486,25 @@ export function getBlockAssignedUserId(
     const raw = localStorage.getItem(BLOCK_USER_ASSIGNMENTS_KEY);
     if (raw) {
       const map = JSON.parse(raw);
-      if (map && map[blockNumber]) {
-        return map[blockNumber];
+      if (map && map[blockNumber] !== undefined) {
+        const val = String(map[blockNumber]).trim();
+        if (!val || val === 'unassigned' || val.toLowerCase().includes('unassigned')) {
+          return 'Unassigned';
+        }
+        return val;
       }
     }
   } catch {}
 
-  // 3. Registered user list mapping
-  if (registeredUsersList && registeredUsersList.length >= blockNumber) {
+  // 3. Registered user list mapping (only if block is within registered users count)
+  const regCount = (registeredUsersList && registeredUsersList.length) || 0;
+  if (registeredUsersList && blockNumber <= regCount) {
     const u = registeredUsersList[blockNumber - 1];
     if (u && u.id) return canonicalizeUserId(u.id);
   }
 
-  // 4. Default synthetic QK-USR-XXXX fallback
-  return `QK-USR-${1000 + blockNumber}`;
+  // 4. Default: If not assigned to any registered user, it is pre-generated in queue awaiting user registration
+  return 'Unassigned';
 }
 
 /**
@@ -461,17 +519,208 @@ export function setBlockAssignedUserId(blockNumber: number, userId: string): voi
   } catch {}
 }
 
+export const INITIAL_USER_BLOCKS_KEY = 'quizkart_initial_user_blocks';
+
 /**
- * STRICT ID-TO-QUESTION MAPPING (Requirement 4):
- * Enforces strict mapping rule: A test session MUST load EXACTLY and ONLY the questions
- * explicitly assigned to that specific User ID in the Admin Panel (no more, no less).
- * If 0 questions are assigned, returns [] (triggering the 0 questions empty state with no Exit Arena button).
+ * Helper to count completed quiz attempts for a specific user ID
  */
+export function getUserCompletedAttemptsCount(userId: string | undefined): number {
+  if (!userId) return 0;
+  const canonicalId = canonicalizeUserId(userId);
+  try {
+    const raw = localStorage.getItem('quizkart_user_quiz_attempts');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter(a => {
+          if (!a) return false;
+          if (a.userId && canonicalizeUserId(a.userId) === canonicalId) return true;
+          return false;
+        }).length;
+      }
+    }
+  } catch {}
+  return 0;
+}
+
 /**
- * STRICT ID-TO-QUESTION MAPPING (Requirement 4):
- * Enforces strict mapping rule: A test session MUST load EXACTLY and ONLY the questions
- * explicitly assigned to that specific User ID in the Admin Panel (no more, no less).
- * If 0 questions are assigned, returns [] (triggering the 0 questions empty state with no Exit Arena button).
+ * Gets the designated initial block number for a registered user ID (e.g. Block 1 for User 1001)
+ */
+export function getUserInitialBlockNumber(userId: string | undefined, allQuestions?: Question[]): number {
+  if (!userId) return 1;
+  const canonicalId = canonicalizeUserId(userId);
+
+  // 1. Check persistent initial user blocks mapping
+  try {
+    const raw = localStorage.getItem(INITIAL_USER_BLOCKS_KEY);
+    if (raw) {
+      const map = JSON.parse(raw);
+      if (map && typeof map[canonicalId] === 'number') {
+        return map[canonicalId];
+      }
+    }
+  } catch {}
+
+  // 2. Check allQuestions for non-retake initial questions explicitly tagged with this user
+  if (allQuestions && allQuestions.length > 0) {
+    const userQs = allQuestions.filter(q => q && q.assignedUserId === canonicalId && !q.isRetake && !q.isDynamicBlock);
+    if (userQs.length > 0 && typeof userQs[0].blockNumber === 'number') {
+      return userQs[0].blockNumber;
+    }
+  }
+
+  // 3. Check registered users list position
+  try {
+    const rawUsers = localStorage.getItem('quizkart_registered_users');
+    if (rawUsers) {
+      const parsed: any[] = JSON.parse(rawUsers);
+      const idx = parsed.findIndex(u => u && canonicalizeUserId(u.id) === canonicalId);
+      if (idx >= 0) return idx + 1;
+    }
+  } catch {}
+
+  // 4. Fallback from ID numeric suffix (e.g. QK-USR-1001 -> 1)
+  const numMatch = String(canonicalId).match(/\d+/);
+  if (numMatch) {
+    const num = parseInt(numMatch[0], 10);
+    if (num >= 1001) return num - 1000;
+  }
+
+  return 1;
+}
+
+/**
+ * FIRST JOIN RULE (Requirement 1):
+ * Loads the user's original, pre-allocated initial block (e.g., Box 1) containing their designated questions.
+ * Does NOT create a new block or assign a secondary block on the very first attempt.
+ */
+export function getUserInitialAssignedQuestions(userId: string | undefined, allQuestions: Question[]): Question[] {
+  if (!allQuestions || allQuestions.length === 0) return [];
+  const canonicalId = canonicalizeUserId(userId);
+  const deletedSet = questionPoolManager.getDeletedQuestionIds();
+  const cleanPool = allQuestions.filter(q => q && q.id != null && !deletedSet.has(Number(q.id)) && !isOldMockQuestion(q));
+
+  const initialBlockNum = getUserInitialBlockNumber(userId, cleanPool);
+
+  // Find questions in this initial block
+  const blockQuestions = cleanPool.filter(q => q.blockNumber === initialBlockNum);
+  if (blockQuestions.length > 0) {
+    return ensureStrictUniqueQuestions(blockQuestions, cleanPool);
+  }
+
+  // Fallback: slice from cleanPool based on block number
+  const startIdx = (initialBlockNum - 1) * 10;
+  const endIdx = startIdx + 10;
+  if (startIdx < cleanPool.length) {
+    return ensureStrictUniqueQuestions(cleanPool.slice(startIdx, endIdx), cleanPool);
+  }
+
+  return [];
+}
+
+/**
+ * Sanitizes question assignments to ensure that existing users with 0 completed attempts
+ * only possess their initial pre-allocated block, releasing any mistakenly assigned queue blocks
+ * (e.g., Block 6) back to 'unassigned' for newly registering users or subsequent re-joins.
+ */
+export function sanitizeAndEnsureInitialBlockMapping(
+  allQuestions: Question[],
+  registeredUsers?: any[]
+): Question[] {
+  if (!allQuestions || allQuestions.length === 0) return allQuestions;
+
+  // Resolve registered users
+  const userList: string[] = [];
+  if (registeredUsers && Array.isArray(registeredUsers)) {
+    registeredUsers.forEach(u => {
+      if (u && !u.isDeleted) {
+        const cid = canonicalizeUserId(u.id);
+        if (cid && !userList.includes(cid)) userList.push(cid);
+      }
+    });
+  }
+  try {
+    const raw = localStorage.getItem('quizkart_registered_users');
+    if (raw) {
+      const parsed: any[] = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        parsed.forEach(u => {
+          if (u && !u.isDeleted) {
+            const cid = canonicalizeUserId(u.id);
+            if (cid && !userList.includes(cid)) userList.push(cid);
+          }
+        });
+      }
+    }
+  } catch {}
+
+  // Initialize or update initial block mapping
+  let initialMap: Record<string, number> = {};
+  try {
+    const rawInit = localStorage.getItem(INITIAL_USER_BLOCKS_KEY);
+    if (rawInit) initialMap = JSON.parse(rawInit);
+  } catch {}
+
+  userList.forEach((uid, idx) => {
+    if (!initialMap[uid]) {
+      initialMap[uid] = idx + 1;
+    }
+  });
+
+  try {
+    localStorage.setItem(INITIAL_USER_BLOCKS_KEY, JSON.stringify(initialMap));
+  } catch {}
+
+  let blockAssignments: Record<string, string> = {};
+  try {
+    const rawAssignments = localStorage.getItem(BLOCK_USER_ASSIGNMENTS_KEY);
+    if (rawAssignments) blockAssignments = JSON.parse(rawAssignments);
+  } catch {}
+
+  // Clean up any block assignments in questions
+  const updatedQuestions = allQuestions.map(q => {
+    if (!q) return q;
+    const qUserId = q.assignedUserId ? canonicalizeUserId(q.assignedUserId) : '';
+    if (qUserId && qUserId !== 'unassigned') {
+      const attemptsCount = getUserCompletedAttemptsCount(qUserId);
+      const userInitialBlock = initialMap[qUserId];
+      // If user has 0 completed attempts, but this question is in a DIFFERENT block (e.g. Block 6 instead of Block 1)
+      if (attemptsCount === 0 && userInitialBlock !== undefined && q.blockNumber !== userInitialBlock) {
+        return {
+          ...q,
+          assignedUserId: 'unassigned'
+        };
+      }
+    }
+    return q;
+  });
+
+  for (const [blkStr, assignedId] of Object.entries(blockAssignments)) {
+    const blk = parseInt(blkStr, 10);
+    const cid = canonicalizeUserId(assignedId);
+    if (cid && cid !== 'unassigned') {
+      const attemptsCount = getUserCompletedAttemptsCount(cid);
+      const userInitialBlock = initialMap[cid];
+      if (attemptsCount === 0 && userInitialBlock !== undefined && blk !== userInitialBlock) {
+        blockAssignments[blkStr] = 'unassigned';
+      }
+    }
+  }
+
+  try {
+    localStorage.setItem(BLOCK_USER_ASSIGNMENTS_KEY, JSON.stringify(blockAssignments));
+  } catch {}
+
+  return updatedQuestions;
+}
+
+/**
+ * STRICT ID-TO-QUESTION MAPPING (Requirement 1 & Requirement 3):
+ * FIRST JOIN RULE: If it is the user's first time taking the test (0 completed attempts),
+ * the system MUST load their original, pre-allocated initial block (e.g., Box 1) containing their designated questions.
+ * RE-JOIN / RETAKE RULE: Only when the user completes their first test and explicitly re-joins,
+ * load the active retake block.
+ * Also enforces STRICT NO-DUPLICATE constraint within every test session.
  */
 export function getAssignedQuestionsForUser(userId: string | undefined, allQuestions: Question[]): Question[] {
   if (!allQuestions || allQuestions.length === 0) return [];
@@ -487,44 +736,58 @@ export function getAssignedQuestionsForUser(userId: string | undefined, allQuest
   if (cleanPool.length === 0) return [];
 
   const canonicalId = canonicalizeUserId(userId);
+  const completedAttempts = getUserCompletedAttemptsCount(canonicalId);
 
-  // 1. Check if user has an active session/retake block assignment
+  // FIRST JOIN RULE (Requirement 1):
+  // When a user has 0 completed tests, they MUST load their original, pre-allocated initial block (Box 1).
+  if (completedAttempts === 0) {
+    const initialQuestions = getUserInitialAssignedQuestions(canonicalId, cleanPool);
+    if (initialQuestions.length === 10) {
+      return ensureStrictUniqueQuestions(initialQuestions, cleanPool);
+    }
+    if (initialQuestions.length > 0) {
+      return ensureStrictUniqueQuestions(initialQuestions, cleanPool);
+    }
+  }
+
+  // RE-JOIN / RETAKE: User has completed at least 1 test and is taking a retake
   try {
     const rawActive = localStorage.getItem(`quizkart_active_user_assigned_block_${canonicalId}`);
     if (rawActive) {
       const activeObj = JSON.parse(rawActive);
-      if (activeObj && activeObj.blockNumber) {
-        const b = Number(activeObj.blockNumber);
-        const start = (b - 1) * 10;
-        const end = start + 10;
-        if (start < cleanPool.length) {
-          const slice = cleanPool.slice(start, end);
-          if (slice.length > 0) {
-            return slice;
-          }
+      // Strictly maintain exact sequence of questions as ordered in the block
+      if (activeObj && Array.isArray(activeObj.questionIds) && activeObj.questionIds.length > 0) {
+        const idMap = new Map<number, Question>();
+        cleanPool.forEach(q => idMap.set(Number(q.id), q));
+        const ordered: Question[] = [];
+        for (const qId of activeObj.questionIds) {
+          const found = idMap.get(Number(qId));
+          if (found) ordered.push(found);
+        }
+        if (ordered.length === activeObj.questionIds.length && ordered.length > 0) {
+          return ensureStrictUniqueQuestions(ordered, cleanPool);
         }
       }
-      if (activeObj && Array.isArray(activeObj.questionIds) && activeObj.questionIds.length > 0) {
-        const idSet = new Set(activeObj.questionIds.map(Number));
-        const activeQuestions = cleanPool.filter(q => idSet.has(Number(q.id)));
-        if (activeQuestions.length > 0) {
-          return activeQuestions;
+      if (activeObj && activeObj.blockNumber) {
+        const b = Number(activeObj.blockNumber);
+        const blockQs = cleanPool.filter(q => q.blockNumber === b);
+        if (blockQs.length > 0) {
+          return ensureStrictUniqueQuestions(blockQs, cleanPool);
         }
       }
     }
   } catch {}
 
-  // 2. Look for questions in cleanPool explicitly tagged with assignedUserId === canonicalId
+  // Next, look for questions in cleanPool explicitly tagged with assignedUserId === canonicalId
   const explicitlyTagged = cleanPool.filter(q => (q as any).assignedUserId === canonicalId);
   if (explicitlyTagged.length > 0) {
-    // If multiple blocks exist for this user, return the most recent block (up to 10 questions)
     if (explicitlyTagged.length > 10) {
-      return explicitlyTagged.slice(explicitlyTagged.length - 10);
+      return ensureStrictUniqueQuestions(explicitlyTagged.slice(explicitlyTagged.length - 10), cleanPool);
     }
-    return explicitlyTagged;
+    return ensureStrictUniqueQuestions(explicitlyTagged, cleanPool);
   }
 
-  // 3. Check persistent block assignments mapping (quizkart_block_user_assignments)
+  // Next, check persistent block assignments mapping (quizkart_block_user_assignments)
   try {
     const rawAssignments = localStorage.getItem(BLOCK_USER_ASSIGNMENTS_KEY);
     if (rawAssignments) {
@@ -537,67 +800,29 @@ export function getAssignedQuestionsForUser(userId: string | undefined, allQuest
         }
       }
       if (assignedBlocks.length > 0) {
-        assignedBlocks.sort((a, b) => b - a); // latest block first
+        assignedBlocks.sort((a, b) => b - a); // latest block first for retake
         const targetBlock = assignedBlocks[0];
-        const start = (targetBlock - 1) * 10;
-        const end = start + 10;
-        if (start < cleanPool.length) {
-          return cleanPool.slice(start, end);
+        const blockQs = cleanPool.filter(q => q.blockNumber === targetBlock);
+        if (blockQs.length > 0) {
+          return ensureStrictUniqueQuestions(blockQs, cleanPool);
         }
       }
     }
   } catch {}
 
-  // 4. Default position-based mapping for initial registered users:
-  // e.g. User 1 (QK-USR-1001) -> Block 1 (items 0..9)
-  let blockIndex = -1;
-  try {
-    const rawUsers = localStorage.getItem('quizkart_registered_users');
-    const parsed: any[] = rawUsers ? JSON.parse(rawUsers) : [];
-    const userIdx = parsed.findIndex(u => u && (canonicalizeUserId(u.id) === canonicalId || u.email === userId));
-    if (userIdx >= 0) {
-      blockIndex = userIdx;
-    } else {
-      const numMatch = String(canonicalId).match(/\d+/);
-      if (numMatch) {
-        const num = parseInt(numMatch[0], 10);
-        if (num >= 1001) {
-          blockIndex = num - 1001;
-        }
-      }
-    }
-  } catch {
-    const numMatch = String(canonicalId).match(/\d+/);
-    if (numMatch) {
-      const num = parseInt(numMatch[0], 10);
-      if (num >= 1001) {
-        blockIndex = num - 1001;
-      }
-    }
-  }
-
-  if (blockIndex >= 0) {
-    const startIdx = blockIndex * 10;
-    const endIdx = startIdx + 10;
-    if (startIdx < cleanPool.length) {
-      return cleanPool.slice(startIdx, endIdx);
-    }
-  }
-
-  // 5. Strict rule: If 0 questions are assigned to this user, return []
-  return [];
+  // Fallback to initial assigned questions
+  return getUserInitialAssignedQuestions(canonicalId, cleanPool);
 }
 
 /**
- * AUTOMATIC USER-BLOCK CREATION & 10-QUESTION LIMIT RULE (Requirement 1 & 2):
- * When questions are imported in the Admin Panel (e.g., a pool of 20 raw questions):
- * 1. Checks total count of registered User IDs (e.g., 5 registered users).
- * 2. Immediately creates 5 distinct blocks/pages in the Question Manager—one dedicated block for each registered User ID.
- * 3. STRICT 10-QUESTION BLOCK LIMIT: Each block MUST contain EXACTLY 10 questions (never 20 in a single block).
- * 4. Question Randomization & Exact Index Mapping: For each block, draws from base pool to create randomized question sequences.
- *    Question identity remains unchanged, but question selection and position are strictly randomized for each User ID.
- * 5. STRICT SYNC RULE: The exact sequence of 10 questions generated inside a specific User ID's block in the Admin Panel
- *    MUST be the EXACT 10 questions presented in that user's live test session.
+ * INITIAL MULTI-USER BLOCK CREATION & UNASSIGNED POOL HANDLING (Requirement 2 & 1):
+ * When questions are imported in the Admin Panel (e.g., a pool of 100 questions):
+ * 1. Divides the pool into 10-question blocks (e.g., 10 blocks for 100 questions).
+ * 2. Checks current registered User count. If there are 5 registered users, assigns first 5 blocks
+ *    (Blocks 1-5) directly to those 5 User IDs with respective IDs explicitly labeled at top.
+ * 3. The remaining blocks (Blocks 6-10) remain pre-generated in the question pool queue awaiting
+ *    new user registrations or retake actions.
+ * 4. STRICT NO-DUPLICATE RULE: Enforces absolute uniqueness within every 10-question block.
  */
 export function createInitialUserBlocksFromPool(params: {
   baseQuestions: Question[];
@@ -607,13 +832,14 @@ export function createInitialUserBlocksFromPool(params: {
 }): {
   allBlockQuestions: Question[];
   distinctUsers: string[];
+  totalBlocks: number;
 } {
   const { baseQuestions, registeredUsers, existingQuestions = [], onQuestionSavedToFirestore } = params;
   if (!baseQuestions || baseQuestions.length === 0) {
-    return { allBlockQuestions: [], distinctUsers: [] };
+    return { allBlockQuestions: [], distinctUsers: [], totalBlocks: 0 };
   }
 
-  // Preserve raw base pool for retakes
+  // Preserve raw base pool for retakes and range-based dynamic blocks
   try {
     localStorage.setItem('quizkart_base_contest_pool', JSON.stringify(baseQuestions));
   } catch {}
@@ -625,7 +851,7 @@ export function createInitialUserBlocksFromPool(params: {
       registeredUsers.forEach(u => {
         if (u && !u.isDeleted) {
           const id = canonicalizeUserId(u.id);
-          if (!userList.includes(id)) userList.push(id);
+          if (id && !userList.includes(id)) userList.push(id);
         }
       });
     }
@@ -639,7 +865,7 @@ export function createInitialUserBlocksFromPool(params: {
         parsed.forEach(u => {
           if (u && !u.isDeleted) {
             const id = canonicalizeUserId(u.id);
-            if (!userList.includes(id)) userList.push(id);
+            if (id && !userList.includes(id)) userList.push(id);
           }
         });
       }
@@ -655,33 +881,112 @@ export function createInitialUserBlocksFromPool(params: {
   const existingIds = existingQuestions.map(q => Number(q.id) || 0);
   let nextId = Math.max(0, ...existingIds, ...Array.from(deletedSet)) + 1;
 
-  const allBlockQuestions: Question[] = [];
-  const usedSequenceSignatures = new Set<string>();
+  // Deduplicate base questions to enforce STRICT NO-DUPLICATE rule
+  const cleanBasePool: Question[] = [];
+  const baseStems = new Set<string>();
+  for (const q of baseQuestions) {
+    if (!q) continue;
+    const s = (q.stem || q.question || '').trim().toLowerCase();
+    if (s && !baseStems.has(s)) {
+      baseStems.add(s);
+      cleanBasePool.push(q);
+    }
+  }
 
-  // 2. Generate exactly one dedicated 10-question block for each registered User ID
-  userList.forEach((userId, userIdx) => {
-    const blockNumber = userIdx + 1;
+  const poolToUse = cleanBasePool.length > 0 ? cleanBasePool : baseQuestions;
 
-    // Pick 10 randomized questions from baseQuestions
-    let picked: Question[] = [];
-    let attempts = 0;
-    while (attempts < 20) {
-      attempts++;
-      const shuffled = shuffleArray(baseQuestions);
-      const candidate = shuffled.slice(0, 10);
-      while (candidate.length < 10 && baseQuestions.length > 0) {
-        candidate.push(baseQuestions[candidate.length % baseQuestions.length]);
-      }
-      const sig = candidate.map(q => q.stem || q.question).join('|');
-      if (!usedSequenceSignatures.has(sig) || attempts >= 20) {
-        usedSequenceSignatures.add(sig);
-        picked = candidate;
-        break;
+  // 2. Divide pool into 10-question blocks with BALANCED MULTI-SUBJECT DISTRIBUTION (Requirement 1 & 2):
+  // When a 100-question pool containing 5 subjects (Maths, Reasoning, Science, GK, English - 20 items each)
+  // is validated and divided into 10-question blocks, EVERY single block MUST contain a balanced representation
+  // of ALL subjects (approximately 2 questions from each of the 5 subjects: 2 Maths, 2 Reasoning, 2 Science, 2 GK, 2 English).
+  const totalBlocks = Math.max(userList.length, Math.ceil(poolToUse.length / 10));
+
+  const SUBJECT_ROTATION: QuestionCategory[] = ['Maths', 'Reasoning', 'Science', 'GK', 'English'];
+
+  // Bucket pool by the 5 normalized subjects
+  const subjectBuckets: Record<QuestionCategory, Question[]> = {
+    Maths: [],
+    Reasoning: [],
+    Science: [],
+    GK: [],
+    English: []
+  };
+
+  for (const q of poolToUse) {
+    const cat = normalizeCategory(q.category || q.subject, `${q.question || q.stem || ''} ${q.explanation || ''}`);
+    subjectBuckets[cat].push(q);
+  }
+
+  // Pre-allocate blocks
+  const rawBlocks: Question[][] = Array.from({ length: totalBlocks }, () => []);
+  const usedStems = new Set<string>();
+
+  // Pass 1 & Pass 2: Pick 1 question from each subject in each pass (2 questions per subject per block)
+  for (let pass = 1; pass <= 2; pass++) {
+    for (let b = 0; b < totalBlocks; b++) {
+      for (const subj of SUBJECT_ROTATION) {
+        if (rawBlocks[b].length >= 10) continue;
+        const bucket = subjectBuckets[subj] || [];
+        const nextQ = bucket.find(q => {
+          const s = (q.stem || q.question || '').trim().toLowerCase();
+          return s && !usedStems.has(s);
+        });
+        if (nextQ) {
+          rawBlocks[b].push(nextQ);
+          usedStems.add((nextQ.stem || nextQ.question || '').trim().toLowerCase());
+        }
       }
     }
+  }
 
-    // 3. Format exactly 10 questions for this block
-    const blockQuestions: Question[] = picked.slice(0, 10).map((q) => {
+  // Pass 3: Distribute any remaining unused pool questions across blocks that have < 10 questions
+  for (const subj of SUBJECT_ROTATION) {
+    const bucket = subjectBuckets[subj] || [];
+    for (const q of bucket) {
+      const s = (q.stem || q.question || '').trim().toLowerCase();
+      if (s && !usedStems.has(s)) {
+        const targetBlock = rawBlocks.find(blk => blk.length < 10);
+        if (targetBlock) {
+          targetBlock.push(q);
+          usedStems.add(s);
+        }
+      }
+    }
+  }
+
+  // Pass 4: Ensure every block has exactly 10 questions without internal duplicates,
+  // and order questions by subject sequence: Maths, Reasoning, Science, GK, English
+  const subjOrder: Record<string, number> = {
+    Maths: 0,
+    Reasoning: 1,
+    Science: 2,
+    GK: 3,
+    English: 4
+  };
+
+  for (let b = 0; b < totalBlocks; b++) {
+    if (rawBlocks[b].length < 10) {
+      rawBlocks[b] = ensureStrictUniqueQuestions(rawBlocks[b], poolToUse);
+    }
+    rawBlocks[b].sort((q1, q2) => {
+      const c1 = normalizeCategory(q1.category || q1.subject, q1.question || q1.stem || '');
+      const c2 = normalizeCategory(q2.category || q2.subject, q2.question || q2.stem || '');
+      return (subjOrder[c1] ?? 99) - (subjOrder[c2] ?? 99);
+    });
+  }
+
+  const allBlockQuestions: Question[] = [];
+
+  for (let b = 1; b <= totalBlocks; b++) {
+    const blockNumber = b;
+    const isAssignedToUser = blockNumber <= userList.length;
+    const targetUserId = isAssignedToUser ? userList[blockNumber - 1] : 'unassigned';
+
+    // Get the balanced 10 questions for this block
+    const guaranteed10 = ensureStrictUniqueQuestions(rawBlocks[b - 1], poolToUse);
+
+    // Format exactly 10 questions for this block
+    const blockQuestions: Question[] = guaranteed10.map((q) => {
       const qId = nextId++;
       questionPoolManager.unrecordDeletedQuestionId(qId);
       return {
@@ -696,7 +1001,7 @@ export function createInitialUserBlocksFromPool(params: {
         subject: q.subject || q.category,
         difficulty: q.difficulty,
         explanation: q.explanation,
-        assignedUserId: userId,
+        assignedUserId: targetUserId,
         blockNumber: blockNumber,
         isCustom: true,
         createdAt: new Date().toISOString(),
@@ -704,23 +1009,33 @@ export function createInitialUserBlocksFromPool(params: {
       };
     });
 
-    // Record block mapping
-    setBlockAssignedUserId(blockNumber, userId);
+    // Record block mapping (User ID if assigned, or 'unassigned' if reserved in queue)
+    setBlockAssignedUserId(blockNumber, targetUserId);
 
-    // Save active block mapping so user's test session loads EXACTLY these 10 questions in real time
-    try {
-      localStorage.setItem(
-        `quizkart_active_user_assigned_block_${userId}`,
-        JSON.stringify({
-          blockNumber: blockNumber,
-          questionIds: blockQuestions.map(q => q.id),
-          timestamp: Date.now()
-        })
-      );
-    } catch {}
+    // If assigned to a registered user, save active block mapping
+    if (isAssignedToUser && targetUserId !== 'unassigned') {
+      try {
+        localStorage.setItem(
+          `quizkart_active_user_assigned_block_${targetUserId}`,
+          JSON.stringify({
+            blockNumber: blockNumber,
+            questionIds: blockQuestions.map(q => q.id),
+            timestamp: Date.now()
+          })
+        );
+      } catch {}
+
+      // Record permanent initial block assignment
+      try {
+        const rawInit = localStorage.getItem(INITIAL_USER_BLOCKS_KEY);
+        const initMap = rawInit ? JSON.parse(rawInit) : {};
+        initMap[targetUserId] = blockNumber;
+        localStorage.setItem(INITIAL_USER_BLOCKS_KEY, JSON.stringify(initMap));
+      } catch {}
+    }
 
     allBlockQuestions.push(...blockQuestions);
-  });
+  }
 
   // Sync to firestore if callback provided
   if (onQuestionSavedToFirestore) {
@@ -733,27 +1048,31 @@ export function createInitialUserBlocksFromPool(params: {
 
   return {
     allBlockQuestions,
-    distinctUsers: userList
+    distinctUsers: userList,
+    totalBlocks
   };
 }
 
 /**
- * RE-JOIN / RETAKE CONTEST RANDOMIZATION LOGIC (Requirement 3):
- * When an existing user (e.g., User ID QK-USR-1001) clicks "Confirm & Join" to retake/re-join a contest:
- * 1. Automatically creates a new dedicated 10-question page/block entry in Admin Question Manager labeled with that User ID.
- * 2. Generates a fresh, unique 10-question randomized subset drawn from the contest pool.
- * 3. UNIQUE SEQUENCE RULE: Ensures that a user's retake block does not repeat the exact 10-question selection or order used in their previous attempt or in other active blocks.
+ * EXHAUSTED POOL DYNAMIC BLOCK GENERATION (Requirement 4):
+ * When all pre-generated blocks (Blocks 1-10) are fully assigned across users and retakes:
+ * 1. Instantly creates new dynamic block (Block 11, 12, etc.) labeled with that User ID.
+ * 2. Range-Based Question Fetching: Divides main 100-question pool into 10 distinct ranges
+ *    (Items 1-10, 11-20, 21-30, ..., 91-100).
+ * 3. Picks 1 random question from each of the 10 ranges without internal duplication.
  */
-export function createRetakeBlockForUser(params: {
+export function createDynamicRangeBlockForUser(params: {
   userId: string | undefined;
   allQuestions: Question[];
+  isRetake?: boolean;
+  onQuestionsUpdated?: (updated: Question[]) => void;
   onQuestionSavedToFirestore?: (q: Question) => Promise<void> | void;
 }): {
-  newQuestions: Question[];
-  updatedPool: Question[];
-  blockNumber: number;
+  assignedBlockNumber: number;
+  assignedQuestions: Question[];
+  updatedQuestions: Question[];
 } {
-  const { userId, allQuestions } = params;
+  const { userId, allQuestions, isRetake = false, onQuestionsUpdated, onQuestionSavedToFirestore } = params;
   const canonicalId = canonicalizeUserId(userId);
   const deletedSet = questionPoolManager.getDeletedQuestionIds();
 
@@ -773,44 +1092,101 @@ export function createRetakeBlockForUser(params: {
     sourcePool = allQuestions.filter(q => q && q.id != null && !deletedSet.has(Number(q.id)) && !isOldMockQuestion(q));
   }
 
-  if (sourcePool.length === 0) {
-    return { newQuestions: [], updatedPool: allQuestions, blockNumber: 1 };
+  // Deduplicate source pool
+  const uniqueSourcePool: Question[] = [];
+  const seenPoolStems = new Set<string>();
+  for (const q of sourcePool) {
+    const s = (q.stem || q.question || '').trim().toLowerCase();
+    if (s && !seenPoolStems.has(s)) {
+      seenPoolStems.add(s);
+      uniqueSourcePool.push(q);
+    }
   }
 
-  // Draw 10 randomized questions with unique sequence rule
-  const comboKey = 'quizkart_used_quiz_combinations';
+  const rawPoolToUse = uniqueSourcePool.length >= 10 ? uniqueSourcePool : sourcePool;
+  const subjOrder: Record<string, number> = {
+    Maths: 0,
+    Reasoning: 1,
+    Science: 2,
+    GK: 3,
+    English: 4
+  };
+  const poolToUse = [...rawPoolToUse].sort((q1, q2) => {
+    const c1 = normalizeCategory(q1.category || q1.subject, q1.question || q1.stem || '');
+    const c2 = normalizeCategory(q2.category || q2.subject, q2.question || q2.stem || '');
+    return (subjOrder[c1] ?? 99) - (subjOrder[c2] ?? 99);
+  });
+
+  // Divide into 10 distinct ranges
+  const chunkSize = 10;
+  const ranges: Question[][] = [];
+  if (poolToUse.length >= 100) {
+    for (let r = 0; r < 10; r++) {
+      ranges.push(poolToUse.slice(r * chunkSize, (r + 1) * chunkSize));
+    }
+  } else if (poolToUse.length >= 10) {
+    const step = poolToUse.length / 10;
+    for (let r = 0; r < 10; r++) {
+      const start = Math.floor(r * step);
+      const end = Math.floor((r + 1) * step);
+      const slice = poolToUse.slice(start, Math.max(start + 1, end));
+      ranges.push(slice.length > 0 ? slice : [poolToUse[r % poolToUse.length]]);
+    }
+  } else {
+    for (let r = 0; r < 10; r++) {
+      ranges.push([poolToUse[r % poolToUse.length]]);
+    }
+  }
+
+  // Load user-specific and global combination history for strict non-repetition
+  const userComboKey = `quizkart_used_quiz_combinations_${canonicalId}`;
   let usedCombos: string[] = [];
   try {
-    usedCombos = JSON.parse(localStorage.getItem(comboKey) || '[]');
+    const userCombos = JSON.parse(localStorage.getItem(userComboKey) || '[]');
+    const globalCombos = JSON.parse(localStorage.getItem('quizkart_used_quiz_combinations') || '[]');
+    usedCombos = Array.from(new Set([...userCombos, ...globalCombos]));
   } catch {}
 
   let picked: Question[] = [];
   let attempts = 0;
-  while (attempts < 20) {
+  while (attempts < 50) {
     attempts++;
-    const shuffled = shuffleArray(sourcePool);
-    const candidate = shuffled.slice(0, 10);
-    while (candidate.length < 10 && sourcePool.length > 0) {
-      candidate.push(sourcePool[candidate.length % sourcePool.length]);
+    const candidate: Question[] = [];
+    const usedStems = new Set<string>();
+
+    for (let r = 0; r < 10; r++) {
+      const currentRange = ranges[r];
+      const available = currentRange.filter(q => {
+        const s = (q.stem || q.question || '').trim().toLowerCase();
+        return !usedStems.has(s);
+      });
+      const pickList = available.length > 0 ? available : currentRange;
+      const chosen = pickList[Math.floor(Math.random() * pickList.length)];
+      candidate.push(chosen);
+      usedStems.add((chosen.stem || chosen.question || '').trim().toLowerCase());
     }
-    const signature = candidate.map(q => q.originalSourceId || q.id || q.stem).join('-');
-    if (!usedCombos.includes(signature) || attempts >= 20) {
-      usedCombos.push(signature);
+
+    const sigCombo = candidate.map(q => q.originalSourceId || q.id || q.stem).sort().join('-');
+    const sigSeq = candidate.map(q => q.originalSourceId || q.id || q.stem).join('-');
+
+    if ((!usedCombos.includes(sigCombo) && !usedCombos.includes(sigSeq)) || attempts >= 50) {
+      usedCombos.push(sigCombo);
+      usedCombos.push(sigSeq);
       try {
-        localStorage.setItem(comboKey, JSON.stringify(usedCombos.slice(-200)));
+        localStorage.setItem(userComboKey, JSON.stringify(usedCombos.slice(-200)));
+        localStorage.setItem('quizkart_used_quiz_combinations', JSON.stringify(usedCombos.slice(-200)));
       } catch {}
       picked = candidate;
       break;
     }
   }
 
-  // Option shuffle for each question to guarantee fresh presentation
+  // Shuffle options for fresh presentation
   const optionShuffled = picked.slice(0, 10).map(q => smartShuffleQuestionOptions(q));
 
   // Determine next block number
   const nextBlockNumber = Math.max(1, Math.ceil(allQuestions.length / 10)) + 1;
 
-  // Allocate new unique IDs (strictly greater than all existing and deleted IDs)
   const allExistingIds = allQuestions.map(q => Number(q.id) || 0);
   const maxId = Math.max(0, ...allExistingIds, ...Array.from(deletedSet));
   const startingId = maxId + 1;
@@ -822,18 +1198,15 @@ export function createRetakeBlockForUser(params: {
     assignedUserId: canonicalId,
     blockNumber: nextBlockNumber,
     isCustom: true,
-    isRetake: true,
+    isRetake: Boolean(isRetake),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   }));
 
-  // Ensure new IDs are unrecorded from deletedSet
   newQuestions.forEach(q => questionPoolManager.unrecordDeletedQuestionId(q.id));
 
-  // Determine dedicated new block/page entry in Admin Question Manager labeled with that User ID
   setBlockAssignedUserId(nextBlockNumber, canonicalId);
 
-  // Store active block mapping for this user so active test session loads EXACTLY these 10 questions
   try {
     localStorage.setItem(
       `quizkart_active_user_assigned_block_${canonicalId}`,
@@ -852,17 +1225,281 @@ export function createRetakeBlockForUser(params: {
     localStorage.setItem('quizkart_questions_initialized', 'true');
   } catch {}
 
-  if (params.onQuestionSavedToFirestore) {
+  if (onQuestionsUpdated) onQuestionsUpdated(updatedPool);
+  if (onQuestionSavedToFirestore) {
     newQuestions.forEach(q => {
-      try {
-        params.onQuestionSavedToFirestore!(q);
-      } catch {}
+      try { onQuestionSavedToFirestore(q); } catch {}
     });
   }
 
   return {
-    newQuestions,
-    updatedPool,
-    blockNumber: nextBlockNumber
+    assignedBlockNumber: nextBlockNumber,
+    assignedQuestions: newQuestions,
+    updatedQuestions: updatedPool
+  };
+}
+
+/**
+ * NEW USER REGISTRATION AUTO-ASSIGNMENT LOGIC (Requirement 3):
+ * As soon as a NEW user registers in the system:
+ * 1. IMMEDIATELY (within 1 second) maps next available unassigned block (e.g. Block 6) to this new User ID.
+ * 2. Labels the top of Block 6 with new User ID so their first test loads those exact 10 questions.
+ * 3. If all pre-generated blocks are exhausted, dynamically compiles Block 11+ via Range-Based Question Fetching.
+ */
+export function autoAssignNextBlockToUser(params: {
+  userId: string;
+  allQuestions: Question[];
+  onQuestionsUpdated?: (updated: Question[]) => void;
+  onQuestionSavedToFirestore?: (q: Question) => Promise<void> | void;
+}): {
+  assignedBlockNumber: number;
+  assignedQuestions: Question[];
+  updatedQuestions: Question[];
+} {
+  const { userId, allQuestions, onQuestionsUpdated, onQuestionSavedToFirestore } = params;
+  const canonicalId = canonicalizeUserId(userId);
+  if (!canonicalId) {
+    return { assignedBlockNumber: 0, assignedQuestions: [], updatedQuestions: allQuestions };
+  }
+
+  // 1. Check if user already has an active block assigned
+  const rawActive = localStorage.getItem(`quizkart_active_user_assigned_block_${canonicalId}`);
+  if (rawActive) {
+    try {
+      const activeObj = JSON.parse(rawActive);
+      if (activeObj && activeObj.blockNumber) {
+        const b = Number(activeObj.blockNumber);
+        const blockQs = allQuestions.filter(q => q.blockNumber === b);
+        if (blockQs.length === 10) {
+          return { assignedBlockNumber: b, assignedQuestions: blockQs, updatedQuestions: allQuestions };
+        }
+      }
+    } catch {}
+  }
+
+  // Check if any block is already assigned to this user in persistent block mappings
+  let blockMap: Record<string, string> = {};
+  try {
+    const raw = localStorage.getItem(BLOCK_USER_ASSIGNMENTS_KEY);
+    if (raw) blockMap = JSON.parse(raw);
+  } catch {}
+
+  for (const [blkStr, uId] of Object.entries(blockMap)) {
+    if (canonicalizeUserId(uId) === canonicalId) {
+      const b = parseInt(blkStr, 10);
+      const blockQs = allQuestions.filter(q => q.blockNumber === b);
+      if (blockQs.length === 10) {
+        try {
+          localStorage.setItem(
+            `quizkart_active_user_assigned_block_${canonicalId}`,
+            JSON.stringify({
+              blockNumber: b,
+              questionIds: blockQs.map(q => q.id),
+              timestamp: Date.now()
+            })
+          );
+        } catch {}
+        return { assignedBlockNumber: b, assignedQuestions: blockQs, updatedQuestions: allQuestions };
+      }
+    }
+  }
+
+  // 2. Search for next available UNASSIGNED block among existing blocks
+  const totalBlocks = Math.ceil(allQuestions.length / 10);
+  let targetBlockNumber = -1;
+
+  for (let b = 1; b <= totalBlocks; b++) {
+    const assigned = blockMap[b];
+    const isUnassignedInMap = !assigned || assigned === 'unassigned' || assigned.toLowerCase().includes('unassigned');
+    const questionsInB = allQuestions.filter(q => q.blockNumber === b);
+    const hasAssignedUser = questionsInB.some(q => q.assignedUserId && q.assignedUserId !== 'unassigned');
+
+    if (isUnassignedInMap && !hasAssignedUser && questionsInB.length === 10) {
+      targetBlockNumber = b;
+      break;
+    }
+  }
+
+  // 3. If an unassigned block is found (e.g. Block 6), map it immediately
+  if (targetBlockNumber > 0) {
+    setBlockAssignedUserId(targetBlockNumber, canonicalId);
+
+    const updatedQuestions = allQuestions.map(q => {
+      if (q.blockNumber === targetBlockNumber) {
+        return {
+          ...q,
+          assignedUserId: canonicalId,
+          updatedAt: new Date().toISOString()
+        };
+      }
+      return q;
+    });
+
+    const blockQuestions = updatedQuestions.filter(q => q.blockNumber === targetBlockNumber);
+
+    try {
+      localStorage.setItem(
+        `quizkart_active_user_assigned_block_${canonicalId}`,
+        JSON.stringify({
+          blockNumber: targetBlockNumber,
+          questionIds: blockQuestions.map(q => q.id),
+          timestamp: Date.now()
+        })
+      );
+    } catch {}
+
+    try {
+      const rawInit = localStorage.getItem(INITIAL_USER_BLOCKS_KEY);
+      const initMap = rawInit ? JSON.parse(rawInit) : {};
+      if (!initMap[canonicalId]) {
+        initMap[canonicalId] = targetBlockNumber;
+        localStorage.setItem(INITIAL_USER_BLOCKS_KEY, JSON.stringify(initMap));
+      }
+    } catch {}
+
+    questionPoolManager.saveAllQuestions(updatedQuestions);
+    try {
+      localStorage.setItem('quizkart_questions', JSON.stringify(updatedQuestions.slice(0, 1000)));
+    } catch {}
+
+    if (onQuestionsUpdated) onQuestionsUpdated(updatedQuestions);
+    if (onQuestionSavedToFirestore) {
+      blockQuestions.forEach(q => {
+        try { onQuestionSavedToFirestore(q); } catch {}
+      });
+    }
+
+    return {
+      assignedBlockNumber: targetBlockNumber,
+      assignedQuestions: blockQuestions,
+      updatedQuestions
+    };
+  }
+
+  // 4. If all pre-generated blocks are exhausted, dynamically compile Block 11+ via Range-Based strategy
+  return createDynamicRangeBlockForUser({
+    userId: canonicalId,
+    allQuestions,
+    onQuestionsUpdated,
+    onQuestionSavedToFirestore
+  });
+}
+
+/**
+ * RE-JOIN / RETAKE STRICT NON-REPETITION LOGIC (Requirement 5):
+ * When an existing user (e.g., User ID QK-USR-1001) clicks "Confirm & Join" to retake a contest:
+ * 1. If unassigned blocks exist in the pool, maps next available block to this retake attempt.
+ * 2. If all initial blocks are exhausted, creates a new dynamic block (Block 11/12) using
+ *    Range-Based Question Fetching.
+ * 3. STRICT UNIQUE SEQUENCE RULE: Ensures that a user's retake block does NOT repeat the exact
+ *    question combination or identical order used in their previous attempts.
+ */
+export function createRetakeBlockForUser(params: {
+  userId: string | undefined;
+  allQuestions: Question[];
+  onQuestionSavedToFirestore?: (q: Question) => Promise<void> | void;
+}): {
+  newQuestions: Question[];
+  updatedPool: Question[];
+  blockNumber: number;
+} {
+  const { userId, allQuestions, onQuestionSavedToFirestore } = params;
+  const canonicalId = canonicalizeUserId(userId);
+
+  // 1. Check if unassigned pre-generated blocks exist in the pool
+  const totalBlocks = Math.ceil(allQuestions.length / 10);
+  let blockMap: Record<string, string> = {};
+  try {
+    const raw = localStorage.getItem(BLOCK_USER_ASSIGNMENTS_KEY);
+    if (raw) blockMap = JSON.parse(raw);
+  } catch {}
+
+  // Load previous combinations used by this user to verify non-repetition
+  const userComboKey = `quizkart_used_quiz_combinations_${canonicalId}`;
+  let usedCombos: string[] = [];
+  try {
+    usedCombos = JSON.parse(localStorage.getItem(userComboKey) || '[]');
+  } catch {}
+
+  let availableUnassignedBlock = -1;
+  for (let b = 1; b <= totalBlocks; b++) {
+    const assigned = blockMap[b];
+    const isUnassigned = !assigned || assigned === 'unassigned' || assigned.toLowerCase().includes('unassigned');
+    const questionsInB = allQuestions.filter(q => q.blockNumber === b);
+    const hasAssignedUser = questionsInB.some(q => q.assignedUserId && q.assignedUserId !== 'unassigned');
+
+    if (isUnassigned && !hasAssignedUser && questionsInB.length === 10) {
+      // Check that this block's question signature does not repeat user's previous attempt
+      const sigCombo = questionsInB.map(q => q.originalSourceId || q.id || q.stem).sort().join('-');
+      if (!usedCombos.includes(sigCombo)) {
+        availableUnassignedBlock = b;
+        break;
+      }
+    }
+  }
+
+  // If an unassigned block exists in the pool (e.g. Block 6, Block 7)
+  if (availableUnassignedBlock > 0) {
+    setBlockAssignedUserId(availableUnassignedBlock, canonicalId);
+
+    const updatedQuestions = allQuestions.map(q => {
+      if (q.blockNumber === availableUnassignedBlock) {
+        return {
+          ...q,
+          assignedUserId: canonicalId,
+          isRetake: true,
+          updatedAt: new Date().toISOString()
+        };
+      }
+      return q;
+    });
+
+    const blockQuestions = updatedQuestions.filter(q => q.blockNumber === availableUnassignedBlock);
+
+    try {
+      localStorage.setItem(
+        `quizkart_active_user_assigned_block_${canonicalId}`,
+        JSON.stringify({
+          blockNumber: availableUnassignedBlock,
+          questionIds: blockQuestions.map(q => q.id),
+          timestamp: Date.now()
+        })
+      );
+
+      const sigCombo = blockQuestions.map(q => q.originalSourceId || q.id || q.stem).sort().join('-');
+      usedCombos.push(sigCombo);
+      localStorage.setItem(userComboKey, JSON.stringify(usedCombos.slice(-200)));
+    } catch {}
+
+    questionPoolManager.saveAllQuestions(updatedQuestions);
+    try {
+      localStorage.setItem('quizkart_questions', JSON.stringify(updatedQuestions.slice(0, 1000)));
+    } catch {}
+
+    if (onQuestionSavedToFirestore) {
+      blockQuestions.forEach(q => {
+        try { onQuestionSavedToFirestore(q); } catch {}
+      });
+    }
+
+    return {
+      newQuestions: blockQuestions,
+      updatedPool: updatedQuestions,
+      blockNumber: availableUnassignedBlock
+    };
+  }
+
+  // 2. If all initial blocks are exhausted, create a new dynamic block (Block 11/12) via Range-Based strategy
+  const dynamicRes = createDynamicRangeBlockForUser({
+    userId: canonicalId,
+    allQuestions,
+    isRetake: true,
+    onQuestionSavedToFirestore
+  });
+
+  return {
+    newQuestions: dynamicRes.assignedQuestions,
+    updatedPool: dynamicRes.updatedQuestions,
+    blockNumber: dynamicRes.assignedBlockNumber
   };
 }
