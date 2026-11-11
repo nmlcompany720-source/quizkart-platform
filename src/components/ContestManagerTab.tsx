@@ -49,6 +49,7 @@ import { ScheduledTimePicker } from './ScheduledTimePicker';
 import { saveContestToFirestore, removeContestFromFirestore } from '../firebase';
 import { getCountdown, parseTargetTimestamp, formatCountdown } from '../utils/timerUtils';
 import { compressImage, sanitizeContestSynchronous, isGifImage } from '../utils/imageCompressor';
+import { calculateDynamicWinnerSlots } from '../utils/poolUtils';
 
 // Real-time Ticking Timer sub-component for Active & Scheduled Contest Cards
 const ContestCardTimers: React.FC<{ scheduledTime?: string; endTime?: string }> = ({ scheduledTime, endTime }) => {
@@ -367,9 +368,8 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     return getAutoPilotSettings().isEnabled;
   });
 
-  // Manual Instant Play 1-Second Loading Animation State & Button Ref
+  // Auto-Pilot Background Generation State
   const [isGeneratingContest, setIsGeneratingContest] = useState<boolean>(false);
-  const playButtonRef = useRef<HTMLButtonElement>(null);
 
   // Contest Builder Form State
   const [contestFormType, setContestFormType] = useState<'cash' | 'product'>('product');
@@ -417,6 +417,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
   const [editStartTime, setEditStartTime] = useState<string>('');
   const [editEndTime, setEditEndTime] = useState<string>('');
   const [editItemTitle, setEditItemTitle] = useState<string>('');
+  const [isStartTimeModified, setIsStartTimeModified] = useState<boolean>(false);
+  const [isEndTimeModified, setIsEndTimeModified] = useState<boolean>(false);
+  const originalStartTimeRef = useRef<string | undefined>(undefined);
+  const originalEndTimeRef = useRef<string | undefined>(undefined);
   const editImageFileInputRef = useRef<HTMLInputElement>(null);
 
   // Catalog Presets with real-time delete option
@@ -608,7 +612,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     } catch {}
 
     // Instant UI Update: Create and push a new active contest into the live contest state / LocalStorage
-    const newContestId = `CNT-LIVE-${Date.now().toString().slice(-4)}`;
+    const newContestId = `CNT-LIVE-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
     const isCash = autoPilot.contestType === 'cash';
     const contestTitle = isCash
       ? `₹${autoPilot.cashPrizePool.toLocaleString('en-IN')} Tournament Blitz`
@@ -636,7 +640,9 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
         winnerShareSummary: `Rank 1 = 100% (₹${(autoPilot.cashPrizePool || 10000).toLocaleString('en-IN')} Instant UPI)`
       } : undefined,
       status: 'active',
-      scheduledTime: 'Live Active Tournament',
+      scheduledTime: new Date().toISOString(),
+      endTime: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+      activatedAt: new Date().toISOString(),
       autoPilotRecurring: true,
       questionIds: selectedQuestions.map(q => q.id),
       createdAt: new Date().toISOString()
@@ -696,21 +702,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     return () => clearInterval(intervalTimer);
   }, [isAutoPilotActive, questions, autoPilot, contests]);
 
-  // Active Event Listener: Bind an explicit handler to the Play Icon button
-  useEffect(() => {
-    const btn = playButtonRef.current;
-    if (!btn) return;
 
-    const handleNativeClick = (e: MouseEvent) => {
-      e.stopPropagation();
-      executeContestGeneration(false);
-    };
-
-    btn.addEventListener('click', handleNativeClick);
-    return () => {
-      btn.removeEventListener('click', handleNativeClick);
-    };
-  }, [questions, autoPilot, contests, isGeneratingContest]);
 
   // Format conflict timestamp into clean time string (e.g. "9:30 AM" or "Oct 8, 9:30 AM")
   const formatConflictTime = (ms: number): string => {
@@ -795,7 +787,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const initialStatus: 'active' | 'scheduled' = willBeActive ? 'active' : 'scheduled';
 
     const newContest: ActiveContest = {
-      id: `CNT-CASH-${Date.now().toString().slice(-4)}`,
+      id: `CNT-CASH-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
       type: 'cash',
       title: cashTitle.trim(),
       overlayTitle: cashOverlayTitle.trim(),
@@ -926,7 +918,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const initialStatus: 'active' | 'scheduled' = willBeActive ? 'active' : 'scheduled';
 
     const newContest: ActiveContest = {
-      id: `CNT-PROD-${Date.now().toString().slice(-4)}`,
+      id: `CNT-PROD-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
       type: 'product',
       title: prodTitle.trim(),
       overlayTitle: prodOverlayTitle.trim(),
@@ -1027,6 +1019,11 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
   const handleStartEditContest = (c: ActiveContest) => {
     soundFx.playClick();
     setEditingContest(c);
+    setIsStartTimeModified(false);
+    setIsEndTimeModified(false);
+    originalStartTimeRef.current = c.scheduledTime;
+    originalEndTimeRef.current = c.endTime;
+
     setEditTitle(c.title);
     setEditOverlayTitle(c.overlayTitle || '');
     setEditBadge(c.badge || (c.type === 'cash' ? 'INSTANT UPI' : 'RANK #1'));
@@ -1039,42 +1036,57 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       ? (c.productConfig?.productImageUrl || '')
       : (c.cashConfig?.cashImageUrl || '');
     setEditImageUrl(img);
-    setEditStartTime(c.scheduledTime || new Date().toISOString());
-    setEditEndTime(c.endTime || new Date(Date.now() + 24 * 3600 * 1000).toISOString());
+
+    // Populate pickers with existing timestamps without mutating original references
+    const safeStart = c.scheduledTime && !isNaN(parseTargetTimestamp(c.scheduledTime))
+      ? c.scheduledTime
+      : (c.activatedAt || c.createdAt || new Date().toISOString());
+    const safeEnd = c.endTime && !isNaN(parseTargetTimestamp(c.endTime))
+      ? c.endTime
+      : new Date(parseTargetTimestamp(safeStart) + 24 * 3600 * 1000).toISOString();
+
+    setEditStartTime(safeStart);
+    setEditEndTime(safeEnd);
   };
 
   // Handlers for edit modal start and end time changes with conflict warning
   const handleEditStartTimeChange = (newVal: string) => {
     setEditStartTime(newVal);
-    if (!editingContest) return;
-    const startMs = parseTargetTimestamp(newVal);
-    const effectiveEnd = editEndTime || editingContest.endTime;
-    const endMs = effectiveEnd ? parseTargetTimestamp(effectiveEnd) : (startMs + 24 * 3600 * 1000);
-    const activeRunning = (contests || []).find(c => c && c.id !== editingContest.id && (c.status === 'active' || c.id === activeContest?.id));
-    if (activeRunning && startMs > 0 && endMs > 0) {
-      const activeStart = parseTargetTimestamp(activeRunning.scheduledTime || activeRunning.activatedAt) || (Date.now() - 3600000);
-      const activeEnd = activeRunning.endTime ? parseTargetTimestamp(activeRunning.endTime) : (activeStart + 24 * 3600 * 1000);
-      if (startMs < activeEnd && endMs > activeStart) {
-        soundFx.playWrong();
-        const endFormatted = formatConflictTime(activeEnd);
-        onShowToast(`Cannot set overlapping timeframe with an active contest. Please choose a slot after ${endFormatted}.`, 'error');
+    if (newVal !== originalStartTimeRef.current) {
+      setIsStartTimeModified(true);
+      if (!editingContest) return;
+      const startMs = parseTargetTimestamp(newVal);
+      const effectiveEnd = editEndTime || editingContest.endTime;
+      const endMs = effectiveEnd ? parseTargetTimestamp(effectiveEnd) : (startMs + 24 * 3600 * 1000);
+      const activeRunning = (contests || []).find(c => c && c.id !== editingContest.id && (c.status === 'active' || c.id === activeContest?.id));
+      if (activeRunning && startMs > 0 && endMs > 0) {
+        const activeStart = parseTargetTimestamp(activeRunning.scheduledTime || activeRunning.activatedAt) || (Date.now() - 3600000);
+        const activeEnd = activeRunning.endTime ? parseTargetTimestamp(activeRunning.endTime) : (activeStart + 24 * 3600 * 1000);
+        if (startMs < activeEnd && endMs > activeStart) {
+          soundFx.playWrong();
+          const endFormatted = formatConflictTime(activeEnd);
+          onShowToast(`Cannot set overlapping timeframe with an active contest. Please choose a slot after ${endFormatted}.`, 'error');
+        }
       }
     }
   };
 
   const handleEditEndTimeChange = (newVal: string) => {
     setEditEndTime(newVal);
-    if (!editingContest) return;
-    const startMs = parseTargetTimestamp(editStartTime || editingContest.scheduledTime);
-    const endMs = parseTargetTimestamp(newVal);
-    const activeRunning = (contests || []).find(c => c && c.id !== editingContest.id && (c.status === 'active' || c.id === activeContest?.id));
-    if (activeRunning && startMs > 0 && endMs > 0) {
-      const activeStart = parseTargetTimestamp(activeRunning.scheduledTime || activeRunning.activatedAt) || (Date.now() - 3600000);
-      const activeEnd = activeRunning.endTime ? parseTargetTimestamp(activeRunning.endTime) : (activeStart + 24 * 3600 * 1000);
-      if (startMs < activeEnd && endMs > activeStart) {
-        soundFx.playWrong();
-        const endFormatted = formatConflictTime(activeEnd);
-        onShowToast(`Cannot set overlapping timeframe with an active contest. Please choose a slot after ${endFormatted}.`, 'error');
+    if (newVal !== originalEndTimeRef.current) {
+      setIsEndTimeModified(true);
+      if (!editingContest) return;
+      const startMs = parseTargetTimestamp(editStartTime || editingContest.scheduledTime);
+      const endMs = parseTargetTimestamp(newVal);
+      const activeRunning = (contests || []).find(c => c && c.id !== editingContest.id && (c.status === 'active' || c.id === activeContest?.id));
+      if (activeRunning && startMs > 0 && endMs > 0) {
+        const activeStart = parseTargetTimestamp(activeRunning.scheduledTime || activeRunning.activatedAt) || (Date.now() - 3600000);
+        const activeEnd = activeRunning.endTime ? parseTargetTimestamp(activeRunning.endTime) : (activeStart + 24 * 3600 * 1000);
+        if (startMs < activeEnd && endMs > activeStart) {
+          soundFx.playWrong();
+          const endFormatted = formatConflictTime(activeEnd);
+          onShowToast(`Cannot set overlapping timeframe with an active contest. Please choose a slot after ${endFormatted}.`, 'error');
+        }
       }
     }
   };
@@ -1084,34 +1096,40 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     e.preventDefault();
     if (!editingContest) return;
 
-    const editStartMs = parseTargetTimestamp(editStartTime || editingContest.scheduledTime);
-    const effectiveEditEndTime = editEndTime || editingContest.endTime || new Date(editStartMs + 24 * 3600 * 1000).toISOString();
-    const editEndMs = parseTargetTimestamp(effectiveEditEndTime);
+    // ISSUE 4 FIX: Strictly preserve the original start and end timestamps and activatedAt
+    // unless the admin intentionally changed the Start Timer or End Timer fields.
+    // Editing Entry Fee, Prize Pool, Max Participants (e.g. 50 to 200), Winners, Banner, Title MUST NOT reset the timer.
+    const effectiveStartTime = isStartTimeModified ? editStartTime : (editingContest.scheduledTime || editStartTime);
+    const effectiveEndTime = isEndTimeModified ? editEndTime : (editingContest.endTime || editEndTime);
 
-    if (editEndMs <= editStartMs) {
-      soundFx.playWrong();
-      onShowToast('End timer must be scheduled after start timer.', 'error');
-      return;
-    }
+    // Validate timeframe ordering & overlap ONLY if start or end timer was intentionally modified
+    if (isStartTimeModified || isEndTimeModified) {
+      const editStartMs = parseTargetTimestamp(effectiveStartTime);
+      const editEndMs = parseTargetTimestamp(effectiveEndTime);
 
-    // EDIT TIMER GUARD: In the Contest Edit Modal (Pencil Icon), if the admin attempts to change or save a Start/End timer that overlaps with an active or already running contest timeframe, BLOCK the action and trigger an alert toast:
-    // "Cannot set overlapping timeframe with an active contest. Please choose a slot after [End Time]."
-    const activeRunningContest = (contests || []).find(c => 
-      c && c.id !== editingContest.id && (c.status === 'active' || c.id === activeContest?.id)
-    );
+      if (editEndMs <= editStartMs) {
+        soundFx.playWrong();
+        onShowToast('End timer must be scheduled after start timer.', 'error');
+        return;
+      }
 
-    if (activeRunningContest) {
-      const activeStartMs = parseTargetTimestamp(activeRunningContest.scheduledTime || activeRunningContest.activatedAt) || (Date.now() - 3600000);
-      const activeEndMs = activeRunningContest.endTime 
-        ? parseTargetTimestamp(activeRunningContest.endTime) 
-        : (activeStartMs + 24 * 3600 * 1000);
+      const activeRunningContest = (contests || []).find(c => 
+        c && c.id !== editingContest.id && (c.status === 'active' || c.id === activeContest?.id)
+      );
 
-      if (activeStartMs > 0 && activeEndMs > 0) {
-        if (editStartMs < activeEndMs && editEndMs > activeStartMs) {
-          soundFx.playWrong();
-          const endFormatted = formatConflictTime(activeEndMs);
-          onShowToast(`Cannot set overlapping timeframe with an active contest. Please choose a slot after ${endFormatted}.`, 'error');
-          return;
+      if (activeRunningContest) {
+        const activeStartMs = parseTargetTimestamp(activeRunningContest.scheduledTime || activeRunningContest.activatedAt) || (Date.now() - 3600000);
+        const activeEndMs = activeRunningContest.endTime 
+          ? parseTargetTimestamp(activeRunningContest.endTime) 
+          : (activeStartMs + 24 * 3600 * 1000);
+
+        if (activeStartMs > 0 && activeEndMs > 0) {
+          if (editStartMs < activeEndMs && editEndMs > activeStartMs) {
+            soundFx.playWrong();
+            const endFormatted = formatConflictTime(activeEndMs);
+            onShowToast(`Cannot set overlapping timeframe with an active contest. Please choose a slot after ${endFormatted}.`, 'error');
+            return;
+          }
         }
       }
     }
@@ -1132,8 +1150,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       entryFee: newFee,
       maxParticipants: newMaxParticipants,
       winnersCount: newWinnersCount,
-      scheduledTime: editStartTime || editingContest.scheduledTime,
-      endTime: editEndTime || editingContest.endTime || new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+      // Strictly preserve original start, end, and activatedAt timestamps unless intentionally changed:
+      scheduledTime: effectiveStartTime,
+      endTime: effectiveEndTime,
+      activatedAt: editingContest.activatedAt,
     };
 
     if (editingContest.type === 'cash' && updated.cashConfig) {
@@ -1546,7 +1566,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
             </div>
           </div>
 
-          {/* ON/OFF Toggle Switch & Adjacent 'Run Cycle Now' Icon Button */}
+          {/* ON/OFF Toggle Switch */}
           <div className="flex items-center gap-3 self-start sm:self-auto">
             {/* Modern ON/OFF Toggle Switch */}
             <div className="flex items-center gap-2 bg-slate-50 border border-slate-200/90 rounded-xl px-3 py-2">
@@ -1573,25 +1593,6 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                 />
               </button>
             </div>
-
-            {/* Play Button (YouTube-shaped icon): Top-Left 'Q' Logo 3-Color Gradient Theme with 1-Second Loading Spinner */}
-            <button
-              ref={playButtonRef}
-              id="instant-play-cycle-button"
-              type="button"
-              onClick={() => executeContestGeneration(false)}
-              disabled={isGeneratingContest}
-              title="Run Cycle Now: Immediately Pull 10 Questions (3-3-3-1 Ratio) & Publish Contest"
-              aria-label="Run Cycle Now"
-              className="w-10 h-10 rounded-xl text-white flex items-center justify-center shadow-md hover:opacity-95 active:scale-95 transition-all cursor-pointer shrink-0 disabled:opacity-75 disabled:cursor-not-allowed"
-              style={{ background: Q_GRADIENT }}
-            >
-              {isGeneratingContest ? (
-                <Loader2 className="w-4 h-4 text-white animate-spin" />
-              ) : (
-                <Play className="w-4 h-4 fill-white text-white translate-x-[0.5px]" />
-              )}
-            </button>
           </div>
         </div>
 
@@ -2453,7 +2454,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                       ? c.totalRevenue 
                       : (cardRealJoins * (c.entryFee || 100));
                     const cardMaxCap = c.maxParticipants || poolData.targetParticipants || 50;
-                    const cardWinners = c.winnersCount || (c.type === 'product' ? 1 : 5);
+                    const cardWinners = calculateDynamicWinnerSlots(cardRealJoins);
 
                     return (
                       <div className="flex-1 min-w-0 space-y-1">

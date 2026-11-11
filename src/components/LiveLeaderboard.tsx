@@ -1,41 +1,72 @@
 import React, { useState } from 'react';
 import { 
-  Trophy, 
-  Medal, 
-  Clock, 
   Search, 
-  Sparkles, 
-  Gift, 
-  Smartphone, 
-  ArrowUpRight, 
-  CheckCircle2, 
-  Filter,
-  Users,
-  ShieldCheck,
   ShieldAlert
 } from 'lucide-react';
-import { LeaderboardEntry } from '../types';
+import { LeaderboardEntry, UserProfile, ActiveContest, DailyPrizeItem } from '../types';
 import { soundFx } from '../utils/audio';
 
 interface LiveLeaderboardProps {
   leaderboard: LeaderboardEntry[];
   currentUserId?: string;
+  currentUserUid?: string;
+  userAvatar?: string;
+  userProfile?: UserProfile;
+  activeContest?: ActiveContest | null;
+  isContestLive?: boolean;
+  todayPrize?: DailyPrizeItem;
+  hasUserCompletedAttempt?: boolean;
   onEnterQuiz: () => void;
   isQuizActive: boolean;
+}
+
+function formatTimeDisplay(secs?: number): string {
+  if (secs === undefined || secs === null || secs <= 0) return '—';
+  const total = Math.round(secs);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m}m ${s.toString().padStart(2, '0')}s` : `${s}s`;
 }
 
 export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
   leaderboard,
   currentUserId,
+  currentUserUid,
+  userAvatar,
+  userProfile,
+  activeContest,
+  isContestLive = false,
+  todayPrize,
+  hasUserCompletedAttempt = false,
   onEnterQuiz,
   isQuizActive
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<'all' | 'winners' | 'my_rank'>('all');
+  const [selectedCardRank, setSelectedCardRank] = useState<number | 'user'>(1);
 
   const safeLeaderboard = leaderboard || [];
+  const effectiveCurrentUid = currentUserUid || userProfile?.uid || userProfile?.id;
 
-  const filteredEntries = safeLeaderboard.filter(entry => {
+  const isRealSubmission = (e?: LeaderboardEntry | null) => {
+    if (!e) return false;
+    // Exclude demo placeholder rows
+    if (e.userName === 'User 1' || e.userName === 'User 2') return false;
+    if (e.id && e.id.startsWith('lb-')) return false;
+    if (e.ownerUid && (e.ownerUid.startsWith('demo-') || e.ownerUid.startsWith('seed-'))) return false;
+
+    // Explicit real submission indicators
+    if (e.id && (e.id.startsWith('ENTRY-') || e.id.startsWith('user-') || e.id.startsWith('sub-') || e.id.startsWith('att-') || e.id.startsWith('real-'))) return true;
+    if (e.entryId && (e.entryId.startsWith('ENTRY-') || e.entryId.startsWith('user-') || e.entryId.startsWith('sub-') || e.entryId.startsWith('att-'))) return true;
+    if (e.score !== undefined && e.score !== null && !isNaN(Number(e.score))) return true;
+    return Boolean(e.submittedAt && !e.id?.startsWith('lb-'));
+  };
+
+  // Zero Mock Data: strictly show only genuine real-time entries when contest is active and users have joined
+  const realLeaderboard = safeLeaderboard.filter(entry => isRealSubmission(entry) && entry.rank != null && entry.rank > 0);
+  const hasRealJoins = realLeaderboard.length > 0;
+
+  const filteredEntries = realLeaderboard.filter(entry => {
     if (!entry) return false;
     const matchesSearch = 
       (entry.userName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -45,39 +76,202 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
     if (!matchesSearch) return false;
 
     if (filterType === 'winners') {
-      return entry.rank <= 10;
+      const dynamicWinnerSlots = Math.max(1, Math.ceil(realLeaderboard.length / 3));
+      return entry.rank <= dynamicWinnerSlots || (entry.rewardAmount !== undefined && entry.rewardAmount > 0) || entry.rewardType === 'product';
     }
     if (filterType === 'my_rank') {
-      return entry.isCurrentUser;
+      return Boolean(
+        effectiveCurrentUid && entry.ownerUid && entry.ownerUid === effectiveCurrentUid
+      );
     }
     return true;
   });
 
-  const top3 = safeLeaderboard.slice(0, 3);
-  const userEntry = safeLeaderboard.find(e => e && e.isCurrentUser);
+  const userEntry = safeLeaderboard.find(e => 
+    e && 
+    isRealSubmission(e) && 
+    Boolean(effectiveCurrentUid && e.ownerUid && e.ownerUid === effectiveCurrentUid)
+  ) || null;
+
+  const getEntryForRank = (rank: number): LeaderboardEntry | null => {
+    return realLeaderboard.find(e => e && e.rank === rank) || null;
+  };
+
+  // Fixed Calendar Date formatter (replaces any "Today" with exact fixed calendar date)
+  const formatSubmissionDate = (entry: LeaderboardEntry): string => {
+    const raw = entry.submittedAt || entry.timestamp || '';
+    const fallbackCalendarDate = new Date().toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+
+    if (!raw) return fallbackCalendarDate;
+
+    if (/^today/i.test(raw.trim())) {
+      const timePart = raw.replace(/^today,?\s*/i, '').trim();
+      return timePart ? `${fallbackCalendarDate}, ${timePart}` : fallbackCalendarDate;
+    }
+
+    return raw;
+  };
+
+  // Clean Monetary Reward Formatter strictly mapped to contest prize tiers
+  const renderPrize = (entry: LeaderboardEntry) => {
+    if (entry.securityBreached || entry.rewardText === 'Disqualified (Violation)') {
+      return (
+        <span className="w-20 h-7 inline-flex items-center justify-center gap-1 text-[10px] font-bold text-rose-700 bg-rose-50 rounded-lg border border-rose-200 shadow-2xs whitespace-nowrap shrink-0">
+          <ShieldAlert className="w-3 h-3 text-rose-500 shrink-0" />
+          Disqualified
+        </span>
+      );
+    }
+
+    const prize = entry.rewardAmount !== undefined ? entry.rewardAmount : 0;
+    return (
+      <span className="w-20 h-7 inline-flex items-center justify-center font-extrabold text-xs text-emerald-700 bg-emerald-50 rounded-lg border border-emerald-200 shadow-2xs whitespace-nowrap tabular-nums shrink-0">
+        ₹{prize.toLocaleString('en-IN')}
+      </span>
+    );
+  };
+
+  const hasValidUserEntry = Boolean(
+    hasUserCompletedAttempt &&
+    userEntry &&
+    isRealSubmission(userEntry) &&
+    userEntry.score !== undefined
+  );
+
+  // Smart Visibility Logic:
+  // If the logged-in user's live rank is 1, 2, or 3, completely HIDE the separate "Your Contest Rank" card
+  // (since they are already featured in the main top winner cards).
+  // If their rank is 4th or lower, display the card accurately with live score, time, and rank details.
+  const shouldShowUserRankCard = Boolean(
+    hasValidUserEntry &&
+    userEntry &&
+    userEntry.rank >= 4
+  );
+
+  const renderWinnerCard = (rank: number, orderClass: string) => {
+    const entry = getEntryForRank(rank);
+    const isSelected = selectedCardRank === rank;
+    const realEntry = isRealSubmission(entry) ? entry : null;
+    const isCurrent = Boolean(
+      realEntry && effectiveCurrentUid && realEntry.ownerUid === effectiveCurrentUid
+    );
+
+    const hasLiveEntry = Boolean(hasRealJoins && realEntry && realEntry.userName && realEntry.userName.trim());
+    const displayName = hasLiveEntry ? realEntry.userName.trim() : (hasRealJoins ? 'Awaiting Player' : 'USER');
+    const avatarSrc = hasLiveEntry ? (realEntry.avatar || null) : null;
+    const scoreDisplay = hasLiveEntry
+      ? `${realEntry.score}/${realEntry.totalQuestions || 10}`
+      : '—';
+    const timeDisplay = hasLiveEntry
+      ? (realEntry.formattedTime ? realEntry.formattedTime.replace(/^in\s+/, '') : (realEntry.timeTakenSeconds ? `${Math.round(realEntry.timeTakenSeconds)}s` : '0m 00s'))
+      : '—';
+
+    // Strict Contest Engine Prize Rules:
+    // Demo behavior (before any real user joins): Rank 1 -> ₹180, Rank 2 -> ₹120, Rank 3 -> ₹60
+    // As soon as first verified real user joins:
+    // - Remove all demo prize data.
+    // - Display only actual contest calculations.
+    // - Only actual winning entries receive prizes. Non-winning users must show ₹0.
+    let prizeText = '₹0';
+    if (!hasRealJoins) {
+      if (rank === 1) prizeText = '₹180';
+      else if (rank === 2) prizeText = '₹120';
+      else if (rank === 3) prizeText = '₹60';
+    } else {
+      if (realEntry && realEntry.rewardAmount !== undefined) {
+        prizeText = `₹${realEntry.rewardAmount.toLocaleString('en-IN')}`;
+      } else {
+        prizeText = '₹0';
+      }
+    }
+
+    return (
+      <div
+        key={rank}
+        onClick={() => {
+          soundFx.playClick();
+          setSelectedCardRank(rank);
+        }}
+        className={`${orderClass} rounded-2xl p-5 min-h-[175px] flex flex-col justify-between relative transition-all duration-200 cursor-pointer ${
+          isSelected
+            ? 'border-2 border-[#3A81F5] shadow-md ring-2 ring-[#3A81F5]/20'
+            : 'border border-slate-200/90 shadow-xs hover:border-slate-300'
+        }`}
+        style={{ backgroundColor: '#FFFFFF' }}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            {avatarSrc ? (
+              <img
+                src={avatarSrc}
+                alt={displayName}
+                className="w-11 h-11 rounded-full object-cover border border-slate-200 shrink-0 shadow-xs"
+              />
+            ) : (
+              <div
+                className="w-11 h-11 rounded-full flex items-center justify-center text-white font-extrabold text-sm shrink-0 shadow-xs"
+                style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+              >
+                {displayName.charAt(0).toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0">
+              <h4 className="font-extrabold text-slate-900 text-sm flex items-center gap-1.5 truncate leading-tight">
+                <span className="truncate">{displayName}</span>
+                {isCurrent && hasLiveEntry && (
+                  <span
+                    className="text-[9px] text-white px-2 py-0.5 rounded-full font-bold shadow-2xs shrink-0"
+                    style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                  >
+                    YOU
+                  </span>
+                )}
+              </h4>
+            </div>
+          </div>
+          <span
+            className={`text-base font-black shrink-0 ${
+              isSelected ? 'text-[#3A81F5]' : 'text-slate-400'
+            }`}
+          >
+            {rank}
+          </span>
+        </div>
+
+        {/* Standardized Score & Timer Layout */}
+        <div className="mt-3.5 pt-3 border-t border-slate-100 flex items-center justify-between text-xs gap-2">
+          <span className="font-extrabold text-sm text-slate-900 whitespace-nowrap tabular-nums">
+            {scoreDisplay}
+          </span>
+          <span className="font-mono text-xs font-semibold text-slate-500 whitespace-nowrap tabular-nums text-right">
+            {timeDisplay}
+          </span>
+        </div>
+
+        {/* Centered Contest-Linked Prize Badge with identical dimensions */}
+        <div className="mt-3 h-8 w-full rounded-xl bg-emerald-50 border border-emerald-200 text-center flex items-center justify-center shadow-2xs shrink-0">
+          <span className="text-xs font-extrabold text-emerald-700 tracking-wide whitespace-nowrap tabular-nums">
+            {prizeText}
+          </span>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="w-full space-y-6 pb-6">
       {/* Header Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200/90 shadow-sm">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-200">
-              <Trophy className="w-3.5 h-3.5 text-indigo-600" />
-              Live Arena #348 Standings
-            </span>
-            <span className="text-xs font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200 flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              Real-time Atomic Sync
-            </span>
-          </div>
-          <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900 tracking-tight mt-2">
-            Skill Leaderboard & Prize Allocation
-          </h2>
-          <p className="text-xs sm:text-sm text-slate-600 mt-0.5">
-            Rankings determined strictly by <strong className="text-slate-900">Correct Answers</strong> & <strong className="text-slate-900">Atomic Completion Speed</strong>.
-          </p>
-        </div>
+      <div 
+        className="flex flex-col items-center justify-center text-center gap-3.5 p-6 rounded-2xl border border-slate-200/90 shadow-sm"
+        style={{ backgroundColor: '#FFFFFF' }}
+      >
+        <h2 className="text-xl sm:text-2xl font-black text-black tracking-tight text-center">
+          Live Standings & Rankings
+        </h2>
 
         {!isQuizActive && (
           <button
@@ -86,164 +280,99 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
               soundFx.playClick();
               onEnterQuiz();
             }}
-            className="px-5 py-3 rounded-xl text-white font-bold text-xs shadow-md flex items-center justify-center gap-2 cursor-pointer shrink-0 transition-all active:scale-95 gemini-glow"
+            className="px-6 py-2.5 rounded-xl text-white font-bold text-xs shadow-sm flex items-center justify-center cursor-pointer transition-all hover:opacity-95 active:scale-98"
             style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
           >
-            <span>Play ₹100 Quiz Now</span>
-            <ArrowUpRight className="w-4 h-4" />
+            Play Quiz Now
           </button>
         )}
       </div>
 
       {/* Top 3 High-Density Podium Cards */}
-      {top3.length >= 3 && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
-          {/* Rank 2 (Silver) */}
-          <div className="order-2 md:order-1 rounded-2xl bg-white border border-slate-200/90 p-5 shadow-sm flex flex-col justify-between relative transition-all hover:border-slate-300">
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 font-bold text-base shadow-xs">
-                  🥈
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
+        {renderWinnerCard(2, 'order-2 md:order-1')}
+        {renderWinnerCard(1, 'order-1 md:order-2')}
+        {renderWinnerCard(3, 'order-3 md:order-3')}
+      </div>
+
+      {/* User's Own Rank Card - Only displayed when rank is 4th or lower; hidden when rank is 1st to 3rd or unassigned */}
+      {shouldShowUserRankCard && userEntry && (
+        <div 
+          onClick={() => {
+            soundFx.playClick();
+            setSelectedCardRank('user');
+          }}
+          className={`rounded-2xl p-5 min-h-[175px] flex flex-col justify-between shadow-sm relative transition-all duration-200 cursor-pointer ${
+            selectedCardRank === 'user'
+              ? 'border-2 border-[#3A81F5] shadow-md ring-2 ring-[#3A81F5]/20'
+              : 'border border-slate-200/90 shadow-xs hover:border-slate-300'
+          }`}
+          style={{ backgroundColor: '#FFFFFF' }}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              {userEntry.avatar ? (
+                <img
+                  src={userEntry.avatar}
+                  alt={userEntry.userName}
+                  className="w-11 h-11 rounded-full object-cover border border-slate-200 shrink-0 shadow-xs"
+                />
+              ) : (
+                <div
+                  className="w-11 h-11 rounded-full flex items-center justify-center text-white font-extrabold text-sm shrink-0 shadow-xs"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                >
+                  {(userEntry.userName || 'U').charAt(0).toUpperCase()}
                 </div>
-                <div>
-                  <h4 className="font-bold text-slate-900 text-sm flex items-center gap-1.5">
-                    {top3[1].userName}
-                    {top3[1].isCurrentUser && <span className="text-[10px] bg-indigo-600 text-white px-2 py-0.5 rounded-full font-bold">YOU</span>}
-                  </h4>
-                  <p className="text-xs text-slate-500">{top3[1].city}, {top3[1].state}</p>
-                </div>
-              </div>
-              <span className="text-sm font-black text-slate-400">#2</span>
+              )}
+              <h4 className="font-extrabold text-slate-900 text-sm flex items-center gap-1.5 truncate leading-tight">
+                <span className="truncate">{userEntry.userName}</span>
+                <span
+                  className="text-[9px] text-white px-2 py-0.5 rounded-full font-bold shadow-2xs shrink-0"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                >
+                  YOU
+                </span>
+              </h4>
             </div>
 
-            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
-              <span className="font-bold text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded-lg border border-indigo-200">
-                Score: {top3[1].score}/10
-              </span>
-              <span className="font-mono text-slate-700 flex items-center gap-1.5 text-xs">
-                <Clock className="w-3.5 h-3.5 text-slate-400" />
-                {top3[1].formattedTime}
-              </span>
-            </div>
-
-            <div className="mt-3 text-xs font-bold text-emerald-700 bg-emerald-50 p-2.5 rounded-xl border border-emerald-200 flex items-center gap-2">
-              <Smartphone className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span className="truncate">{top3[1].rewardText}</span>
-            </div>
+            <span className="text-base font-black text-[#3A81F5] shrink-0">
+              {userEntry.rank}
+            </span>
           </div>
 
-          {/* Rank 1 (Gold Winner - Highlighted) */}
-          <div className="order-1 md:order-2 rounded-2xl bg-amber-50/50 border-2 border-amber-300 p-5 shadow-sm flex flex-col justify-between relative transition-all hover:border-amber-400">
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-xl bg-gradient-to-tr from-amber-500 to-amber-400 text-white flex items-center justify-center font-bold text-lg shadow-sm">
-                  👑
-                </div>
-                <div>
-                  <span className="text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 px-2 py-0.5 rounded-full border border-amber-300">
-                    Rank #1 Winner
-                  </span>
-                  <h4 className="font-extrabold text-slate-900 text-base flex items-center gap-1.5 mt-1">
-                    {top3[0].userName}
-                    {top3[0].isCurrentUser && <span className="text-[10px] bg-indigo-600 text-white px-2 py-0.5 rounded-full font-bold">YOU</span>}
-                  </h4>
-                  <p className="text-xs text-slate-600">{top3[0].city}, {top3[0].state}</p>
-                </div>
-              </div>
-              <span className="text-lg font-black text-amber-600">#1</span>
-            </div>
-
-            <div className="mt-4 pt-3 border-t border-amber-200/80 flex items-center justify-between text-xs">
-              <span className="font-black text-amber-900 bg-amber-100 px-3 py-1 rounded-lg border border-amber-300">
-                Score: {top3[0].score}/10
-              </span>
-              <span className="font-mono font-bold text-amber-900 flex items-center gap-1.5 text-xs">
-                <Clock className="w-3.5 h-3.5 text-amber-600" />
-                {top3[0].formattedTime}
-              </span>
-            </div>
-
-            <div className="mt-3 text-xs font-bold text-amber-900 bg-amber-100/80 p-2.5 rounded-xl border border-amber-300 flex items-center gap-2">
-              <Gift className="w-4 h-4 text-amber-600 shrink-0" />
-              <span className="truncate">{top3[0].rewardText}</span>
-            </div>
+          {/* Standardized Score & Timer Layout: precisely matches winner card format */}
+          <div className="mt-3.5 pt-3 border-t border-slate-100 flex items-center justify-between text-xs gap-2">
+            <span className="font-extrabold text-sm text-slate-900 whitespace-nowrap tabular-nums">
+              {`${userEntry.score}/${userEntry.totalQuestions || 10}`}
+            </span>
+            <span className="font-mono text-xs font-semibold text-slate-500 whitespace-nowrap tabular-nums text-right">
+              {userEntry.formattedTime ? userEntry.formattedTime.replace(/^in\s+/, '') : (userEntry.timeTakenSeconds ? `${Math.round(userEntry.timeTakenSeconds)}s` : '0m 00s')}
+            </span>
           </div>
 
-          {/* Rank 3 (Bronze) */}
-          <div className="order-3 md:order-3 rounded-2xl bg-white border border-slate-200/90 p-5 shadow-sm flex flex-col justify-between relative transition-all hover:border-slate-300">
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-200 flex items-center justify-center text-orange-700 font-bold text-base shadow-xs">
-                  🥉
-                </div>
-                <div>
-                  <h4 className="font-bold text-slate-900 text-sm flex items-center gap-1.5">
-                    {top3[2].userName}
-                    {top3[2].isCurrentUser && <span className="text-[10px] bg-indigo-600 text-white px-2 py-0.5 rounded-full font-bold">YOU</span>}
-                  </h4>
-                  <p className="text-xs text-slate-500">{top3[2].city}, {top3[2].state}</p>
-                </div>
-              </div>
-              <span className="text-sm font-black text-slate-400">#3</span>
-            </div>
-
-            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
-              <span className="font-bold text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded-lg border border-indigo-200">
-                Score: {top3[2].score}/10
-              </span>
-              <span className="font-mono text-slate-700 flex items-center gap-1.5 text-xs">
-                <Clock className="w-3.5 h-3.5 text-slate-400" />
-                {top3[2].formattedTime}
-              </span>
-            </div>
-
-            <div className="mt-3 text-xs font-bold text-emerald-700 bg-emerald-50 p-2.5 rounded-xl border border-emerald-200 flex items-center gap-2">
-              <Smartphone className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span className="truncate">{top3[2].rewardText}</span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* User's Own Rank Spotlight Strip if available */}
-      {userEntry && (
-        <div className="rounded-2xl bg-indigo-50 text-indigo-950 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs border border-indigo-200">
-          <div className="flex items-center gap-3.5">
-            <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center font-black text-sm text-white shadow-xs">
-              #{userEntry.rank}
-            </div>
-            <div>
-              <div className="text-[10px] text-indigo-700 font-bold uppercase tracking-wider">Your Contest Rank</div>
-              <div className="font-extrabold text-slate-900 text-sm">
-                {userEntry.userName} • {userEntry.score}/10 in {userEntry.formattedTime}
-              </div>
-            </div>
-          </div>
-          <div className="text-xs font-bold bg-white px-3 py-1.5 rounded-xl border border-indigo-200 flex items-center gap-1.5 self-start sm:self-auto shadow-xs">
-            {userEntry.securityBreached || userEntry.rewardText === 'Disqualified (Violation)' ? (
-              <span className="text-rose-600 flex items-center gap-1 font-semibold">
-                <ShieldAlert className="w-3.5 h-3.5 text-rose-600" />
-                Disqualified (Violation)
-              </span>
-            ) : (
-              <span className="text-emerald-700">{userEntry.rewardText}</span>
-            )}
+          {/* Centered Contest-Linked Prize Badge with identical dimensions */}
+          <div className="mt-3 h-8 w-full rounded-xl bg-emerald-50 border border-emerald-200 text-center flex items-center justify-center shadow-2xs shrink-0">
+            <span className="text-xs font-extrabold text-emerald-700 tracking-wide whitespace-nowrap tabular-nums">
+              {userEntry.rewardAmount !== undefined ? `₹${userEntry.rewardAmount.toLocaleString('en-IN')}` : '₹0'}
+            </span>
           </div>
         </div>
       )}
 
       {/* Search & Filter Bar */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-sm p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        {/* Search input */}
-        <div className="relative flex-1">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
+        {/* Search input with perfectly centered icon and text */}
+        <div className="relative flex-1 flex items-center">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             id="leaderboard-search-input"
             type="text"
-            placeholder="Search contestant by name, city, or state..."
+            placeholder="Search by name"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+            className="w-full pl-10 pr-4 py-2.5 text-xs border border-slate-200 rounded-xl leading-normal text-slate-900 placeholder:text-slate-400 focus:ring-2 focus:ring-[#3A81F5] focus:border-[#3A81F5] outline-none shadow-2xs"
+            style={{ backgroundColor: '#FFFFFF' }}
           />
         </div>
 
@@ -251,36 +380,46 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
         <div className="flex items-center gap-2">
           <button
             onClick={() => { soundFx.playClick(); setFilterType('all'); }}
-            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs ${
               filterType === 'all'
-                ? 'bg-indigo-600 text-white shadow-xs'
-                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                ? 'text-white shadow-sm'
+                : 'text-slate-700 border border-slate-200 hover:bg-slate-50'
             }`}
+            style={filterType === 'all'
+              ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }
+              : { backgroundColor: '#FFFFFF' }
+            }
           >
-            All ({leaderboard.length})
+            All ({realLeaderboard.length})
           </button>
           <button
             onClick={() => { soundFx.playClick(); setFilterType('winners'); }}
-            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs ${
               filterType === 'winners'
-                ? 'bg-emerald-600 text-white shadow-xs'
-                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                ? 'text-white shadow-sm'
+                : 'text-slate-700 border border-slate-200 hover:bg-slate-50'
             }`}
+            style={filterType === 'winners'
+              ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }
+              : { backgroundColor: '#FFFFFF' }
+            }
           >
             Top 10 Rewards
           </button>
-          {userEntry && (
-            <button
-              onClick={() => { soundFx.playClick(); setFilterType('my_rank'); }}
-              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
-                filterType === 'my_rank'
-                  ? 'bg-indigo-600 text-white shadow-xs'
-                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-              }`}
-            >
-              My Rank
-            </button>
-          )}
+          <button
+            onClick={() => { soundFx.playClick(); setFilterType('my_rank'); }}
+            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs ${
+              filterType === 'my_rank'
+                ? 'text-white shadow-sm'
+                : 'text-slate-700 border border-slate-200 hover:bg-slate-50'
+            }`}
+            style={filterType === 'my_rank'
+              ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }
+              : { backgroundColor: '#FFFFFF' }
+            }
+          >
+            My Rank
+          </button>
         </div>
       </div>
 
@@ -290,124 +429,97 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 text-[10px] uppercase tracking-wider font-bold">
-                <th className="py-3 px-4">Rank</th>
-                <th className="py-3 px-4">Contestant</th>
-                <th className="py-3 px-4 text-center">Score</th>
-                <th className="py-3 px-4">Time Taken</th>
-                <th className="py-3 px-4">Reward Qualification</th>
-                <th className="py-3 px-4 text-right">Submitted</th>
+                <th className="py-3 px-4 w-16 whitespace-nowrap">Rank</th>
+                <th className="py-3 px-4 min-w-[140px]">Contestant</th>
+                <th className="py-3 px-4 text-center w-24 whitespace-nowrap">Score</th>
+                <th className="py-3 px-4 text-center w-28 whitespace-nowrap">Time Taken</th>
+                <th className="py-3 px-4 text-center w-28 whitespace-nowrap">Prize</th>
+                <th className="py-3 px-4 text-center w-36 whitespace-nowrap">Submitted</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredEntries.map((entry) => {
-                const isUser = entry.isCurrentUser;
-                const isTop1 = entry.rank === 1;
-                const isTop10 = entry.rank <= 10;
+              {(!hasRealJoins || filteredEntries.length === 0) ? (
+                <tr>
+                  <td colSpan={6} className="py-12 px-4 text-center text-slate-400 font-medium text-xs bg-white">
+                    {filterType === 'my_rank'
+                      ? 'You have not joined this contest yet. Join now to view your rank!'
+                      : 'No active submissions. Play now to join the rankings!'}
+                  </td>
+                </tr>
+              ) : (
+                filteredEntries.map((entry) => {
+                  const isUser = Boolean(
+                    effectiveCurrentUid && entry.ownerUid && entry.ownerUid === effectiveCurrentUid
+                  );
+                  const contestantName = entry.userName;
 
-                return (
-                  <tr 
-                    key={entry.id}
-                    className={`hover:bg-slate-50 transition-colors ${
-                      isUser ? 'bg-indigo-50/60 font-semibold' : ''
-                    }`}
-                  >
-                    {/* Rank */}
-                    <td className="py-3 px-4 whitespace-nowrap">
-                      <div className="flex items-center gap-1.5">
-                        {entry.rank === 1 ? (
-                          <span className="w-6 h-6 rounded-full bg-amber-400 text-slate-900 font-black text-[11px] flex items-center justify-center shadow-xs">
-                            1
+                  return (
+                    <tr 
+                      key={entry.id}
+                      className={`transition-colors ${
+                        isUser 
+                          ? 'bg-blue-50/70 font-semibold' 
+                          : 'hover:bg-slate-50/80 bg-white'
+                      }`}
+                    >
+                      {/* Rank Number: clean circular badge styled with primary brand theme */}
+                      <td className="py-3.5 px-4 whitespace-nowrap align-middle">
+                        <div className="flex items-center">
+                          <span
+                            className="w-7 h-7 rounded-full text-white font-black text-xs flex items-center justify-center shadow-2xs"
+                            style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                          >
+                            {entry.rank}
                           </span>
-                        ) : entry.rank === 2 ? (
-                          <span className="w-6 h-6 rounded-full bg-slate-200 text-slate-800 font-bold text-[11px] flex items-center justify-center">
-                            2
-                          </span>
-                        ) : entry.rank === 3 ? (
-                          <span className="w-6 h-6 rounded-full bg-orange-100 text-orange-800 font-bold text-[11px] flex items-center justify-center border border-orange-200">
-                            3
-                          </span>
-                        ) : (
-                          <span className="w-6 h-6 rounded-full text-slate-500 font-bold text-[11px] flex items-center justify-center">
-                            #{entry.rank}
-                          </span>
-                        )}
-                      </div>
-                    </td>
-
-                    {/* Contestant */}
-                    <td className="py-3 px-4">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-7 h-7 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center font-bold text-[11px] shrink-0 border border-slate-200">
-                          {entry.userName.charAt(0)}
                         </div>
-                        <div>
-                          <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                            {entry.userName}
-                            {isUser && (
-                              <span className="text-[9px] bg-indigo-600 text-white font-bold px-1.5 py-0.2 rounded-full">
-                                YOU
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[10px] text-slate-500">
-                            {entry.city}, {entry.state}
-                          </div>
+                      </td>
+
+                      {/* Contestant: clean user name and badges only, without location text or avatar thumbnails */}
+                      <td className="py-3.5 px-4 align-middle">
+                        <div className="font-bold text-slate-900 flex items-center gap-1.5 truncate">
+                          <span className="truncate">{contestantName}</span>
+                          {isUser && (
+                            <span
+                              className="text-[9px] text-white px-2 py-0.5 rounded-full font-bold shadow-2xs shrink-0"
+                              style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                            >
+                              YOU
+                            </span>
+                          )}
                         </div>
-                      </div>
-                    </td>
+                      </td>
 
-                    {/* Score */}
-                    <td className="py-3 px-4 text-center whitespace-nowrap">
-                      <span className={`inline-block px-2.5 py-0.5 rounded-full font-black text-[11px] ${
-                        entry.score === 10
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : entry.score >= 8
-                          ? 'bg-indigo-50 text-indigo-800 border border-indigo-200'
-                          : 'bg-slate-100 text-slate-600 border border-slate-200'
-                      }`}>
-                        {entry.score} / {entry.totalQuestions}
-                      </span>
-                    </td>
+                      {/* Score: styled with website's primary brand accent color */}
+                      <td className="py-3.5 px-4 text-center whitespace-nowrap align-middle">
+                        <span className="w-14 h-7 inline-flex items-center justify-center rounded-lg font-black text-xs text-[#3A81F5] bg-blue-50 border border-blue-200/80 shadow-2xs tabular-nums">
+                          {entry.score}/{entry.totalQuestions || 10}
+                        </span>
+                      </td>
 
-                    {/* Time Taken */}
-                    <td className="py-3 px-4 whitespace-nowrap font-mono text-[11px] text-slate-700">
-                      <div className="flex items-center gap-1.5">
-                        <Clock className="w-3.5 h-3.5 text-slate-400" />
-                        <span>{entry.formattedTime}</span>
-                      </div>
-                    </td>
+                      {/* Time Taken: small rounded timer box matching Admin Panel Score & Speed */}
+                      <td className="py-3.5 px-4 whitespace-nowrap text-center align-middle">
+                        <div className="flex items-center justify-center">
+                          <span className="min-w-[76px] px-2.5 h-7 inline-flex items-center justify-center rounded-lg font-mono font-semibold text-xs text-slate-700 bg-slate-50 border border-slate-200 shadow-2xs tabular-nums whitespace-nowrap">
+                            {formatTimeDisplay(entry.timeTakenSeconds)}
+                          </span>
+                        </div>
+                      </td>
 
-                    {/* Reward */}
-                    <td className="py-3 px-4">
-                      {entry.securityBreached || entry.rewardText === 'Disqualified (Violation)' ? (
-                        <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-800 bg-rose-50 px-2.5 py-0.5 rounded-full border border-rose-200">
-                          <ShieldAlert className="w-3.5 h-3.5 text-rose-600" />
-                          Disqualified (Violation)
-                        </span>
-                      ) : isTop1 ? (
-                        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-amber-900 bg-amber-50 px-2.5 py-0.5 rounded-full border border-amber-200">
-                          <Gift className="w-3.5 h-3.5 text-amber-600" />
-                          {entry.rewardText}
-                        </span>
-                      ) : isTop10 ? (
-                        <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
-                          <Smartphone className="w-3.5 h-3.5 text-emerald-600" />
-                          {entry.rewardText}
-                        </span>
-                      ) : (
-                        <span className="text-[11px] text-slate-500 italic">
-                          Consolation Certificate
-                        </span>
-                      )}
-                    </td>
+                      {/* Prize: exact backend waterfall prize amount, centered directly below PRIZE */}
+                      <td className="py-3.5 px-4 whitespace-nowrap text-center align-middle">
+                        <div className="flex items-center justify-center">
+                          {renderPrize(entry)}
+                        </div>
+                      </td>
 
-                    {/* Submitted At */}
-                    <td className="py-3 px-4 text-right text-[11px] text-slate-500 whitespace-nowrap">
-                      {entry.submittedAt || entry.timestamp}
-                    </td>
-                  </tr>
-                );
-              })}
+                      {/* Submitted At: exact fixed calendar date, centered directly below heading */}
+                      <td className="py-3.5 px-4 text-center text-[11px] font-medium text-slate-500 whitespace-nowrap tabular-nums align-middle">
+                        {formatSubmissionDate(entry)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>

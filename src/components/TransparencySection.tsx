@@ -40,7 +40,7 @@ export const TransparencySection: React.FC<TransparencySectionProps> = ({
   onShowToast,
   onOpenSupport
 }) => {
-  const [openFaq, setOpenFaq] = useState<number | null>(0);
+  const [openFaq, setOpenFaq] = useState<number | null>(null);
 
   // Typewriter animation state for hero heading
   const [lineIdx, setLineIdx] = useState(0);

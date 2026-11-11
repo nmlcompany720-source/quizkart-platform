@@ -276,3 +276,19 @@ export function calculateDynamicPool(
     phase: isPoolFull ? 'full' : (isExpanded ? 'expanded_real_fill' : (steps > 0 ? 'active_stable' : 'delay_zero'))
   };
 }
+
+/**
+ * PROPORTIONAL DYNAMIC WINNER SLOT SCALING (1-TO-3 RATIO):
+ * Automatically calculates winner slots based on active real user joins:
+ * Winner Slots = Math.max(1, Math.floor(Total Active Real Joins / 3))
+ * e.g., 1 to 3 joins = 1 winner slot
+ *       4 to 6 joins = 2 winner slots
+ *       7 to 9 joins = 3 winner slots
+ *       and scaling proportionally up for higher counts (like 100 joins = ~33-34 winners).
+ */
+export function calculateDynamicWinnerSlots(activeRealJoins: number): number {
+  const joins = Math.max(0, Math.floor(Number(activeRealJoins) || 0));
+  if (joins <= 3) return 1;
+  return Math.max(1, Math.ceil(joins / 3));
+}
+

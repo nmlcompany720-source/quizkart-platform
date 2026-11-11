@@ -11,12 +11,40 @@ import {
   ShieldCheck, 
   ShieldAlert, 
   ChevronDown, 
-  ChevronUp,
-  RotateCcw
+  ChevronUp
 } from 'lucide-react';
 import { Question, QuizAttemptResult, DailyPrizeItem } from '../types';
 import { soundFx } from '../utils/audio';
 import { safeCopyToClipboard } from '../utils/clipboard';
+import { getQuestionCorrectIndex } from '../utils/questionPoolManager';
+import { contestBackend } from '../backend/contestEngine';
+
+export const PAYOUT_STATUS_OPTIONS: readonly string[] = [
+  "Your result is recorded. Final prize will be confirmed after the contest ends.",
+  "Great performance! Your eligible prize is subject to final settlement.",
+  "Your entry is confirmed. Final rankings will be announced soon.",
+  "Contest is live. Your final rank and reward will be confirmed at completion.",
+  "Your performance is saved. Stay tuned for the final results."
+] as const;
+
+export function getAttemptPayoutMessage(attempt?: Partial<QuizAttemptResult> | null): string {
+  if (typeof attempt?.selectedMessageOption === 'number' && attempt.selectedMessageOption >= 1 && attempt.selectedMessageOption <= PAYOUT_STATUS_OPTIONS.length) {
+    return PAYOUT_STATUS_OPTIONS[attempt.selectedMessageOption - 1];
+  }
+  if (attempt?.payoutMessage && typeof attempt.payoutMessage === 'string' && attempt.payoutMessage.trim().length > 0) {
+    const trimmed = attempt.payoutMessage.trim();
+    const idx = PAYOUT_STATUS_OPTIONS.indexOf(trimmed as any);
+    if (idx !== -1) return PAYOUT_STATUS_OPTIONS[idx];
+    return trimmed;
+  }
+  // Deterministic fallback based on entryId / attemptId so it never shifts or re-randomizes on refresh
+  const seed = (attempt?.entryId || attempt?.attemptId || 'entry-seed');
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  return PAYOUT_STATUS_OPTIONS[hash % PAYOUT_STATUS_OPTIONS.length];
+}
 
 interface QuizResultProps {
   result: QuizAttemptResult;
@@ -37,6 +65,17 @@ export const QuizResult: React.FC<QuizResultProps> = ({
 }) => {
   const [showDetailedReview, setShowDetailedReview] = useState<boolean>(true);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [, setSettlementTick] = useState<number>(0);
+
+  useEffect(() => {
+    const handleSettlementSync = () => setSettlementTick(t => t + 1);
+    window.addEventListener('quizkart_attempts_updated', handleSettlementSync);
+    window.addEventListener('quizkart_profile_updated', handleSettlementSync);
+    return () => {
+      window.removeEventListener('quizkart_attempts_updated', handleSettlementSync);
+      window.removeEventListener('quizkart_profile_updated', handleSettlementSync);
+    };
+  }, []);
 
   useEffect(() => {
     // Fire confetti celebration
@@ -52,7 +91,77 @@ export const QuizResult: React.FC<QuizResultProps> = ({
     }
   }, [result.rank]);
 
-  const accuracy = Math.round((result.score / result.totalQuestions) * 100);
+  // Derive true review questions list for this test attempt
+  const reviewQuestions = React.useMemo(() => {
+    const list = (result.questions && result.questions.length > 0 ? result.questions : questions) || [];
+    return list.filter(q => q && q.id != null);
+  }, [result.questions, questions]);
+
+  // Denominator: strictly 10 (or actual question block count), eliminating erroneous pool denominators like 100
+  const effectiveTotalQuestions = reviewQuestions.length > 0
+    ? reviewQuestions.length
+    : (result.totalQuestions > 0 && result.totalQuestions <= 25 ? result.totalQuestions : 10);
+
+  // Score: Strict immutable evaluation engine: Final Score = (Correct × 1) − (Wrong × 0.33)
+  const displayScore = React.useMemo(() => {
+    if (result.securityBreached) return 0;
+    if (reviewQuestions.length > 0 && result.answers) {
+      let correct = 0;
+      let wrong = 0;
+      reviewQuestions.forEach((q) => {
+        const correctIdx = getQuestionCorrectIndex(q);
+        const userAns = result.answers[q.id];
+        if (userAns !== undefined) {
+          if (userAns === correctIdx) {
+            correct += 1;
+          } else {
+            wrong += 1;
+          }
+        }
+      });
+      const netScore = (correct * 1) - (wrong * 0.33);
+      return Math.max(0, Math.round(netScore * 100) / 100);
+    }
+    const rawScore = Number(result.score) || 0;
+    return Math.max(0, Math.round(rawScore * 100) / 100);
+  }, [result.securityBreached, reviewQuestions, result.answers, result.score]);
+
+  // Decimal Support: properly render score with decimal points where applicable (e.g., 8.67 or 9.33)
+  const formattedScore = React.useMemo(() => {
+    if (Number.isInteger(displayScore)) {
+      return displayScore.toString();
+    }
+    return (Math.round(displayScore * 100) / 100).toString();
+  }, [displayScore]);
+
+  // Attempt-Based Accuracy Percentage Formula (Without Decimals):
+  // Based strictly on user attempts: totalAttempted = correctAnswers + wrongAnswers
+  const accuracy = React.useMemo(() => {
+    if (result.securityBreached) return 0;
+    let correctAnswers = 0;
+    let wrongAnswers = 0;
+
+    if (reviewQuestions.length > 0 && result.answers) {
+      reviewQuestions.forEach((q) => {
+        const correctIdx = getQuestionCorrectIndex(q);
+        const userAns = result.answers[q.id];
+        if (userAns !== undefined) {
+          if (userAns === correctIdx) {
+            correctAnswers += 1;
+          } else {
+            wrongAnswers += 1;
+          }
+        }
+      });
+    }
+
+    const totalAttempted = correctAnswers + wrongAnswers;
+    const calculatedAccuracy = totalAttempted > 0 
+      ? Math.round((correctAnswers / totalAttempted) * 100) 
+      : 0;
+    return calculatedAccuracy;
+  }, [result.securityBreached, reviewQuestions, result.answers]);
+
   const formatTime = (secs: number) => {
     const totalSecs = Math.floor(Number(secs) || 0);
     const m = Math.floor(totalSecs / 60);
@@ -73,7 +182,7 @@ export const QuizResult: React.FC<QuizResultProps> = ({
     const siteUrl = 'https://quizkart.in';
     const shareText = result.securityBreached
       ? `🎯 I attempted the QuizKart Daily Skill Contest! Competing for mega prizes on ${siteUrl}`
-      : `🎯 I scored ${result.score}/${result.totalQuestions} (${accuracy}% accuracy) in ${formatTime(result.timeTakenSeconds)} on QuizKart Daily Skill Contest and achieved Rank ${result.rank}! 🏆 Competing for ${todayPrize?.title || 'daily prizes'}! ${siteUrl}`;
+      : `🎯 I scored ${formattedScore}/${effectiveTotalQuestions} (${accuracy}% accuracy) in ${formatTime(result.timeTakenSeconds)} on QuizKart Daily Skill Contest and achieved Rank ${result.rank}! 🏆 Competing for ${todayPrize?.title || 'daily prizes'}! ${siteUrl}`;
     const shareData = {
       title: 'QuizKart - My Contest Score & Rank',
       text: shareText,
@@ -96,8 +205,73 @@ export const QuizResult: React.FC<QuizResultProps> = ({
     }
   };
 
+  const isSettled = result.settlementStatus === 'settled' || 
+    (result.finalPrizeRupees !== undefined && result.finalPrizeRupees > 0) ||
+    (result.contestId ? contestBackend.isContestSettled(result.contestId) : false);
+
+  const actualCreditedPrize = React.useMemo(() => {
+    // 1. Authoritative finalPrizeRupees if already set on attempt
+    if (result.finalPrizeRupees !== undefined && result.finalPrizeRupees > 0) {
+      return result.finalPrizeRupees;
+    }
+    // 2. rewardAmount if attempt is settled
+    if (result.settlementStatus === 'settled' && result.rewardAmount && result.rewardAmount > 0) {
+      return result.rewardAmount;
+    }
+    // 3. Authoritative backend settlement record for this contest & user
+    if (result.contestId && contestBackend.isContestSettled(result.contestId)) {
+      const disbursements = contestBackend.getContestDisbursements(result.contestId);
+      const match = disbursements.find(d => 
+        (result.entryId && d.entryId === result.entryId) ||
+        (result.ownerUid && (d.ownerUid === result.ownerUid || d.ownerUid === result.ownerUid.replace(/^usr-/, ''))) ||
+        (result.userId && (d.ownerUid === result.userId || d.ownerUid === result.userId.replace(/^usr-/, ''))) ||
+        (result.userEmail && d.ownerUid && d.ownerUid.toLowerCase().includes(result.userEmail.replace(/[^a-zA-Z0-9]/g, '_')))
+      );
+      if (match && match.prizeRupees > 0) return match.prizeRupees;
+    }
+    if (result.rewardWon && typeof result.rewardWon === 'string' && (result.settlementStatus === 'settled' || (result.finalPrizeRupees !== undefined && result.finalPrizeRupees > 0))) {
+      const match = result.rewardWon.match(/₹\s*(\d+)/);
+      if (match) return parseInt(match[1], 10);
+    }
+    return 0;
+  }, [result]);
+
+  const payoutMessage = React.useMemo(() => {
+    return getAttemptPayoutMessage(result);
+  }, [result.payoutMessage, result.entryId, result.attemptId]);
+
+  const provisionalPrize = React.useMemo(() => {
+    // 1. Explicit provisionalPrizeRupees on attempt
+    if (result.provisionalPrizeRupees !== undefined && result.provisionalPrizeRupees > 0) {
+      return result.provisionalPrizeRupees;
+    }
+    // 2. Authoritative backend entry projectedPrizeRupees
+    if (result.contestId) {
+      const entries = contestBackend.getContestEntries(result.contestId);
+      const match = entries.find(e => 
+        (result.entryId && e.entryId === result.entryId) ||
+        (result.ownerUid && (e.ownerUid === result.ownerUid || e.ownerUid === result.ownerUid.replace(/^usr-/, ''))) ||
+        (result.userId && (e.ownerUid === result.userId || e.ownerUid === result.userId.replace(/^usr-/, ''))) ||
+        (result.userEmail && e.ownerUid && e.ownerUid.toLowerCase().includes(result.userEmail.replace(/[^a-zA-Z0-9]/g, '_')))
+      );
+      if (match && match.projectedPrizeRupees !== undefined && match.projectedPrizeRupees > 0) {
+        return match.projectedPrizeRupees;
+      }
+    }
+    // 3. Fallback from rewardAmount if active
+    if (!isSettled && result.rewardAmount && result.rewardAmount > 0) {
+      return result.rewardAmount;
+    }
+    return 0;
+  }, [result, isSettled]);
+
   const isRank1 = !result.securityBreached && result.rank === 1;
-  const isTopRunnerUp = !result.securityBreached && result.rank > 1 && result.rank <= 10;
+  const isProductWinner = isRank1 && result.rewardType === 'product';
+  const isConfirmedWinner = isSettled && !result.securityBreached && actualCreditedPrize > 0 && !isProductWinner;
+  const isConfirmedNonWinner = isSettled && !result.securityBreached && actualCreditedPrize === 0 && !isProductWinner;
+  const isPendingSettlement = !isSettled && !result.securityBreached;
+  const isWinner = isProductWinner || isConfirmedWinner;
+
 
   return (
     <div className="w-full space-y-6 pb-6">
@@ -114,34 +288,27 @@ export const QuizResult: React.FC<QuizResultProps> = ({
         </div>
       )}
 
-      {/* Result Hero Header */}
-      <div className={`relative overflow-hidden rounded-2xl p-6 sm:p-8 shadow-sm border ${
-        result.securityBreached
-          ? 'bg-white border-slate-200/90'
-          : isRank1
-          ? 'bg-amber-50/70 border-amber-300'
-          : isTopRunnerUp
-          ? 'bg-indigo-50/70 border-indigo-200'
-          : 'bg-white border-slate-200/90'
-      }`}>
+      {/* Result Hero Header - Clean Solid White Background without color tints and removed sub-lines */}
+      <div 
+        className="relative overflow-hidden rounded-2xl p-6 sm:p-8 shadow-sm border border-slate-200/90"
+        style={{ backgroundColor: '#FFFFFF' }}
+      >
         <div className="relative z-10 text-center space-y-3">
           <h2 className="text-2xl sm:text-3xl font-black tracking-tight text-slate-900">
             {result.securityBreached 
               ? '🚨 Test Auto-Submitted' 
+              : isConfirmedWinner
+              ? '🎉 Congratulations You Won!'
+              : isProductWinner
+              ? '🎉 Congratulations You Won Product Prize!'
               : isRank1 
-              ? '🎉 Congratulations! You Are Rank #1!' 
-              : isTopRunnerUp 
+              ? '🎉 Congratulations You Are Rank 1' 
+              : isWinner 
               ? '🔥 Excellent Performance!' 
+              : isPendingSettlement
+              ? '🎯 Quiz Submitted Successfully!'
               : '👏 Contest Completed'}
           </h2>
-
-          {!result.securityBreached && (isRank1 || isTopRunnerUp) && (
-            <p className="text-xs sm:text-sm text-slate-600 max-w-lg mx-auto leading-relaxed">
-              {isRank1
-                ? `You achieved the fastest ${result.score}/${result.totalQuestions} score of the day! Today's prize product dispatch is initiated.`
-                : `You ranked ${result.rank} out of ${result.totalParticipants} contestants and qualified for the UPI Cashback reward!`}
-            </p>
-          )}
 
           {/* Metric Cards Grid - pure white card background with subtle light borders */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 max-w-2xl mx-auto pt-3">
@@ -151,7 +318,7 @@ export const QuizResult: React.FC<QuizResultProps> = ({
             >
               <div className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Your Score</div>
               <div className="text-2xl font-black mt-0.5" style={{ color: '#3A81F5' }}>
-                {result.score}/{result.totalQuestions}
+                {formattedScore}/{effectiveTotalQuestions}
               </div>
             </div>
 
@@ -208,15 +375,10 @@ export const QuizResult: React.FC<QuizResultProps> = ({
             >
               FAILED
             </span>
-          ) : isRank1 || isTopRunnerUp ? (
-            <span className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200 flex items-center gap-1">
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-              Auto-Settled
-            </span>
           ) : (
             <span 
-              className="text-[10px] font-semibold px-2.5 py-0.5 rounded-full"
-              style={{ color: '#FFFFFF', background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+              className="text-[10px] font-semibold px-2.5 py-0.5 rounded-full text-white shrink-0"
+              style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
             >
               Completed
             </span>
@@ -244,7 +406,7 @@ export const QuizResult: React.FC<QuizResultProps> = ({
               )}
             </div>
           </div>
-        ) : isRank1 ? (
+        ) : isProductWinner ? (
           <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-3.5">
             <div className="flex flex-col sm:flex-row sm:items-center gap-3.5">
               {todayPrize?.imageUrl ? (
@@ -280,33 +442,49 @@ export const QuizResult: React.FC<QuizResultProps> = ({
               </div>
             </div>
           </div>
-        ) : isTopRunnerUp ? (
-          <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
-            <div className="space-y-1">
-              <div className="inline-flex items-center gap-1.5 text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2.5 py-0.5 rounded-full border border-emerald-300">
-                <Smartphone className="w-3.5 h-3.5" />
-                Runner-Up Cashback Qualified
-              </div>
-              <h4 className="text-lg font-black text-slate-900">{result.rewardWon}</h4>
-              <p className="text-xs text-slate-600">
-                Dispatched via automated instant UPI webhook to <code className="text-indigo-700 font-semibold">{result.upiId || 'Registered UPI ID'}</code>
-              </p>
-            </div>
-            <div className="text-right">
-              <div className="text-[10px] text-slate-500">Settlement ID</div>
-              <div className="text-xs font-mono font-bold text-emerald-700">UPI-REF-89472918</div>
-            </div>
-          </div>
-        ) : (
+        ) : isConfirmedWinner ? (
           <div 
-            className="rounded-xl p-4 text-center space-y-1.5 shadow-xs"
+            className="rounded-xl p-4 text-center font-bold text-sm sm:text-base shadow-xs"
+            style={{ backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', color: '#059669' }}
+          >
+            Congratulations, You Won <span style={{ color: '#059669' }}>₹{actualCreditedPrize}</span>
+          </div>
+
+        ) : (!isSettled && !result.securityBreached && provisionalPrize > 0) ? (
+          <div 
+            className="rounded-xl p-4 text-center shadow-xs"
             style={{ backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0' }}
           >
-            <p className="text-xs sm:text-sm font-semibold text-slate-800 leading-normal">
-              Your Rank: {result.rank} | Keep Improving, Keep Winning!
+            <p className="text-xs sm:text-sm leading-relaxed">
+              <span className="font-bold" style={{ color: '#059669' }}>
+                Congratulations! Your Current Provisional Prize Is <span style={{ color: '#059669' }}>₹{provisionalPrize}</span>. 
+              </span>
+              <span className="font-medium" style={{ color: '#334155' }}>
+                {payoutMessage}
+              </span>
             </p>
           </div>
-        )}
+
+        ) : (!isSettled && !result.securityBreached) ? (
+          <div 
+            className="rounded-xl p-4 text-center space-y-1 shadow-xs"
+            style={{ backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0' }}
+          >
+            <p className="text-xs sm:text-sm font-semibold text-slate-700 leading-normal">
+              Contest in progress · Final result & settlement pending
+            </p>
+          </div>
+
+        ) : (isConfirmedNonWinner || isSettled) ? (
+          <div 
+            className="rounded-xl p-4 text-center space-y-1 shadow-xs"
+            style={{ backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0' }}
+          >
+            <p className="text-xs sm:text-sm font-semibold text-slate-700 leading-normal">
+              Contest Settled · Better Luck Next Time!
+            </p>
+          </div>
+        ) : null}
 
         {/* Action Buttons */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
@@ -319,22 +497,6 @@ export const QuizResult: React.FC<QuizResultProps> = ({
             >
               {copiedLink ? <CheckCircle2 className="w-4 h-4 text-white" /> : <Share2 className="w-4 h-4 text-white" />}
               <span>{copiedLink ? 'Score Shared / Copied!' : 'Share your Score'}</span>
-            </button>
-
-            <button
-              id="rejoin-contest-btn"
-              onClick={() => {
-                soundFx.playClick();
-                if (onRejoinContest) {
-                  onRejoinContest();
-                } else {
-                  onRetakeOrHome();
-                }
-              }}
-              className="px-4 py-2.5 rounded-xl text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-300 font-bold text-xs flex items-center gap-1.5 shadow-2xs active:scale-98 cursor-pointer transition-all"
-            >
-              <RotateCcw className="w-3.5 h-3.5 text-amber-700" />
-              <span>Re-join Contest</span>
             </button>
           </div>
 
@@ -370,9 +532,10 @@ export const QuizResult: React.FC<QuizResultProps> = ({
 
         {showDetailedReview && (
           <div className="space-y-3 pt-1">
-            {(questions || []).filter(q => q && q.id != null).map((q, idx) => {
+            {((result.questions && result.questions.length > 0 ? result.questions : questions) || []).filter(q => q && q.id != null).map((q, idx) => {
+              const correctIdx = getQuestionCorrectIndex(q);
               const userAnsIndex = result.answers[q.id];
-              const isCorrect = userAnsIndex === q.correctIndex;
+              const isCorrect = userAnsIndex === correctIdx;
               const isUnanswered = userAnsIndex === undefined;
 
               return (
@@ -408,7 +571,7 @@ export const QuizResult: React.FC<QuizResultProps> = ({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                     {q.options.map((opt, optIdx) => {
                       const isSelected = userAnsIndex === optIdx;
-                      const isActualCorrect = optIdx === q.correctIndex;
+                      const isActualCorrect = optIdx === correctIdx;
 
                       let optBorderAndText = 'border-slate-200 text-slate-700';
                       let optBg = '#FFFFFF';

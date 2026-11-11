@@ -117,10 +117,13 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
 
   // Filter user's specific deposits and withdrawals strictly by logged-in user's exact Email Address
   const currentUserEmail = (userProfile.email || '').trim().toLowerCase();
+  const currentUid = userProfile.uid || userProfile.id || '';
 
   const rawUserDeposits = useMemo(() => {
     const belongsToCurrentUser = (d: DepositRequest) => {
-      if (!d || !currentUserEmail) return false;
+      if (!d) return false;
+      if (currentUid && (d.ownerUid === currentUid || d.userId === currentUid)) return true;
+      if (!currentUserEmail) return false;
       const dEmail = (d.userEmail || d.email || '').trim().toLowerCase();
       if (!dEmail) return false;
       return dEmail === currentUserEmail;
@@ -140,7 +143,7 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
       }
     } catch {}
 
-    // 2. Filter matching deposits from live props strictly by email
+    // 2. Filter matching deposits from live props strictly by email or ownerUid
     const matchingFromProps = (deposits || []).filter(belongsToCurrentUser);
 
     // 3. Merge both sets, prioritizing latest status and ensuring no user transaction is ever lost
@@ -162,8 +165,10 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
           ...existing,
           ...item,
           id: normId,
-          userEmail: currentUserEmail,
-          email: currentUserEmail,
+          userEmail: currentUserEmail || item.userEmail || item.email,
+          email: currentUserEmail || item.userEmail || item.email,
+          ownerUid: currentUid || item.ownerUid,
+          userId: currentUid || item.userId,
           status: resolvedStatus
         });
       }
@@ -172,11 +177,11 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
     return Array.from(map.values()).map((d, idx) => ({
       ...d,
       id: formatDepositId(d.id, idx + 1),
-      userEmail: currentUserEmail,
-      email: currentUserEmail,
+      userEmail: currentUserEmail || d.userEmail || d.email,
+      email: currentUserEmail || d.userEmail || d.email,
       timestamp: formatDepositTimestamp(d.timestamp, (d as any).createdAt, (d as any).date)
     }));
-  }, [deposits, currentUserEmail, syncTick]);
+  }, [deposits, currentUserEmail, currentUid, syncTick]);
 
   const rawUserWithdrawals = useMemo(() => {
     const isBuggedDemoWithdrawal = (w: WithdrawalRequest) => {
@@ -192,7 +197,9 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
     };
 
     const belongsToCurrentUser = (w: WithdrawalRequest) => {
-      if (!w || isBuggedDemoWithdrawal(w) || !currentUserEmail) return false;
+      if (!w || isBuggedDemoWithdrawal(w)) return false;
+      if (currentUid && (w.ownerUid === currentUid || w.userId === currentUid)) return true;
+      if (!currentUserEmail) return false;
       const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
       if (!wEmail) return false;
       return wEmail === currentUserEmail;
@@ -481,6 +488,7 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
                 const timestamp = formatDepositTimestamp(dep.timestamp, (dep as any).createdAt, (dep as any).date);
                 const isSuccess = dep.status === 'approved';
                 const isRejected = dep.status === 'rejected';
+                const isCancelled = dep.status === 'cancelled';
 
                 return (
                   <div
@@ -512,11 +520,11 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
                       <span className={`px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wider select-none ${
                         isSuccess
                           ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                          : isRejected
+                          : (isRejected || isCancelled)
                           ? 'bg-rose-100 text-rose-800 border border-rose-200'
                           : 'bg-amber-100 text-amber-900 border border-amber-200'
                       }`}>
-                        {isSuccess ? 'SUCCESS' : isRejected ? 'REJECTED' : 'PENDING'}
+                        {isSuccess ? 'SUCCESS' : isRejected ? 'REJECTED' : isCancelled ? 'CANCELLED' : 'PENDING'}
                       </span>
                     </div>
                   </div>

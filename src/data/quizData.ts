@@ -196,8 +196,9 @@ export const INITIAL_LEADERBOARD: LeaderboardEntry[] = [
 ];
 
 export const DEFAULT_USER_PROFILE: UserProfile = {
-  id: 'QK-USR-1001',
-  uid: 'QK-USR-1001',
+  id: '',
+  uid: '',
+  customUserId: '',
   name: 'New Player',
   mobile: '',
   countryCode: '+91',

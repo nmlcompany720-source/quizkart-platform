@@ -3,7 +3,7 @@ import { Navbar } from './components/Navbar';
 import { HeroSection } from './components/HeroSection';
 import { WalletEntryConfirmModal } from './components/WalletEntryConfirmModal';
 import { QuizArena } from './components/QuizArena';
-import { QuizResult } from './components/QuizResult';
+import { QuizResult, PAYOUT_STATUS_OPTIONS } from './components/QuizResult';
 import { LiveLeaderboard } from './components/LiveLeaderboard';
 import { TransparencySection } from './components/TransparencySection';
 import { ProfileWallet } from './components/ProfileWallet';
@@ -48,6 +48,7 @@ import { AnnouncementBar } from './components/AnnouncementBar';
 import { BannerSlider } from './components/BannerSlider';
 import { soundFx } from './utils/audio';
 import { 
+  auth,
   subscribeToAuth, 
   signInWithGoogle, 
   logOutUser, 
@@ -61,8 +62,10 @@ import {
   saveContestToFirestore,
   fetchDepositsFromFirestore,
   saveDepositToFirestore,
+  subscribeToDepositsFromFirestore,
   fetchWithdrawalsFromFirestore,
   saveWithdrawalToFirestore,
+  subscribeToWithdrawalsFromFirestore,
   fetchDepositQrFromFirestore,
   subscribeToUserQuizAttempts,
   fetchQuizTimerFromFirestore,
@@ -74,8 +77,29 @@ import {
   isWithinRetentionWindow,
   saveQuestionToFirestore,
   removeQuestionFromFirestore,
-  updateUserPresenceInFirestore
+  updateUserPresenceInFirestore,
+  assignSequentialUserIdViaTransaction,
+  extractNumericUserNumber,
+  deleteUserProfileFromFirestore,
+  saveContestEntryToFirestore,
+  fetchContestEntriesFromFirestore,
+  subscribeToContestEntriesFromFirestore,
+  fetchAllContestEntriesFromFirestore,
+  saveFinancialLedgerToFirestore,
+  creditWalletForSettlement,
+  updateQuizAttemptPrizeInFirestore,
+  syncUserNameAcrossContestEntriesInFirestore,
+  fetchUserQuizAttemptsFromFirestore,
+  saveLeaderboardEntryToFirestore
 } from './firebase';
+
+import { 
+  contestBackend, 
+  mapEntriesToLeaderboard, 
+  calculateContestPool, 
+  calculateTrustedScore,
+  type ContestEntry 
+} from './backend/contestEngine';
 import { 
   getNextDepositId, 
   getNextWithdrawalId, 
@@ -95,11 +119,14 @@ import {
   getAssignedQuestionsForUser, 
   createRetakeBlockForUser, 
   autoAssignNextBlockToUser,
+  assignNextSequentialBlockOnDemand,
   canonicalizeUserId,
   isOldMockQuestion,
   getUserInitialAssignedQuestions,
   getUserInitialBlockNumber,
-  sanitizeAndEnsureInitialBlockMapping
+  sanitizeAndEnsureInitialBlockMapping,
+  setBlockAssignedUserId,
+  getQuestionCorrectIndex
 } from './utils/questionPoolManager';
 import { User } from 'firebase/auth';
 import { Bell, X } from 'lucide-react';
@@ -257,11 +284,14 @@ export default function App() {
     try {
       localStorage.removeItem('quizkart_is_authenticated');
       localStorage.removeItem('quizkart_profile_manually_saved');
+      localStorage.removeItem('quizkart_last_result');
       localStorage.setItem('quizkart_current_tab', 'home');
       await logOutUser();
     } catch {}
     setIsUserAuthenticated(false);
     setIsEmailChangeMode(false);
+    setLastQuizResult(null);
+    setUserQuizAttempts([]);
     setCurrentTab('home');
     setAuthModalStep(1);
     setIsAuthModalOpen(true);
@@ -316,16 +346,223 @@ export default function App() {
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
-    const activeContests = contests.filter(c => c && c.id && !deletedList.includes(c.id) && c.status === 'active');
+    const nonDeleted = contests.filter(c => c && c.id && !deletedList.includes(c.id) && c.id !== 'CNT-CASH-LIVE' && c.id !== 'CNT-FALLBACK-PLACEHOLDER' && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202');
     if (activeContestId && !deletedList.includes(activeContestId)) {
-      const matched = activeContests.find(c => c.id === activeContestId);
+      const matched = nonDeleted.find(c => c.id === activeContestId);
       if (matched) return matched;
     }
-    return activeContests[0] || null;
+    const liveMatch = nonDeleted.find(c => c.status === 'active');
+    if (liveMatch) return liveMatch;
+    const upcomingMatch = nonDeleted.find(c => c.status === 'scheduled');
+    if (upcomingMatch) return upcomingMatch;
+    // Issue 1: Preserve created contest on website even when expired until Admin explicitly deletes it
+    return nonDeleted[0] || null;
   }, [contests, activeContestId]);
+
+  // Authoritative, Idempotent Winner Settlement for Wallet Credits & Total Won
+  const settleAndDisburseContest = useCallback((contestId: string) => {
+    if (!contestId) return;
+    try {
+      const allEntries = contestBackend.getContestEntries(contestId);
+      const activeEntries = allEntries.filter(e => e.isActive && e.isValid && e.status === 'active');
+
+      let disbursements: { ownerUid: string; entryId: string; rank: number; prizeRupees: number }[] = [];
+
+      if (!contestBackend.isContestSettled(contestId)) {
+        const directSettle = contestBackend.settleContest(contestId);
+        disbursements = directSettle.disbursements || [];
+      } else {
+        disbursements = contestBackend.getContestDisbursements(contestId);
+      }
+
+      if (disbursements.length === 0) {
+        const payoutLedgers = contestBackend.getFinancialLedgers(contestId).filter(l => l.type === 'PRIZE_PAYOUT');
+        disbursements = payoutLedgers.map(p => ({
+          ownerUid: p.ownerUid,
+          entryId: p.entryId,
+          rank: (allEntries.find(e => e.entryId === p.entryId)?.rank) || 1,
+          prizeRupees: p.amountRupees
+        }));
+      }
+
+      const currentProfile = (() => {
+        try {
+          const p = localStorage.getItem('quizkart_user_profile');
+          return p ? JSON.parse(p) : null;
+        } catch {
+          return null;
+        }
+      })();
+
+      const currentUid = auth.currentUser?.uid || currentProfile?.uid || currentProfile?.id || currentProfile?.customUserId;
+      const currentEmail = (currentProfile?.email || auth.currentUser?.email || '').trim().toLowerCase();
+      const userEmailOwnerUid = currentEmail ? `usr-${currentEmail.replace(/[^a-zA-Z0-9]/g, '_')}` : '';
+
+      const attemptsToCheck = (() => {
+        try {
+          const s = localStorage.getItem('quizkart_user_quiz_attempts');
+          return s ? JSON.parse(s) : [];
+        } catch {
+          return [];
+        }
+      })();
+
+      // 1. Process winning disbursements
+      if (disbursements && disbursements.length > 0) {
+        for (const disb of disbursements) {
+          const isUser = 
+            disb.ownerUid === currentProfile?.uid || 
+            disb.ownerUid === currentProfile?.id || 
+            disb.ownerUid === currentProfile?.customUserId ||
+            disb.ownerUid === auth.currentUser?.uid ||
+            (userEmailOwnerUid && disb.ownerUid === userEmailOwnerUid) ||
+            (currentEmail && disb.ownerUid.replace(/^usr-/, '').toLowerCase() === currentEmail.replace(/[^a-zA-Z0-9_-]/g, '_')) ||
+            attemptsToCheck.some((att: any) => att && (
+              (att.entryId && att.entryId === disb.entryId) ||
+              (att.ownerUid && att.ownerUid === disb.ownerUid) ||
+              (att.userId && att.userId === disb.ownerUid) ||
+              (userEmailOwnerUid && att.ownerUid === userEmailOwnerUid)
+            ));
+
+          if (isUser && disb.prizeRupees > 0) {
+            // Strict Idempotency Guard: prevent duplicate wallet crediting locally
+            const creditLedgerKey = `quizkart_settlement_wallet_credited_${contestId}_${disb.entryId || disb.ownerUid}`;
+            const alreadyCreditedLocally = localStorage.getItem(creditLedgerKey) === 'true';
+
+            setUserProfile(prev => {
+              const currentWon = Number(prev.totalWonAmount) || 0;
+              const currentBal = Number(prev.walletBalance) || 0;
+              // If already credited locally AND wallet already contains at least this prize, do not double-add
+              if (alreadyCreditedLocally && currentWon >= disb.prizeRupees) {
+                return prev;
+              }
+
+              try {
+                localStorage.setItem(creditLedgerKey, 'true');
+              } catch {}
+
+              const newBal = currentBal + disb.prizeRupees;
+              const newWon = currentWon + disb.prizeRupees;
+              const updated = {
+                ...prev,
+                walletBalance: newBal,
+                totalWonAmount: newWon
+              };
+              try {
+                localStorage.setItem('quizkart_user_profile', JSON.stringify(updated));
+              } catch {}
+              syncUserProfile(updated).catch(() => {});
+
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(new Event('quizkart_profile_updated'));
+                window.dispatchEvent(new CustomEvent('quizkart_wallet_updated', { 
+                  detail: { contestId, addedAmount: disb.prizeRupees } 
+                }));
+              }
+              return updated;
+            });
+
+            // Idempotent wallet credit in Firestore
+            creditWalletForSettlement(disb.ownerUid, disb.prizeRupees, contestId, currentProfile?.id, currentEmail).catch(() => {});
+
+            // Sync attempt prize to Firestore for winner using contestId, ownerUid and entryId
+            updateQuizAttemptPrizeInFirestore(contestId, disb.ownerUid, disb.prizeRupees, disb.rank, disb.entryId, currentProfile?.id, currentEmail).catch(() => {});
+          }
+        }
+      }
+
+      // 2. Process non-winning active entries (set to ₹0)
+      for (const entry of activeEntries) {
+        const isWinner = disbursements.some(d => (entry.entryId && d.entryId === entry.entryId) || d.ownerUid === entry.ownerUid);
+        if (!isWinner && !entry.ownerUid.startsWith('demo-') && !entry.ownerUid.startsWith('seed-')) {
+          updateQuizAttemptPrizeInFirestore(contestId, entry.ownerUid, 0, entry.rank, entry.entryId, currentProfile?.id, entry.userEmail).catch(() => {});
+        }
+      }
+
+      // 3. Update all contest attempts in state and localStorage
+      setUserQuizAttempts(prev => {
+        const updated = prev.map(att => {
+          const matchesContest = att.contestId === contestId || att.attemptId.includes(contestId);
+          if (matchesContest) {
+            const matchingDisb = disbursements.find(d => 
+              (att.entryId && d.entryId === att.entryId) ||
+              d.ownerUid === att.ownerUid || 
+              d.ownerUid === att.userId ||
+              (userEmailOwnerUid && d.ownerUid === userEmailOwnerUid)
+            );
+            const prize = matchingDisb ? matchingDisb.prizeRupees : 0;
+            const rank = matchingDisb ? matchingDisb.rank : (att.rank || 1);
+            const settledAtt: QuizAttemptResult = {
+              ...att,
+              rank,
+              rewardAmount: prize,
+              finalPrizeRupees: prize,
+              rewardWon: prize > 0 ? `₹${prize} Won` : 'Better Luck Next Time',
+              settlementStatus: 'settled' as const
+            };
+            recordQuizAttemptInFirestore(settledAtt).catch(() => {});
+            return settledAtt;
+          }
+          return att;
+        });
+
+        try {
+          localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(updated));
+          if (currentProfile?.email) {
+            localStorage.setItem(`quizkart_user_quiz_attempts_${currentProfile.email.toLowerCase()}`, JSON.stringify(updated));
+          }
+        } catch {}
+
+        return updated;
+      });
+
+      // Update lastQuizResult if it matches settled contest
+      setLastQuizResult(prev => {
+        if (prev && (prev.contestId === contestId || prev.attemptId.includes(contestId))) {
+          const matchingDisb = disbursements.find(d => 
+            (prev.entryId && d.entryId === prev.entryId) ||
+            d.ownerUid === prev.ownerUid || 
+            d.ownerUid === prev.userId ||
+            (userEmailOwnerUid && d.ownerUid === userEmailOwnerUid)
+          );
+          const prize = matchingDisb ? matchingDisb.prizeRupees : 0;
+          const rank = matchingDisb ? matchingDisb.rank : (prev.rank || 1);
+          const updatedResult: QuizAttemptResult = {
+            ...prev,
+            rank,
+            rewardAmount: prize,
+            finalPrizeRupees: prize,
+            rewardWon: prize > 0 ? `₹${prize} Won` : 'Better Luck Next Time',
+            settlementStatus: 'settled' as const
+          };
+          try {
+            localStorage.setItem('quizkart_last_result', JSON.stringify(updatedResult));
+          } catch {}
+          return updatedResult;
+        }
+        return prev;
+      });
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('quizkart_attempts_updated'));
+      }
+
+      // 4. Save audit payout ledgers to Firestore
+      const allLedgers = contestBackend.getFinancialLedgers(contestId);
+      const payoutLedgers = allLedgers.filter(l => l.type === 'PRIZE_PAYOUT');
+      for (const pl of payoutLedgers) {
+        saveFinancialLedgerToFirestore(pl).catch(() => {});
+      }
+    } catch (err) {
+      console.warn('Contest settlement execution notice:', err);
+    }
+  }, []);
 
   // Immediate permanent deletion handler to synchronize front-end and storage
   const handleDeleteContest = useCallback((contestId: string) => {
+    // 1. FIRST finalize contest using current valid ranking and settle winner's prize (Req 4)
+    settleAndDisburseContest(contestId);
+
     try {
       const deletedList: string[] = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
       if (!deletedList.includes(contestId)) {
@@ -375,8 +612,25 @@ export default function App() {
 
       if (nextActiveId) {
         setActiveContestId(nextActiveId);
+        const nextEntries = contestBackend.getActiveEntries(nextActiveId);
+        const currUid = auth.currentUser?.uid || (() => { try { const p = localStorage.getItem('quizkart_user_profile'); return p ? (JSON.parse(p)?.uid || JSON.parse(p)?.id) : undefined; } catch { return undefined; } })();
+        const mapped = nextEntries.length > 0 
+          ? contestBackend.getLeaderboard(nextActiveId, currUid)
+          : [];
+        setLeaderboard(mapped);
+        setRealActiveParticipants(mapped.length);
+        try {
+          localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
+          localStorage.setItem('quizkart_real_active_participants', String(mapped.length));
+        } catch {}
       } else if (activeContestId === contestId) {
         setActiveContestId(null);
+        setLeaderboard([]);
+        setRealActiveParticipants(0);
+        try {
+          localStorage.setItem('quizkart_leaderboard', JSON.stringify([]));
+          localStorage.setItem('quizkart_real_active_participants', '0');
+        } catch {}
       }
 
       return updatedList;
@@ -481,6 +735,24 @@ export default function App() {
               } catch {}
               return merged;
             });
+
+            // Ensure activeContestId is initialized if currently empty
+            setActiveContestId(curr => {
+              if (curr && !deletedList.includes(curr)) {
+                return curr;
+              }
+              const active = validCloud.find((c: any) => c.status === 'active') ||
+                             validCloud.find((c: any) => c.status === 'scheduled') ||
+                             validCloud[0];
+              if (active) {
+                try {
+                  localStorage.setItem('quizkart_active_contest_id', active.id);
+                  localStorage.setItem('quizkart_current_active_contest', JSON.stringify(active));
+                } catch {}
+                return active.id;
+              }
+              return curr;
+            });
           }
         }
       } catch (err) {
@@ -533,6 +805,9 @@ export default function App() {
   // Front-End Website & Contest Sync & Auto-Rotation Logic:
   // When an active tournament ends (00:00:00), immediately auto-promote next queued upcoming contest into LIVE NOW
   const handleContestExpired = useCallback((expiredContestId: string) => {
+    // 1. Authoritative final settlement upon timer expiry (Req 4)
+    settleAndDisburseContest(expiredContestId);
+
     setContests(prev => {
       const contestToExpire = prev.find(c => c.id === expiredContestId);
       if (!contestToExpire || contestToExpire.status === 'completed') {
@@ -566,7 +841,16 @@ export default function App() {
 
         setTimeout(() => {
           setActiveContestId(nextToPromote.id);
+          const nextEntries = contestBackend.getActiveEntries(nextToPromote.id);
+          const currUid = auth.currentUser?.uid || (() => { try { const p = localStorage.getItem('quizkart_user_profile'); return p ? (JSON.parse(p)?.uid || JSON.parse(p)?.id) : undefined; } catch { return undefined; } })();
+          const mapped = nextEntries.length > 0 
+            ? contestBackend.getLeaderboard(nextToPromote.id, currUid)
+            : [];
+          setLeaderboard(mapped);
+          setRealActiveParticipants(mapped.length);
           try {
+            localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
+            localStorage.setItem('quizkart_real_active_participants', String(mapped.length));
             localStorage.setItem('quizkart_active_contest_id', nextToPromote.id);
             localStorage.setItem('quizkart_active_contests', JSON.stringify(withPromoted));
             localStorage.setItem('quizkart_current_active_contest', JSON.stringify(nextToPromote));
@@ -581,11 +865,19 @@ export default function App() {
         return withPromoted;
       } else {
         setTimeout(() => {
-          setActiveContestId(null);
+          // ISSUE 1 FIX: Contest persistence — do NOT nullify activeContestId or wipe the leaderboard!
+          // Keep expiredContestId active so the website continues displaying the expired contest and its final standings/winners!
+          setActiveContestId(expiredContestId);
           try {
-            localStorage.setItem('quizkart_active_contest_id', '');
+            localStorage.setItem('quizkart_active_contest_id', expiredContestId);
             localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
-            localStorage.removeItem('quizkart_current_active_contest');
+            const expiredContest = updated.find(c => c.id === expiredContestId);
+            if (expiredContest) {
+              localStorage.setItem('quizkart_current_active_contest', JSON.stringify(expiredContest));
+              if (!isFirestoreQuotaExceeded()) {
+                saveContestToFirestore(expiredContest).catch(() => {});
+              }
+            }
           } catch {}
         }, 0);
 
@@ -599,10 +891,12 @@ export default function App() {
     const syncContests = () => {
       const now = Date.now();
       setContests(prev => {
-        // 1. Check if an active contest's endTime has expired (00:00:00 reached)
+        // 1. Check if an active contest's endTime has expired or is 1 minute before completion (delayed payout trigger)
         const currentActive = prev.find(c => c.status === 'active');
         if (currentActive && currentActive.endTime) {
           const endMs = parseTargetTimestamp(currentActive.endTime);
+          const remainingMs = endMs - now;
+
           if (endMs > 0 && now >= endMs) {
             setTimeout(() => {
               handleContestExpired(currentActive.id);
@@ -844,42 +1138,21 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Dynamic check: true if an active or scheduled tournament exists with time remaining
+  // Dynamic check: true if any non-deleted created tournament exists on the website
   const hasRealActiveOrUpcomingContest = useMemo(() => {
     let deletedList: string[] = [];
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
 
-    // 1. Check activeContest pointer
-    if (
-      activeContest &&
-      activeContest.id &&
-      !deletedList.includes(activeContest.id) &&
-      activeContest.status !== 'completed'
-    ) {
-      const timeStr = activeContest.status === 'scheduled'
-        ? (activeContest.scheduledTime || todayPrize.scheduledTime)
-        : (activeContest.endTime || activeContest.scheduledTime || todayPrize.scheduledTime);
-      const target = parseTargetTimestamp(timeStr);
-      const cd = getCountdown(target, nowMs);
-      if (!cd.isFinished) {
-        return true;
-      }
-    }
+    const nonDeleted = (contests || []).filter(c => 
+      c && c.id && !deletedList.includes(c.id) && 
+      c.id !== 'CNT-CASH-LIVE' && c.id !== 'CNT-FALLBACK-PLACEHOLDER' && 
+      c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202'
+    );
 
-    // 2. Check contests list
-    const valid = (contests || []).some(c => {
-      if (!c || !c.id || deletedList.includes(c.id) || c.status === 'completed') {
-        return false;
-      }
-      const timeStr = c.status === 'scheduled' ? c.scheduledTime : (c.endTime || c.scheduledTime);
-      const target = parseTargetTimestamp(timeStr);
-      return getCountdown(target, nowMs).totalSecondsRemaining > 0;
-    });
-
-    return valid;
-  }, [activeContest, contests, nowMs, todayPrize.scheduledTime]);
+    return nonDeleted.length > 0;
+  }, [contests]);
 
   // Track live state reported from HeroSection (guarantees 100% synchronicity with 'Join Now' vs 'Coming Soon' state)
   const [heroReportedLive, setHeroReportedLive] = useState<boolean | null>(null);
@@ -922,7 +1195,19 @@ export default function App() {
 
     if (isRealUpcoming(activeContest)) return activeContest;
     const upcoming = (contests || []).find(isRealUpcoming);
-    return upcoming || null;
+    if (upcoming) return upcoming;
+
+    // ISSUE 1: If contest is expired, keep it visible until explicit Admin deletion!
+    const isRealNonDeleted = (c?: ActiveContest | null) => {
+      if (!c || !c.id) return false;
+      if (deletedList.includes(c.id)) return false;
+      if (c.id === 'CNT-CASH-LIVE' || c.id === 'CNT-FALLBACK-PLACEHOLDER' || c.id === 'CNT-PROD-101' || c.id === 'CNT-CASH-202') return false;
+      return true;
+    };
+
+    if (isRealNonDeleted(activeContest)) return activeContest;
+    const anyContest = (contests || []).find(isRealNonDeleted);
+    return anyContest || null;
   }, [activeContest, contests, nowMs]);
 
   // Check whether the tournament is currently in the pre-contest / 'STARTS IN' state
@@ -948,7 +1233,7 @@ export default function App() {
     }
     if (!currentPrimaryContest) return false;
     if (isCurrentContestUpcoming) return false;
-    if (currentPrimaryContest.status === 'completed') return false;
+    if (currentPrimaryContest.status === 'completed' || currentPrimaryContest.status === 'expired') return false;
     if (currentPrimaryContest.endTime) {
       const endTarget = parseTargetTimestamp(currentPrimaryContest.endTime);
       if (endTarget > 0 && nowMs >= endTarget) return false;
@@ -1056,13 +1341,9 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (parsed && typeof parsed === 'object') {
-          if (parsed.id) {
+          if (parsed.id && /^(?:QK-)?USR-\d+$/i.test(parsed.id)) {
             parsed.id = parsed.id.startsWith('QK-') ? parsed.id : (parsed.id.startsWith('USR-') ? `QK-${parsed.id}` : `QK-USR-${parsed.id}`);
-          } else {
-            parsed.id = 'QK-USR-1001';
-          }
-          if (parsed.uid && !parsed.uid.startsWith('QK-')) {
-            parsed.uid = parsed.id;
+            parsed.customUserId = parsed.customUserId || parsed.id;
           }
           return parsed;
         }
@@ -1073,10 +1354,7 @@ export default function App() {
     }
   });
 
-  // Strictly map User ID only to its assigned questions configured in the Admin Panel
-  const userAssignedQuestions = useMemo(() => {
-    return getAssignedQuestionsForUser(userProfile?.id, quizQuestions);
-  }, [userProfile?.id, quizQuestions]);
+
 
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(() => {
     try {
@@ -1084,15 +1362,22 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          const valid = parsed.filter((e): e is LeaderboardEntry => Boolean(e && e.id != null));
+          const valid = parsed.filter((e): e is LeaderboardEntry => Boolean(e && e.id != null && !e.id.startsWith('lb-') && e.userName !== 'User 1' && e.userName !== 'User 2'));
           if (valid.length > 0) return valid;
         }
       }
-      return INITIAL_LEADERBOARD;
+      const savedActiveContestId = localStorage.getItem('quizkart_active_contest_id') || 'live_round';
+      const initialActive = contestBackend.getActiveEntries(savedActiveContestId);
+      if (initialActive.length > 0) {
+        const mapped = mapEntriesToLeaderboard(initialActive);
+        if (mapped.length > 0) return mapped;
+      }
+      return [];
     } catch {
-      return INITIAL_LEADERBOARD;
+      return [];
     }
   });
+
 
   const [poolData, setPoolData] = useState<PoolEconomics>(() => {
     try {
@@ -1103,15 +1388,111 @@ export default function App() {
     }
   });
 
+  // Persistent Real Joins & Leaderboard synchronization with Firestore in real-time
+  useEffect(() => {
+    const contestId = activeContest?.id;
+    if (!contestId) return;
+
+    const syncEntries = (cloudEntries: ContestEntry[]) => {
+      if (!cloudEntries) return;
+      contestBackend.loadContestEntries(contestId, cloudEntries);
+      const activeList = contestBackend.getActiveEntries(contestId);
+      const feeRupees = activeContest?.entryFee || 100;
+      const poolCalc = contestBackend.getPoolCalculation(contestId, feeRupees);
+      const confirmedCount = poolCalc.confirmedPaidEntries;
+
+      setRealActiveParticipants(confirmedCount);
+      try {
+        localStorage.setItem('quizkart_real_active_participants', String(confirmedCount));
+      } catch {}
+
+      setContests(prev => {
+        let changed = false;
+        const updated = prev.map(c => {
+          if (c.id === contestId) {
+            if (
+              c.realJoins !== confirmedCount ||
+              c.confirmedPaidEntries !== confirmedCount ||
+              c.totalRevenue !== poolCalc.totalRevenueRupees ||
+              c.winnerSlots !== poolCalc.winnerSlots
+            ) {
+              changed = true;
+              return {
+                ...c,
+                realJoins: confirmedCount,
+                confirmedPaidEntries: confirmedCount,
+                totalRevenue: poolCalc.totalRevenueRupees,
+                prizePoolPaise: poolCalc.prizePoolPaise,
+                referralPoolPaise: poolCalc.referralPoolPaise,
+                platformMarginPaise: poolCalc.platformMarginPaise,
+                winnerSlots: poolCalc.winnerSlots
+              };
+            }
+          }
+          return c;
+        });
+        if (changed) {
+          try {
+            localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
+          } catch {}
+          return updated;
+        }
+        return prev;
+      });
+
+      setPoolData(prev => {
+        if (
+          prev.activeParticipants === confirmedCount &&
+          prev.totalPoolAmount === poolCalc.prizePoolRupees
+        ) {
+          return prev;
+        }
+        return {
+          ...prev,
+          activeParticipants: confirmedCount,
+          totalPoolAmount: poolCalc.prizePoolRupees,
+          productPrizeValue: poolCalc.prizePoolRupees
+        };
+      });
+
+      const currUid = auth.currentUser?.uid || userProfile?.uid || userProfile?.id;
+      const mapped = activeList.length > 0
+        ? mapEntriesToLeaderboard(
+            activeList,
+            currUid,
+            activeContest?.type === 'product',
+            todayPrize?.brand,
+            todayPrize?.retailValue
+          )
+        : [];
+      if (mapped.length > 0) {
+        setLeaderboard(mapped);
+        try {
+          localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
+        } catch {}
+      } else {
+        const hasLocalSubmitted = activeList.some(e => e.isSubmitted);
+        if (!hasLocalSubmitted) {
+          setLeaderboard([]);
+          try {
+            localStorage.setItem('quizkart_leaderboard', JSON.stringify([]));
+          } catch {}
+        }
+      }
+    };
+
+    const unsub = subscribeToContestEntriesFromFirestore(contestId, syncEntries);
+    return () => unsub();
+  }, [activeContest?.id, activeContest?.entryFee]);
+
   const [deposits, setDeposits] = useState<DepositRequest[]>(() => {
     try {
-      const deletedDeposits = getDeletedDepositIds();
       const saved = localStorage.getItem('quizkart_admin_deposits');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
           return parsed
-            .filter((d: DepositRequest) => d && d.id && !deletedDeposits.includes(d.id) && !deletedDeposits.includes(formatDepositId(d.id)))
+            .filter((d: DepositRequest) => d && d.id)
             .map((d: DepositRequest, idx: number) => ({
               ...d,
               id: formatDepositId(d.id, idx + 1),
@@ -1120,7 +1501,7 @@ export default function App() {
         }
       }
       return DEFAULT_DEPOSIT_REQUESTS
-        .filter((d) => d && d.id && !deletedDeposits.includes(d.id) && !deletedDeposits.includes(formatDepositId(d.id)))
+        .filter((d) => d && d.id)
         .map((d, idx) => ({
           ...d,
           id: formatDepositId(d.id, idx + 1)
@@ -1193,13 +1574,12 @@ export default function App() {
       } catch {}
 
       try {
-        const deletedDeposits = getDeletedDepositIds();
         const savedD = localStorage.getItem('quizkart_admin_deposits');
         if (savedD) {
           const parsed = JSON.parse(savedD);
           if (Array.isArray(parsed)) {
             setDeposits(
-              parsed.filter((d: DepositRequest) => d && d.id && !deletedDeposits.includes(d.id) && !deletedDeposits.includes(formatDepositId(d.id)))
+              parsed.filter((d: DepositRequest) => d && d.id)
             );
           }
         }
@@ -1259,9 +1639,13 @@ export default function App() {
   const handleAddDeposit = useCallback((newDeposit: Partial<DepositRequest> & { amount: number }) => {
     setDeposits((prev) => {
       const resolvedEmail = (newDeposit.userEmail || newDeposit.email || userProfile.email || '').trim();
+      const depId = newDeposit.id ? formatDepositId(newDeposit.id) : getNextDepositId(prev);
       const fullDeposit: DepositRequest = {
         ...newDeposit,
-        id: newDeposit.id ? formatDepositId(newDeposit.id) : getNextDepositId(prev),
+        id: depId,
+        requestId: newDeposit.requestId || depId,
+        ownerUid: newDeposit.ownerUid || userProfile.uid || userProfile.id || '',
+        userId: newDeposit.userId || userProfile.id || userProfile.uid || '',
         userName: newDeposit.userName || userProfile.name,
         userEmail: resolvedEmail,
         email: resolvedEmail,
@@ -1295,9 +1679,13 @@ export default function App() {
   const handleAddWithdrawal = useCallback((newWithdrawal: Partial<WithdrawalRequest> & { amount: number }) => {
     setWithdrawals((prev) => {
       const resolvedEmail = (newWithdrawal.userEmail || newWithdrawal.email || userProfile.email || '').trim();
+      const wthId = newWithdrawal.id ? formatWithdrawalId(newWithdrawal.id) : getNextWithdrawalId(prev);
       const fullWithdrawal: WithdrawalRequest = {
         ...newWithdrawal,
-        id: newWithdrawal.id ? formatWithdrawalId(newWithdrawal.id) : getNextWithdrawalId(prev),
+        id: wthId,
+        requestId: newWithdrawal.requestId || wthId,
+        ownerUid: newWithdrawal.ownerUid || userProfile.uid || userProfile.id || '',
+        userId: newWithdrawal.userId || userProfile.id || userProfile.uid || '',
         userName: newWithdrawal.userName || userProfile.name,
         userEmail: resolvedEmail,
         email: resolvedEmail,
@@ -1381,34 +1769,45 @@ export default function App() {
     }
   });
 
-  // User's Real-time Quiz Attempts (Live Tournament Records - Strict 30-Day Rolling Retention Window)
+  // User's Real-time Quiz Attempts (Permanent Historical Records in Firestore)
   const [userQuizAttempts, setUserQuizAttempts] = useState<QuizAttemptResult[]>(() => {
     try {
       const saved = localStorage.getItem('quizkart_user_quiz_attempts');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          return parsed.filter(a => a && isWithinRetentionWindow(a.submittedAt));
+          return parsed.filter(a => a && a.attemptId);
         }
       }
     } catch {}
     return [];
   });
 
-  // Subscribe to real-time user quiz attempts from Firestore (Strict 30-Day Retention Window)
+  // Subscribe to real-time user quiz attempts from Firestore permanently
   useEffect(() => {
-    if (!currentUser?.uid) return;
-    const unsubscribe = subscribeToUserQuizAttempts(currentUser.uid, (cloudAttempts) => {
+    const activeTargetUid = currentUser?.uid || userProfile?.uid || userProfile?.id;
+    const activeTargetEmail = (userProfile?.email || currentUser?.email || '').trim().toLowerCase();
+
+    if (!activeTargetUid && !activeTargetEmail) return;
+
+    const identifier = {
+      ownerUid: activeTargetUid,
+      userId: userProfile?.id || activeTargetUid,
+      userEmail: activeTargetEmail || undefined
+    };
+
+    // 1. Initial fetch from Firestore
+    fetchUserQuizAttemptsFromFirestore(identifier).then(cloudAttempts => {
       if (cloudAttempts && cloudAttempts.length > 0) {
         setUserQuizAttempts(prev => {
           const map = new Map<string, QuizAttemptResult>();
           prev.forEach(a => { 
-            if (a && a.attemptId && isWithinRetentionWindow(a.submittedAt)) {
+            if (a && a.attemptId) {
               map.set(a.attemptId, a); 
             }
           });
           cloudAttempts.forEach(a => { 
-            if (a && a.attemptId && isWithinRetentionWindow(a.submittedAt)) {
+            if (a && a.attemptId) {
               map.set(a.attemptId, a); 
             }
           });
@@ -1419,13 +1818,162 @@ export default function App() {
           });
           try {
             localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(merged));
+            if (activeTargetEmail) {
+              localStorage.setItem(`quizkart_user_quiz_attempts_${activeTargetEmail}`, JSON.stringify(merged));
+            }
+          } catch {}
+          return merged;
+        });
+      }
+    }).catch(() => {});
+
+    // 2. Real-time updates subscription
+    const unsubscribe = subscribeToUserQuizAttempts(identifier, (cloudAttempts) => {
+      if (cloudAttempts && cloudAttempts.length > 0) {
+        setUserQuizAttempts(prev => {
+          const map = new Map<string, QuizAttemptResult>();
+          prev.forEach(a => { 
+            if (a && a.attemptId) {
+              map.set(a.attemptId, a); 
+            }
+          });
+          cloudAttempts.forEach(a => { 
+            if (a && a.attemptId) {
+              map.set(a.attemptId, a); 
+            }
+          });
+          const merged = Array.from(map.values()).sort((a, b) => {
+            const timeA = new Date(a.submittedAt || 0).getTime();
+            const timeB = new Date(b.submittedAt || 0).getTime();
+            return timeB - timeA;
+          });
+          try {
+            localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(merged));
+            if (activeTargetEmail) {
+              localStorage.setItem(`quizkart_user_quiz_attempts_${activeTargetEmail}`, JSON.stringify(merged));
+            }
           } catch {}
           return merged;
         });
       }
     });
     return () => unsubscribe();
-  }, [currentUser?.uid]);
+  }, [currentUser?.uid, userProfile?.uid, userProfile?.id, userProfile?.email]);
+
+  // Listen for background settlement updates (Req 4 & 5)
+  useEffect(() => {
+    const handleProfileUpdate = () => {
+      try {
+        const saved = localStorage.getItem('quizkart_user_profile');
+        if (saved) {
+          setUserProfile(JSON.parse(saved));
+        }
+      } catch {}
+    };
+
+    const handleAttemptsUpdate = () => {
+      try {
+        const saved = localStorage.getItem('quizkart_user_quiz_attempts');
+        if (saved) {
+          setUserQuizAttempts(JSON.parse(saved));
+        }
+      } catch {}
+    };
+
+    window.addEventListener('quizkart_profile_updated', handleProfileUpdate);
+    window.addEventListener('quizkart_attempts_updated', handleAttemptsUpdate);
+    return () => {
+      window.removeEventListener('quizkart_profile_updated', handleProfileUpdate);
+      window.removeEventListener('quizkart_attempts_updated', handleAttemptsUpdate);
+    };
+  }, []);
+
+  // Auto-settle any pending attempts for contests that have completed or expired
+  useEffect(() => {
+    const now = Date.now();
+    userQuizAttempts.forEach(att => {
+      if (att && att.contestId && att.settlementStatus !== 'settled') {
+        const contestObj = contests.find(c => c.id === att.contestId);
+        const isEnded = 
+          contestBackend.isContestSettled(att.contestId) ||
+          (contestObj && contestObj.status === 'completed') ||
+          (contestObj?.endTime && parseTargetTimestamp(contestObj.endTime) <= now);
+
+        if (isEnded) {
+          settleAndDisburseContest(att.contestId);
+        }
+      }
+    });
+  }, [contests, userQuizAttempts, settleAndDisburseContest]);
+
+  // Track joined contest IDs per user for dynamic button state (Join Now vs RE - JOIN)
+  const [joinedContestKeys, setJoinedContestKeys] = useState<string[]>(() => {
+    try {
+      const keys: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('quizkart_user_contest_joined_')) {
+          keys.push(k.replace('quizkart_user_contest_joined_', ''));
+        }
+      }
+      return keys;
+    } catch {
+      return [];
+    }
+  });
+
+  // Dynamic attempt-based participation check for currently active competition:
+  // - FIRST ATTEMPT: Returns false ("Join Now") for any newly launched active competition
+  // - SUBSEQUENT ATTEMPTS (RE-JOIN): Returns true ("RE - JOIN") if user has already joined/completed an attempt for that specific active competition
+  // - Resets fresh (false) for every newly created daily/weekly contest
+  const hasUserCompletedCurrentContest = useMemo(() => {
+    if (!isUserAuthenticated || !activeContest?.id || !userProfile?.id) return false;
+    const canonicalUserId = canonicalizeUserId(userProfile.id);
+    const joinKey = `${canonicalUserId}_${activeContest.id}`;
+
+    // 1. User clicked to join / entered arena for this specific active competition
+    if (joinedContestKeys.includes(joinKey)) {
+      return true;
+    }
+    try {
+      if (localStorage.getItem(`quizkart_user_contest_joined_${joinKey}`) === 'true') {
+        return true;
+      }
+    } catch {}
+
+    // 2. User has a recorded attempt result for this specific competition
+    const hasAttempt = userQuizAttempts.some(a => {
+      if (!a) return false;
+      const matchesUser = (a.userId && canonicalizeUserId(a.userId) === canonicalUserId) || a.userName === userProfile.name;
+      if (!matchesUser) return false;
+
+      // Direct match on contest ID
+      if (a.contestId && a.contestId === activeContest.id) return true;
+
+      // Title match within active contest live window
+      if (activeContest.title && a.title === activeContest.title) {
+        if (activeContest.activatedAt) {
+          const actTime = new Date(activeContest.activatedAt).getTime();
+          const subTime = new Date(a.submittedAt || 0).getTime();
+          if (subTime >= actTime - 60000) return true;
+        } else if (activeContest.createdAt) {
+          const createTime = new Date(activeContest.createdAt).getTime();
+          const subTime = new Date(a.submittedAt || 0).getTime();
+          if (subTime >= createTime - 60000) return true;
+        }
+      }
+      return false;
+    });
+
+    return hasAttempt;
+  }, [isUserAuthenticated, activeContest, userProfile, joinedContestKeys, userQuizAttempts]);
+
+  // Strictly map User ID only to its assigned questions configured in the Admin Panel
+  // First Join ("Join Now"): loads designated pre-allocated block (Rule 4)
+  // Re-Join ("RE - JOIN"): loads dynamically allocated unassigned block / dynamic block (Rule 5 & 6)
+  const userAssignedQuestions = useMemo(() => {
+    return getAssignedQuestionsForUser(userProfile?.id, quizQuestions, hasUserCompletedCurrentContest);
+  }, [userProfile?.id, quizQuestions, hasUserCompletedCurrentContest]);
 
   // Save changes to localStorage
   useEffect(() => {
@@ -1464,11 +2012,23 @@ export default function App() {
             ((u.email && u.email.toLowerCase() === userProfile.email.toLowerCase()) ||
               (u.id && userProfile.id && u.id === userProfile.id))
         );
+        const userProfileId = (userProfile.id && /^(?:QK-)?USR-\d+$/i.test(userProfile.id))
+          ? (userProfile.id.startsWith('QK-') ? userProfile.id : `QK-${userProfile.id}`)
+          : (userProfile.customUserId && /^(?:QK-)?USR-\d+$/i.test(userProfile.customUserId))
+          ? (userProfile.customUserId.startsWith('QK-') ? userProfile.customUserId : `QK-${userProfile.customUserId}`)
+          : '';
+        const existingListId = (idx >= 0 && list[idx] && (list[idx].customUserId || list[idx].id))
+          ? (((list[idx].customUserId || list[idx].id)!.startsWith('QK-') ? (list[idx].customUserId || list[idx].id)! : `QK-${list[idx].customUserId || list[idx].id}`))
+          : '';
+        // Prioritize active sequential ID (e.g., QK-USR-1011) over outdated cached list ID (e.g., QK-USR-1009)
+        const resolvedId = userProfileId || existingListId || userProfile.customUserId || userProfile.id || '';
+
         if (idx >= 0) {
           list[idx] = {
             ...list[idx],
             ...userProfile,
-            id: `QK-USR-${1001 + idx}`,
+            id: resolvedId,
+            customUserId: resolvedId,
             registrationDate: list[idx].registrationDate || userProfile.registrationDate || getCurrentFormattedTimestamp(),
             passwordStatus:
               userProfile.passwordStatus && !userProfile.passwordStatus.includes('••••') && !userProfile.passwordStatus.includes('Secured')
@@ -1480,11 +2040,11 @@ export default function App() {
         } else {
           list.push({
             ...userProfile,
-            id: `QK-USR-${1001 + list.length}`
+            id: resolvedId,
+            customUserId: resolvedId
           });
         }
-        const reindexed = list.map((u, i) => ({ ...u, id: `QK-USR-${1001 + i}` }));
-        localStorage.setItem('quizkart_registered_users', JSON.stringify(reindexed));
+        localStorage.setItem('quizkart_registered_users', JSON.stringify(list));
         window.dispatchEvent(new Event('quizkart_users_updated'));
       }
     } catch {}
@@ -1518,66 +2078,67 @@ export default function App() {
 
   // Firebase Auth listener and Cloud Profile synchronization
   useEffect(() => {
-    const resolveCanonicalUserId = (email?: string, fallbackId?: string): string => {
+    const resolveCanonicalUserId = (email?: string, fallbackId?: string): { id: string; userNumber: number } => {
       const cleanEmail = (email || '').trim().toLowerCase();
       try {
         const raw = localStorage.getItem('quizkart_registered_users');
         const parsed: UserProfile[] = raw ? JSON.parse(raw) : [];
         const list = Array.isArray(parsed) ? parsed.filter((u) => u && !isDemoSeedUser(u)) : [];
         if (cleanEmail) {
-          const idx = list.findIndex((u) => u && u.email && u.email.trim().toLowerCase() === cleanEmail);
-          if (idx >= 0) {
-            return `QK-USR-${1001 + idx}`;
+          const match = list.find((u) => u && u.email && u.email.trim().toLowerCase() === cleanEmail);
+          if (match && (match.customUserId || match.id) && /^(?:QK-)?USR-\d+$/i.test(match.customUserId || match.id || '')) {
+            const rawId = (match.customUserId || match.id)!.trim().toUpperCase();
+            const idStr = rawId.startsWith('QK-') ? rawId : `QK-${rawId}`;
+            const num = match.userNumber || extractNumericUserNumber(match);
+            return { id: idStr, userNumber: num < 999999 ? num : 1001 };
           }
         }
       } catch {}
       if (fallbackId && /^(?:QK-)?USR-\d+$/i.test(fallbackId.trim())) {
         const raw = fallbackId.trim().toUpperCase();
-        return raw.startsWith('QK-') ? raw : `QK-${raw}`;
+        const idStr = raw.startsWith('QK-') ? raw : `QK-${raw}`;
+        const match = idStr.match(/(\d+)/);
+        const num = match ? parseInt(match[1], 10) : 1001;
+        return { id: idStr, userNumber: num };
       }
-      return 'QK-USR-1001';
+      return { id: '', userNumber: 0 };
     };
 
     const unsubscribe = subscribeToAuth(async (user) => {
       setCurrentUser(user);
       if (user) {
         try {
-          const manuallySaved = localStorage.getItem('quizkart_profile_manually_saved') === 'true';
           let localSaved: Partial<UserProfile> = {};
           try {
             localSaved = JSON.parse(localStorage.getItem('quizkart_user_profile') || '{}');
           } catch {}
 
-          // If user already manually logged in or registered via AuthModal, preserve their exact profile & ID
-          if (manuallySaved && localSaved && localSaved.email) {
-            const canonicalId = resolveCanonicalUserId(localSaved.email, localSaved.id);
-            if (localSaved.id !== canonicalId) {
-              const syncedLocal = { ...(localSaved as UserProfile), id: canonicalId };
-              setUserProfile(syncedLocal);
-              try {
-                localStorage.setItem('quizkart_user_profile', JSON.stringify(syncedLocal));
-              } catch {}
-            }
-            return;
-          }
+          // 1. Fetch live Firestore user profile from users/{user.uid} as the single source of truth
+          const remoteProfile = await fetchUserProfile(user.uid, user.email || undefined);
 
-          const remoteProfile = await fetchUserProfile(user.uid);
+          if (remoteProfile && (remoteProfile.customUserId || remoteProfile.id) && /^(?:QK-)?USR-\d+$/i.test(remoteProfile.customUserId || remoteProfile.id || '')) {
+            // Existing registered user: strictly lock and preserve their assigned sequential ID from live Firestore!
+            const canonicalId = (remoteProfile.customUserId || remoteProfile.id)!.trim().toUpperCase();
+            const normalizedId = canonicalId.startsWith('QK-') ? canonicalId : `QK-${canonicalId}`;
+            const userNum = remoteProfile.userNumber || extractNumericUserNumber(remoteProfile);
 
-          if (remoteProfile) {
             setUserProfile(prev => {
-              const resolvedEmail = localSaved.email || remoteProfile.email || user.email || prev.email;
-              const canonicalId = resolveCanonicalUserId(resolvedEmail, localSaved.id || remoteProfile.id || prev.id);
+              const resolvedEmail = (remoteProfile.email || user.email || localSaved.email || prev.email || '').trim().toLowerCase();
               const merged: UserProfile = {
                 ...prev,
-                ...remoteProfile,
                 ...localSaved,
-                id: canonicalId,
+                ...remoteProfile,
+                id: normalizedId,
+                customUserId: normalizedId,
+                userNumber: userNum < 999999 ? userNum : (normalizedId.match(/(\d+)/) ? parseInt(normalizedId.match(/(\d+)/)![1], 10) : undefined),
+                uid: user.uid,
                 name: localSaved.name || remoteProfile.name || user.displayName || prev.name,
                 email: resolvedEmail,
                 avatarUrl: localSaved.avatarUrl || remoteProfile.avatarUrl || user.photoURL || prev.avatarUrl,
                 mobile: localSaved.mobile || remoteProfile.mobile || prev.mobile,
                 countryCode: localSaved.countryCode || remoteProfile.countryCode || prev.countryCode || '+91',
-                walletBalance: (localSaved.walletBalance !== undefined) ? localSaved.walletBalance : (remoteProfile.walletBalance ?? prev.walletBalance)
+                walletBalance: (localSaved.walletBalance !== undefined && localSaved.walletBalance > 0) ? localSaved.walletBalance : (remoteProfile.walletBalance ?? prev.walletBalance),
+                isRegistered: true
               };
               try {
                 localStorage.setItem('quizkart_user_profile', JSON.stringify(merged));
@@ -1585,16 +2146,36 @@ export default function App() {
               return merged;
             });
           } else {
-            const resolvedEmail = localSaved.email || user.email || userProfile.email;
-            const canonicalId = resolveCanonicalUserId(resolvedEmail, localSaved.id || userProfile.id);
+            // New user registration via Google Sign-In or user without Firestore ID:
+            // Check if local cache has an authentic, verified ID or if registered users list has it
+            const resolvedEmail = (localSaved.email || user.email || userProfile.email || '').trim().toLowerCase();
+            const existingResolved = resolveCanonicalUserId(resolvedEmail, localSaved.customUserId || localSaved.id);
+
+            let canonicalId = existingResolved.id;
+            let userNum = existingResolved.userNumber;
+
+            if (!canonicalId || !/^(?:QK-)?USR-\d+$/i.test(canonicalId)) {
+              // Execute atomic Firestore transaction to calculate next sequential user number and bind customUserId to their doc
+              const assigned = await assignSequentialUserIdViaTransaction(
+                user.uid,
+                resolvedEmail
+              );
+              canonicalId = assigned.customUserId;
+              userNum = assigned.userNumber;
+            }
+
             const initialSync: UserProfile = {
               ...userProfile,
               ...localSaved,
               id: canonicalId,
+              customUserId: canonicalId,
+              userNumber: userNum,
+              uid: user.uid,
               name: localSaved.name || user.displayName || userProfile.name,
               email: resolvedEmail,
               avatarUrl: localSaved.avatarUrl || user.photoURL || userProfile.avatarUrl,
-              countryCode: localSaved.countryCode || userProfile.countryCode || '+91'
+              countryCode: localSaved.countryCode || userProfile.countryCode || '+91',
+              isRegistered: true
             };
             setUserProfile(initialSync);
             try {
@@ -1637,10 +2218,19 @@ export default function App() {
 
           const merged = Array.from(map.values()).sort((a, b) => Number(a.id) - Number(b.id));
 
-          // If local questions had items not in cloud, sync them to cloud in background
-          for (const q of cleanLocal) {
-            if (!cleanCloud.some(cq => Number(cq.id) === Number(q.id))) {
-              saveQuestionToFirestore(q).catch(() => {});
+          // If local questions had items not in cloud, sync them to cloud in background only if authenticated as admin
+          const currentUser = auth.currentUser;
+          const isAdminUser = Boolean(
+            currentUser && (
+              currentUser.email === 'nmlcompany720@gmail.com' ||
+              localStorage.getItem('quizkart_admin_authenticated') === 'true'
+            )
+          );
+          if (isAdminUser) {
+            for (const q of cleanLocal) {
+              if (!cleanCloud.some(cq => Number(cq.id) === Number(q.id))) {
+                saveQuestionToFirestore(q).catch(() => {});
+              }
             }
           }
 
@@ -1659,89 +2249,139 @@ export default function App() {
       }
 
       try {
-        const cloudLeaderboard = await fetchLeaderboardFromFirestore();
-        if (cloudLeaderboard && cloudLeaderboard.length > 0) {
-          const valid = cloudLeaderboard.filter((e): e is LeaderboardEntry => Boolean(e && e.id != null));
-          if (valid.length > 0) {
-            setLeaderboard(valid);
+        const contestId = activeContestId || activeContest?.id || 'live_round';
+        const cloudEntries = await fetchContestEntriesFromFirestore(contestId);
+        contestBackend.loadContestEntries(contestId, cloudEntries || []);
+        const activeList = contestBackend.getActiveEntries(contestId);
+        const feeRupees = activeContest?.entryFee || 100;
+        const poolCalc = contestBackend.getPoolCalculation(contestId, feeRupees);
+        const confirmedPaidCount = poolCalc.confirmedPaidEntries;
+
+        setRealActiveParticipants(confirmedPaidCount);
+        try {
+          localStorage.setItem('quizkart_real_active_participants', String(confirmedPaidCount));
+        } catch {}
+
+        setContests(prev => {
+          const updated = prev.map(c => {
+            if (c.id === contestId) {
+              return {
+                ...c,
+                realJoins: confirmedPaidCount,
+                confirmedPaidEntries: confirmedPaidCount,
+                totalRevenue: poolCalc.totalRevenueRupees,
+                prizePoolPaise: poolCalc.prizePoolPaise,
+                referralPoolPaise: poolCalc.referralPoolPaise,
+                platformMarginPaise: poolCalc.platformMarginPaise,
+                winnerSlots: poolCalc.winnerSlots
+              };
+            }
+            return c;
+          });
+          try {
+            localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
+          } catch {}
+          return updated;
+        });
+
+        setPoolData(prev => ({
+          ...prev,
+          activeParticipants: confirmedPaidCount,
+          totalPoolAmount: poolCalc.prizePoolRupees,
+          productPrizeValue: poolCalc.prizePoolRupees
+        }));
+
+        if (activeList.length > 0) {
+          const mapped = mapEntriesToLeaderboard(
+            activeList,
+            currentUser?.uid || userProfile?.uid,
+            activeContest?.type === 'product',
+            todayPrize?.brand,
+            todayPrize?.retailValue
+          );
+          if (mapped.length > 0) {
+            setLeaderboard(mapped);
+            try {
+              localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
+            } catch {}
           }
         }
       } catch (err) {
-        console.warn('Firestore leaderboard load notice:', err);
+        console.warn('Firestore contest entries load notice:', err);
       }
 
-      try {
-        const cloudDeposits = await fetchDepositsFromFirestore();
-        if (cloudDeposits && cloudDeposits.length > 0) {
-          const deletedDeposits = getDeletedDepositIds();
-          setDeposits((prev) => {
-            const map = new Map<string, DepositRequest>();
-            cloudDeposits.forEach((d, idx) => { 
-              if (d && d.id) {
-                const normId = formatDepositId(d.id, idx + 1);
-                if (!deletedDeposits.includes(d.id) && !deletedDeposits.includes(normId)) {
+
+      if (auth.currentUser) {
+        try {
+          const cloudDeposits = await fetchDepositsFromFirestore();
+          if (cloudDeposits && cloudDeposits.length > 0) {
+            setDeposits((prev) => {
+              const map = new Map<string, DepositRequest>();
+              cloudDeposits.forEach((d, idx) => { 
+                if (d && d.id) {
+                  const normId = formatDepositId(d.id, idx + 1);
                   map.set(normId, {
                     ...d,
                     id: normId,
                     timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
                   });
-                }
-              } 
+                } 
+              });
+              prev.forEach((d, idx) => { 
+                if (d && d.id) {
+                  const normId = formatDepositId(d.id, idx + 1);
+                  if (!map.has(normId)) {
+                    map.set(normId, {
+                      ...d,
+                      id: normId,
+                      timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
+                    });
+                  }
+                } 
+              });
+              return Array.from(map.values());
             });
-            prev.forEach((d, idx) => { 
-              if (d && d.id) {
-                const normId = formatDepositId(d.id, idx + 1);
-                if (!deletedDeposits.includes(d.id) && !deletedDeposits.includes(normId) && !map.has(normId)) {
-                  map.set(normId, {
-                    ...d,
-                    id: normId,
-                    timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
-                  });
-                }
-              } 
-            });
-            return Array.from(map.values());
-          });
+          }
+        } catch (err) {
+          console.warn('Firestore deposits load notice:', err);
         }
-      } catch (err) {
-        console.warn('Firestore deposits load notice:', err);
-      }
 
-      try {
-        const cloudWithdrawals = await fetchWithdrawalsFromFirestore();
-        if (cloudWithdrawals && cloudWithdrawals.length > 0) {
-          const deletedWithdrawals = getDeletedWithdrawalIds();
-          setWithdrawals((prev) => {
-            const map = new Map<string, WithdrawalRequest>();
-            cloudWithdrawals.forEach((w, idx) => { 
-              if (w && w.id) {
-                const normId = formatWithdrawalId(w.id, idx + 1);
-                if (!deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(normId)) {
-                  map.set(normId, {
-                    ...w,
-                    id: normId,
-                    timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-                  });
-                }
-              } 
+        try {
+          const cloudWithdrawals = await fetchWithdrawalsFromFirestore();
+          if (cloudWithdrawals && cloudWithdrawals.length > 0) {
+            const deletedWithdrawals = getDeletedWithdrawalIds();
+            setWithdrawals((prev) => {
+              const map = new Map<string, WithdrawalRequest>();
+              cloudWithdrawals.forEach((w, idx) => { 
+                if (w && w.id) {
+                  const normId = formatWithdrawalId(w.id, idx + 1);
+                  if (!deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(normId)) {
+                    map.set(normId, {
+                      ...w,
+                      id: normId,
+                      timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+                    });
+                  }
+                } 
+              });
+              prev.forEach((w, idx) => { 
+                if (w && w.id) {
+                  const normId = formatWithdrawalId(w.id, idx + 1);
+                  if (!deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(normId) && !map.has(normId)) {
+                    map.set(normId, {
+                      ...w,
+                      id: normId,
+                      timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+                    });
+                  }
+                } 
+              });
+              return Array.from(map.values());
             });
-            prev.forEach((w, idx) => { 
-              if (w && w.id) {
-                const normId = formatWithdrawalId(w.id, idx + 1);
-                if (!deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(normId) && !map.has(normId)) {
-                  map.set(normId, {
-                    ...w,
-                    id: normId,
-                    timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-                  });
-                }
-              } 
-            });
-            return Array.from(map.values());
-          });
+          }
+        } catch (err) {
+          console.warn('Firestore withdrawals load notice:', err);
         }
-      } catch (err) {
-        console.warn('Firestore withdrawals load notice:', err);
       }
     }
 
@@ -1817,12 +2457,27 @@ export default function App() {
     let updatedProfile: UserProfile;
 
     if (existingMatch) {
-      const matchIdx = existingUsers.indexOf(existingMatch);
-      const canonicalId = `QK-USR-${1001 + (matchIdx >= 0 ? matchIdx : 0)}`;
+      const existingId = existingMatch.customUserId || existingMatch.id || '';
+      const userNum = existingMatch.userNumber || extractNumericUserNumber(existingMatch);
+      let canonicalId = (existingId && /^(?:QK-)?USR-\d+$/i.test(existingId))
+        ? (existingId.startsWith('QK-') ? existingId : `QK-${existingId}`)
+        : (userNum < 999999 ? `QK-USR-${userNum}` : '');
+      let finalUserNumber = userNum < 999999 ? userNum : (canonicalId.match(/(\d+)/) ? parseInt(canonicalId.match(/(\d+)/)![1], 10) : 0);
+
+      if (!canonicalId) {
+        const assigned = await assignSequentialUserIdViaTransaction(
+          currentUser?.uid || existingMatch.uid || '',
+          cleanInputEmail
+        );
+        canonicalId = assigned.customUserId;
+        finalUserNumber = assigned.userNumber;
+      }
       // RETURNING LOGGED-IN USER: Persist and load their actual real-time database state without resetting
       updatedProfile = {
         ...existingMatch,
         id: canonicalId,
+        customUserId: canonicalId,
+        userNumber: finalUserNumber,
         uid: currentUser?.uid || existingMatch.uid || canonicalId,
         name: existingMatch.name || userData.name.trim(),
         mobile: existingMatch.mobile || cleanInputMobile,
@@ -1840,25 +2495,63 @@ export default function App() {
         hasPassword: true
       };
 
-      // Restore returning user's quiz attempts
+      // Restore returning user's quiz attempts strictly isolated by email/ownerUid from localStorage & Firestore
       try {
-        const savedUserAttempts = localStorage.getItem(
-          `quizkart_user_quiz_attempts_${updatedProfile.email.toLowerCase()}_${updatedProfile.name.toLowerCase()}`
-        );
+        const savedUserAttempts = localStorage.getItem(`quizkart_user_quiz_attempts_${cleanInputEmail}`) ||
+          localStorage.getItem(`quizkart_user_quiz_attempts_${updatedProfile.email.toLowerCase()}_${updatedProfile.name.toLowerCase()}`);
         if (savedUserAttempts) {
           const parsedAttempts = JSON.parse(savedUserAttempts);
-          if (Array.isArray(parsedAttempts)) {
+          if (Array.isArray(parsedAttempts) && parsedAttempts.length > 0) {
             setUserQuizAttempts(parsedAttempts);
             localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(parsedAttempts));
+            const lastAtt = parsedAttempts[0];
+            if (lastAtt && (lastAtt.userId === updatedProfile.id || lastAtt.userName === updatedProfile.name)) {
+              setLastQuizResult(lastAtt);
+            }
           }
         }
       } catch {}
+
+      // Always restore user's permanent historical quiz attempts from Firestore
+      const targetIdentifier = {
+        ownerUid: updatedProfile.uid || updatedProfile.id,
+        userId: updatedProfile.id,
+        userEmail: cleanInputEmail
+      };
+      fetchUserQuizAttemptsFromFirestore(targetIdentifier).then(cloudAttempts => {
+        if (cloudAttempts && cloudAttempts.length > 0) {
+          setUserQuizAttempts(prev => {
+            const map = new Map<string, QuizAttemptResult>();
+            prev.forEach(a => { if (a && a.attemptId) map.set(a.attemptId, a); });
+            cloudAttempts.forEach(a => { if (a && a.attemptId) map.set(a.attemptId, a); });
+            const merged = Array.from(map.values()).sort((a, b) => {
+              const timeA = new Date(a.submittedAt || 0).getTime();
+              const timeB = new Date(b.submittedAt || 0).getTime();
+              return timeB - timeA;
+            });
+            try {
+              localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(merged));
+              localStorage.setItem(`quizkart_user_quiz_attempts_${cleanInputEmail}`, JSON.stringify(merged));
+            } catch {}
+            if (merged.length > 0) {
+              setLastQuizResult(merged[0]);
+            }
+            return merged;
+          });
+        }
+      }).catch(() => {});
     } else {
-      // NEW USER REGISTRATION: Sequential ID starting strictly at QK-USR-1001
-      const nextSeqNum = 1001 + existingUsers.length;
-      const sequentialId = `QK-USR-${nextSeqNum}`;
+      // NEW USER REGISTRATION: Permanent sequential ID allocated via Firestore runTransaction()
+      const assigned = await assignSequentialUserIdViaTransaction(
+        currentUser?.uid || '',
+        cleanInputEmail
+      );
+      const sequentialId = assigned.customUserId;
+      const nextSeqNum = assigned.userNumber;
       updatedProfile = {
         id: sequentialId,
+        customUserId: sequentialId,
+        userNumber: nextSeqNum,
         uid: currentUser?.uid || sequentialId,
         name: userData.name.trim(),
         mobile: cleanInputMobile,
@@ -1919,22 +2612,8 @@ export default function App() {
       localStorage.setItem('quizkart_registered_users', JSON.stringify(existingUsers));
     } catch {}
 
-    // NEW USER REGISTRATION AUTO-ASSIGNMENT LOGIC (Requirement 3):
-    // As soon as a NEW user registers, immediately map next available unassigned block (e.g. Block 6)
-    // and label top with new User ID so first test loads those exact 10 questions
-    try {
-      const assignRes = autoAssignNextBlockToUser({
-        userId: updatedProfile.id,
-        allQuestions: quizQuestions,
-        onQuestionsUpdated: setQuizQuestions,
-        onQuestionSavedToFirestore: (q) => saveQuestionToFirestore(q).catch(() => {})
-      });
-      if (assignRes.updatedQuestions.length > 0) {
-        setQuizQuestions(assignRes.updatedQuestions);
-      }
-    } catch (err) {
-      console.warn('Auto block assign on registration error:', err);
-    }
+    // Question blocks are strictly assigned ON-DEMAND upon clicking 'Join Now' or 'Re-join'
+    // No automatic pre-filling on user registration
 
     setCurrentTab('home');
     await syncUserProfile(updatedProfile);
@@ -1983,6 +2662,90 @@ export default function App() {
   // Dedicated profile update handler with synchronous localStorage & cloud persistence
   const handleUpdateProfile = useCallback((updated: UserProfile) => {
     setUserProfile(updated);
+    const ownerUid = auth.currentUser?.uid || updated.uid || updated.id;
+    if (ownerUid) {
+      const modifiedEntries = contestBackend.updateUserProfile(ownerUid, {
+        userName: updated.name,
+        avatarUrl: updated.avatarUrl,
+        city: updated.address?.city,
+        state: updated.address?.state
+      });
+
+      // Synchronize modified active contest entries to Firestore
+      modifiedEntries.forEach(entry => {
+        saveContestEntryToFirestore(entry).catch(() => {});
+      });
+
+      // Synchronize user name in Firestore contest entries & quiz attempts
+      syncUserNameAcrossContestEntriesInFirestore(ownerUid, updated.name).catch(() => {});
+
+      if (activeContestId) {
+        const activeList = contestBackend.getActiveEntries(activeContestId);
+        if (activeList.length > 0) {
+          const refreshed = contestBackend.getLeaderboard(
+            activeContestId,
+            ownerUid,
+            activeContest?.type === 'product',
+            todayPrize?.brand,
+            todayPrize?.retailValue
+          );
+          setLeaderboard(refreshed);
+          try {
+            localStorage.setItem('quizkart_leaderboard', JSON.stringify(refreshed));
+          } catch {}
+        }
+      } else {
+        setLeaderboard(prev => {
+          const refreshed = prev.map(item => {
+            if (item && item.ownerUid === ownerUid) {
+              return { ...item, userName: updated.name, avatar: updated.avatarUrl || item.avatar };
+            }
+            return item;
+          });
+          try {
+            localStorage.setItem('quizkart_leaderboard', JSON.stringify(refreshed));
+          } catch {}
+          return refreshed;
+        });
+      }
+
+      // Synchronize user name in userQuizAttempts state and localStorage
+      setUserQuizAttempts(prev => {
+        const next = prev.map(att => {
+          if (att && (att.ownerUid === ownerUid || att.userId === ownerUid || att.userId === updated.id)) {
+            return {
+              ...att,
+              userName: updated.name
+            };
+          }
+          return att;
+        });
+        try {
+          localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(next));
+          if (updated.email) {
+            localStorage.setItem(`quizkart_user_quiz_attempts_${updated.email.toLowerCase()}`, JSON.stringify(next));
+          }
+        } catch {}
+        return next;
+      });
+
+      // Synchronize user name in lastQuizResult
+      setLastQuizResult(prev => {
+        if (prev && (prev.ownerUid === ownerUid || prev.userId === ownerUid || prev.userId === updated.id)) {
+          const next = { ...prev, userName: updated.name };
+          try {
+            localStorage.setItem('quizkart_last_result', JSON.stringify(next));
+          } catch {}
+          return next;
+        }
+        return prev;
+      });
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('quizkart_profile_updated', { detail: updated }));
+        window.dispatchEvent(new Event('quizkart_attempts_updated'));
+      }
+    }
     try {
       localStorage.setItem('quizkart_user_profile', JSON.stringify(updated));
       localStorage.setItem('quizkart_profile_manually_saved', 'true');
@@ -2003,7 +2766,7 @@ export default function App() {
       }
     } catch {}
     syncUserProfile(updated).catch(err => console.warn('Sync profile error:', err));
-  }, []);
+  }, [activeContestId, activeContest?.type, todayPrize?.brand, todayPrize?.retailValue]);
 
   const lastFirestorePresencePingRef = useRef<number>(0);
 
@@ -2241,70 +3004,137 @@ export default function App() {
       });
     }
 
-    // RE-JOIN / RETAKE CONTEST RANDOMIZATION LOGIC (Requirement 3):
-    // 1. Automatically create a new dedicated 10-question page/block entry in Admin Question Manager labeled with that User ID.
-    // 2. Generate a fresh set of 10 randomized questions drawn from the contest pool.
-    // 3. Strict Unique Randomization Rule: Avoid exact duplicate sequence or selection as prior attempts.
+    // STRICT ON-DEMAND SEQUENTIAL ASSIGNMENT (JOIN/RE-JOIN):
+    // 1. Dynamic Mapping on Action: Map User IDs to question boxes strictly on-demand when a user explicitly clicks "Join Now" or "Re-join".
+    // 2. Sequential Order Allocation: The first user to join/re-join gets the first available box (QK-USR-1001),
+    //    the second gets the next box (QK-USR-1002), and so on, permanently replacing "Unassigned" on that box in strict sequential order.
     const deletedSet = questionPoolManager.getDeletedQuestionIds();
     const cleanPool = quizQuestions.filter(q => q && q.id != null && !deletedSet.has(Number(q.id)) && !isOldMockQuestion(q));
 
     if (cleanPool.length > 0) {
       const canonicalUserId = canonicalizeUserId(userProfile?.id);
-      const userAttemptsCount = userQuizAttempts.filter(
-        a => (a && ((a as any).userId ? canonicalizeUserId((a as any).userId) === canonicalUserId : (a as any).userName === userProfile.name))
-      ).length;
+      const isRetake = hasUserCompletedCurrentContest;
 
-      // FIRST JOIN RULE vs RE-JOIN / RETAKE RULE (Requirement 1):
-      // - FIRST JOIN RULE: If it is the user's first time taking the test (userAttemptsCount === 0),
-      //   the system MUST load their original, pre-allocated initial block (e.g., Box 1) containing
-      //   their designated questions. Do NOT create a new block or assign a secondary block on the very first attempt.
-      // - RE-JOIN / RETAKE RULE: Only when the user completes their first test (userAttemptsCount > 0)
-      //   and explicitly clicks Re-join to take the test a second time, the system should assign the next
-      //   available unassigned block (or generate a new dynamic block if initial blocks are exhausted) mapped to their User ID.
-      const isRetake = userAttemptsCount > 0;
+      const assignResult = assignNextSequentialBlockOnDemand({
+        userId: canonicalUserId,
+        allQuestions: quizQuestions,
+        isRejoin: isRetake,
+        onQuestionsUpdated: setQuizQuestions
+      });
 
-      if (isRetake) {
-        const retakeResult = createRetakeBlockForUser({
-          userId: userProfile?.id,
-          allQuestions: quizQuestions,
-          onQuestionSavedToFirestore: (q) => {
-            saveQuestionToFirestore(q).catch(() => {});
-          }
+      if (assignResult.updatedPool && assignResult.updatedPool.length > 0) {
+        setQuizQuestions(assignResult.updatedPool);
+      }
+    }
+
+    if (!isPracticeMode && activeContest?.id && userProfile?.id) {
+      const canonicalUserId = canonicalizeUserId(userProfile.id);
+      const joinKey = `${canonicalUserId}_${activeContest.id}`;
+      try {
+        localStorage.setItem(`quizkart_user_contest_joined_${joinKey}`, 'true');
+      } catch {}
+      setJoinedContestKeys(prev => prev.includes(joinKey) ? prev : [...prev, joinKey]);
+
+      // QUIZKART BACKEND: Atomic Join & Re-Join Processing (Req 1, 2, 3, 5)
+      try {
+        const contestId = activeContest.id;
+        const ownerUid = auth.currentUser?.uid || userProfile.uid || userProfile.id || (userProfile.email ? `usr-${userProfile.email.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${Date.now()}`);
+        const userEmail = userProfile.email || auth.currentUser?.email || 'player@quizkart.in';
+        const userName = userProfile.name || 'Contestant';
+        const feeRupees = feeToDeduct > 0 ? feeToDeduct : (activeContest.entryFee || 100);
+
+        const joinResult = contestBackend.joinContest({
+          contestId,
+          ownerUid,
+          userEmail,
+          userName,
+          avatarUrl: userProfile.avatarUrl,
+          city: userProfile.address?.city,
+          state: userProfile.address?.state,
+          entryFeeRupees: feeRupees,
+          paymentVerified: true
         });
 
-        if (retakeResult.newQuestions.length > 0) {
-          setQuizQuestions(retakeResult.updatedPool);
-        }
-      } else {
-        // FIRST JOIN RULE: Load original pre-allocated initial block (Box 1)
-        const initialQs = getUserInitialAssignedQuestions(userProfile?.id, quizQuestions);
-        if (initialQs.length === 0) {
-          const assignResult = autoAssignNextBlockToUser({
-            userId: userProfile?.id,
-            allQuestions: quizQuestions,
-            onQuestionsUpdated: setQuizQuestions,
-            onQuestionSavedToFirestore: (q) => {
-              saveQuestionToFirestore(q).catch(() => {});
-            }
-          });
+        // Store active entry ID in session
+        try {
+          sessionStorage.setItem(`quizkart_active_entry_${contestId}_${ownerUid}`, joinResult.entry.entryId);
+        } catch {}
 
-          if (assignResult.updatedQuestions.length > 0) {
-            setQuizQuestions(assignResult.updatedQuestions);
-          }
-        } else {
-          // Strictly anchor active block mapping to the user's initial block
-          const initBlockNum = getUserInitialBlockNumber(userProfile?.id, quizQuestions);
+        // Update realActiveParticipants strictly to confirmed active joins
+        setRealActiveParticipants(joinResult.poolCalculation.confirmedPaidEntries);
+        try {
+          localStorage.setItem('quizkart_real_active_participants', String(joinResult.poolCalculation.confirmedPaidEntries));
+        } catch {}
+
+        // Update active contest state with Real Joins, Prize Pool, Winner Slots, Revenue
+        setContests(prev => {
+          const updated = prev.map(c => {
+            if (c.id === contestId || c.status === 'active') {
+              const confirmedCount = joinResult.poolCalculation.confirmedPaidEntries;
+              const rev = joinResult.poolCalculation.totalRevenueRupees;
+              const targetCap = c.maxParticipants || poolData.targetParticipants || 50;
+              const isNowFull = confirmedCount >= targetCap;
+              return {
+                ...c,
+                realJoins: confirmedCount,
+                totalRevenue: rev,
+                confirmedPaidEntries: confirmedCount,
+                prizePoolPaise: joinResult.poolCalculation.prizePoolPaise,
+                referralPoolPaise: joinResult.poolCalculation.referralPoolPaise,
+                platformMarginPaise: joinResult.poolCalculation.platformMarginPaise,
+                winnerSlots: joinResult.poolCalculation.winnerSlots,
+                cashConfig: c.cashConfig ? {
+                  ...c.cashConfig,
+                  prizePool: joinResult.poolCalculation.prizePoolRupees
+                } : undefined,
+                status: isNowFull ? ('full' as const) : c.status
+              };
+            }
+            return c;
+          });
           try {
-            localStorage.setItem(
-              `quizkart_active_user_assigned_block_${canonicalUserId}`,
-              JSON.stringify({
-                blockNumber: initBlockNum,
-                questionIds: initialQs.map(q => q.id),
-                timestamp: Date.now()
-              })
-            );
+            localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
+          } catch {}
+          if (!isFirestoreQuotaExceeded()) {
+            const joinedContest = updated.find(c => c.id === contestId || c.status === 'active');
+            if (joinedContest) {
+              saveContestToFirestore(joinedContest).catch(() => {});
+            }
+          }
+          return updated;
+        });
+
+        // Update PoolEconomics data
+        setPoolData(prev => ({
+          ...prev,
+          activeParticipants: joinResult.poolCalculation.confirmedPaidEntries,
+          totalPoolAmount: joinResult.poolCalculation.prizePoolRupees,
+          productPrizeValue: joinResult.poolCalculation.prizePoolRupees
+        }));
+
+        // Persist entry and financial audit ledger to Firestore
+        saveContestEntryToFirestore(joinResult.entry).catch(() => {});
+        saveFinancialLedgerToFirestore(joinResult.ledgerRecord).catch(() => {});
+        if (joinResult.replacedEntry) {
+          saveContestEntryToFirestore(joinResult.replacedEntry).catch(() => {});
+        }
+
+        // If re-join, immediately update public leaderboard to invalidate old entry
+        if (joinResult.isRejoin) {
+          const updatedLb = mapEntriesToLeaderboard(
+            joinResult.activeEntries,
+            ownerUid,
+            activeContest.type === 'product',
+            todayPrize?.brand,
+            todayPrize?.retailValue
+          );
+          setLeaderboard(updatedLb);
+          try {
+            localStorage.setItem('quizkart_leaderboard', JSON.stringify(updatedLb));
           } catch {}
         }
+      } catch (backendJoinErr) {
+        console.warn('Backend contest join error notice:', backendJoinErr);
       }
     }
 
@@ -2324,44 +3154,9 @@ export default function App() {
     setIsPracticeMode(practice);
     setLastQuizResult(null);
 
-    // If real quiz, record real-time participant join for Admin
+    // If real quiz and contestBackend wasn't triggered yet, ensure realActiveParticipants is at least 1
     if (!practice) {
-      setRealActiveParticipants(prev => {
-        const next = prev + 1;
-        try {
-          localStorage.setItem('quizkart_real_active_participants', next.toString());
-        } catch {}
-        return next;
-      });
-
-      // Update active contest's realJoins and totalRevenue, persist dynamically to Firestore
-      setContests(prev => {
-        const updated = prev.map(c => {
-          if (c.id === activeContest?.id || c.status === 'active') {
-            const currentJoins = (c.realJoins || 0) + 1;
-            const currentRev = (c.totalRevenue || 0) + (c.entryFee || 100);
-            const targetCap = c.maxParticipants || poolData.targetParticipants || 50;
-            const isNowFull = currentJoins >= targetCap;
-            return {
-              ...c,
-              realJoins: currentJoins,
-              totalRevenue: currentRev,
-              status: isNowFull ? ('full' as const) : c.status
-            };
-          }
-          return c;
-        });
-        try {
-          localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
-        } catch {}
-        if (!isFirestoreQuotaExceeded()) {
-          const joinedContest = updated.find(c => c.id === activeContest?.id || c.status === 'active');
-          if (joinedContest) {
-            saveContestToFirestore(joinedContest).catch(() => {});
-          }
-        }
-        return updated;
-      });
+      setRealActiveParticipants(prev => Math.max(1, prev));
     }
 
     setCurrentTab('quiz_arena');
@@ -2376,10 +3171,8 @@ export default function App() {
     securityBreached?: boolean,
     securityBreachReason?: string
   ) => {
-    // 1. Calculate score with +1.0 for correct, -0.33 for incorrect, 0 for unattempted
-    let calculatedScore = 0;
+    const activeTestQuestions = (userAssignedQuestions || []).filter(q => q && q.id != null);
     if (securityBreached) {
-      calculatedScore = 0;
       try {
         const newViolation = {
           id: `SEC-${Math.floor(1000 + Math.random() * 9000)}`,
@@ -2397,182 +3190,212 @@ export default function App() {
         const parsed = existingLogs ? JSON.parse(existingLogs) : [];
         localStorage.setItem('quizkart_security_logs', JSON.stringify([newViolation, ...parsed]));
       } catch {}
-    } else {
-      (userAssignedQuestions || []).filter(q => q && q.id != null).forEach((q) => {
-        const selected = answers[q.id];
-        if (selected !== undefined) {
-          if (selected === q.correctIndex) {
-            calculatedScore += 1;
-          } else {
-            calculatedScore -= 0.33; // -0.33 negative marking
-          }
-        }
-      });
-      // Floor score at 0 and round to 2 decimal places
-      calculatedScore = Math.max(0, Math.round(calculatedScore * 100) / 100);
     }
 
-    const formatSecs = (secs: number) => {
-      const m = Math.floor(secs / 60);
-      const s = Math.round(secs % 60);
-      return `${m}m ${s.toString().padStart(2, '0')}s`;
-    };
+    // QUIZKART BACKEND: Trusted Backend Submission & Live Ranking (Req 3, 4, 5)
+    const contestId = activeContest?.id || 'live_round';
+    const ownerUid = auth.currentUser?.uid || userProfile.uid || userProfile.id || (userProfile.email ? `usr-${userProfile.email.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${Date.now()}`);
 
-    // 2. Insert into competitive leaderboard (remove existing user entry first if any)
-    const existingClean = (leaderboard || []).filter(e => e && e.id && !e.isCurrentUser && e.userName !== userProfile.name);
-    
-    // Create new entry
-    const newUserEntry: LeaderboardEntry = {
-      id: `user-${Date.now()}`,
-      rank: 1, // temporary
-      userName: userProfile.name || 'You',
-      avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=120&auto=format&fit=crop&q=80',
-      score: calculatedScore,
-      totalQuestions: userAssignedQuestions.length,
+    let activeEntry = contestBackend.getActiveUserEntry(contestId, ownerUid);
+    if (!activeEntry) {
+      const jRes = contestBackend.joinContest({
+        contestId,
+        ownerUid,
+        userEmail: userProfile.email || auth.currentUser?.email || 'player@quizkart.in',
+        userName: userProfile.name || 'Contestant',
+        avatarUrl: userProfile.avatarUrl,
+        city: userProfile.address?.city,
+        state: userProfile.address?.state,
+        entryFeeRupees: activeContest?.entryFee || 100,
+        paymentVerified: true
+      });
+      activeEntry = jRes.entry;
+    }
+
+    const submitResult = contestBackend.submitQuiz({
+      contestId,
+      entryId: activeEntry.entryId,
+      ownerUid,
+      answers,
+      questions: activeTestQuestions,
       timeTakenSeconds,
-      formattedTime: formatSecs(timeTakenSeconds),
-      city: userProfile.address.city || 'Bengaluru',
-      state: userProfile.address.state || 'Karnataka',
-      rewardText: '',
-      rewardType: 'none',
-      isCurrentUser: true,
-      timestamp: 'Just now',
-      submittedAt: 'Today, ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
-
-    // Sort all entries: Score DESC, then TimeTaken ASC
-    const allEntries = [...existingClean, newUserEntry].sort((a, b) => {
-      if (b.score !== a.score) {
-        return b.score - a.score;
-      }
-      return a.timeTakenSeconds - b.timeTakenSeconds;
+      securityBreached,
+      securityBreachReason
     });
 
-    // Assign final dynamic ranks & rewards
-    let userRank = 1;
+    const calculatedScore = submitResult.scoreResult ? submitResult.scoreResult.score : 0;
+    const testTotalQuestions = activeTestQuestions.length > 0 ? activeTestQuestions.length : 10;
+    const isProductContest = activeContest?.type === 'product';
+
+    const rankedLeaderboard = mapEntriesToLeaderboard(
+      submitResult.rankedEntries || [],
+      ownerUid,
+      isProductContest,
+      todayPrize?.brand,
+      todayPrize?.retailValue
+    );
+
+    setLeaderboard(rankedLeaderboard);
+    try {
+      localStorage.setItem('quizkart_leaderboard', JSON.stringify(rankedLeaderboard));
+    } catch {}
+
+    // Update contest live metrics
+    if (submitResult.poolCalculation) {
+      setContests(prev => prev.map(c => {
+        if (c.id === contestId || c.status === 'active') {
+          return {
+            ...c,
+            realJoins: submitResult.poolCalculation!.confirmedPaidEntries,
+            confirmedPaidEntries: submitResult.poolCalculation!.confirmedPaidEntries,
+            prizePoolPaise: submitResult.poolCalculation!.prizePoolPaise,
+            referralPoolPaise: submitResult.poolCalculation!.referralPoolPaise,
+            platformMarginPaise: submitResult.poolCalculation!.platformMarginPaise,
+            winnerSlots: submitResult.poolCalculation!.winnerSlots,
+            cashConfig: c.cashConfig ? {
+              ...c.cashConfig,
+              prizePool: submitResult.poolCalculation!.prizePoolRupees
+            } : undefined
+          };
+        }
+        return c;
+      }));
+    }
+
+    if (submitResult.entry) {
+      saveContestEntryToFirestore(submitResult.entry).catch(() => {});
+    }
+
+    // Save authoritative leaderboard entries to Firestore
+    rankedLeaderboard.forEach(lbEntry => {
+      saveLeaderboardEntryToFirestore(lbEntry).catch(() => {});
+    });
+
+    const userRank = submitResult.entry?.rank || 1;
+    const prizeRupees = submitResult.entry?.projectedPrizeRupees || 0;
     let rewardWonText = 'Consolation Certificate';
     let rewardType: 'product' | 'cashback' | 'none' = 'none';
     let rewardAmount = 0;
 
-    const rankedLeaderboard: LeaderboardEntry[] = allEntries.map((entry, idx) => {
-      const rank = idx + 1;
-      let rewardText = 'Consolation Certificate';
-      let rType: 'product' | 'cashback' | 'none' = 'none';
-      let rAmt = 0;
-
-      if (rank === 1) {
-        rewardText = `🎁 ${todayPrize.brand} Smartwatch (${entry.city})`;
-        rType = 'product';
-        rAmt = todayPrize.retailValue;
-      } else if (rank === 2) {
-        rewardText = '₹1,000 UPI Cashback';
-        rType = 'cashback';
-        rAmt = 1000;
-      } else if (rank === 3) {
-        rewardText = '₹600 UPI Cashback';
-        rType = 'cashback';
-        rAmt = 600;
-      } else if (rank === 4) {
-        rewardText = '₹400 UPI Cashback';
-        rType = 'cashback';
-        rAmt = 400;
-      } else if (rank === 5) {
-        rewardText = '₹300 UPI Cashback';
-        rType = 'cashback';
-        rAmt = 300;
-      } else if (rank === 6) {
-        rewardText = '₹200 UPI Cashback';
-        rType = 'cashback';
-        rAmt = 200;
-      } else if (rank <= 8) {
-        rewardText = '₹150 UPI Cashback';
-        rType = 'cashback';
-        rAmt = 150;
-      } else if (rank <= 10) {
-        rewardText = '₹100 UPI Refund';
-        rType = 'cashback';
-        rAmt = 100;
+    if (securityBreached) {
+      rewardWonText = 'Disqualified (Violation)';
+      rewardType = 'none';
+      rewardAmount = 0;
+    } else if (prizeRupees > 0) {
+      if (userRank === 1 && isProductContest) {
+        rewardWonText = `🎁 ${todayPrize?.brand || 'Premium'} Smartwatch`;
+        rewardType = 'product';
+        rewardAmount = todayPrize?.retailValue || 2999;
+      } else {
+        rewardWonText = `₹${prizeRupees} Cashback`;
+        rewardType = 'cashback';
+        rewardAmount = prizeRupees;
       }
-
-      if (entry.isCurrentUser) {
-        userRank = rank;
-        if (securityBreached) {
-          rewardWonText = 'Disqualified (Violation)';
-          rewardType = 'none';
-          rewardAmount = 0;
-        } else {
-          rewardWonText = rewardText;
-          rewardType = rType;
-          rewardAmount = rAmt;
-        }
-      }
-
-      return {
-        ...entry,
-        rank,
-        rewardText: (entry.isCurrentUser && securityBreached) ? 'Disqualified (Violation)' : rewardText,
-        rewardType: (entry.isCurrentUser && securityBreached) ? 'none' : rType,
-        rewardAmount: (entry.isCurrentUser && securityBreached) ? 0 : rAmt,
-        securityBreached: entry.isCurrentUser ? securityBreached : false
-      };
-    });
-
-    setLeaderboard(rankedLeaderboard);
+    }
 
     const canonicalUserId = canonicalizeUserId(userProfile?.id);
+    const attemptQuestions = [...userAssignedQuestions];
 
-    // 3. Build Result Object
+    // 3. Build Result Object with strictly bounded ranks (maxRank strictly equals total real joins)
+    const totalParticipants = submitResult.poolCalculation?.confirmedPaidEntries || rankedLeaderboard.length || 1;
+    const finalRank = Math.min(userRank, totalParticipants);
+    const resolvedOwnerUid = userProfile.uid || currentUser?.uid || canonicalUserId;
+    const resolvedUserEmail = (userProfile.email || '').trim().toLowerCase();
+
+    const isContestSettled = contestBackend.isContestSettled(activeContest?.id || '');
+
+    // Select one random professional ongoing message upon quiz submission
+    const randomOptionIndex = Math.floor(Math.random() * PAYOUT_STATUS_OPTIONS.length);
+    const selectedPayoutMessage = PAYOUT_STATUS_OPTIONS[randomOptionIndex];
+
     const attemptResult: QuizAttemptResult = {
       attemptId: `att-${Date.now()}`,
+      entryId: activeEntry.entryId,
       userId: canonicalUserId,
+      ownerUid: resolvedOwnerUid,
+      userEmail: resolvedUserEmail,
       userName: userProfile.name,
       quizDate: new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
       score: calculatedScore,
-      totalQuestions: quizQuestions.length,
-      timeTakenSeconds,
+      totalQuestions: testTotalQuestions,
+      timeTakenSeconds: Math.round(timeTakenSeconds),
       answers,
       markedForReview,
-      rank: userRank,
-      totalParticipants: rankedLeaderboard.length,
-      rewardWon: rewardWonText,
+      rank: finalRank,
+      totalParticipants: totalParticipants,
+      rewardWon: isContestSettled ? rewardWonText : 'Pending Settlement',
       rewardType,
-      rewardAmount,
+      rewardAmount: isContestSettled ? prizeRupees : 0,
+      finalPrizeRupees: isContestSettled ? prizeRupees : 0,
+      settlementStatus: isContestSettled ? 'settled' : 'pending',
+      provisionalPrizeRupees: prizeRupees,
+      payoutMessage: selectedPayoutMessage,
+      selectedMessageOption: randomOptionIndex + 1,
       deliveryAddress: userProfile.address,
       upiId: userProfile.upiId,
       securityBreached,
       securityBreachReason,
       title: activeContest?.title || 'Cash Tournament',
-      submittedAt: new Date().toISOString()
+      submittedAt: new Date().toISOString(),
+      contestId: activeContest?.id,
+      questions: attemptQuestions
     };
 
     setLastQuizResult(attemptResult);
     try {
-      const canonicalUserId = canonicalizeUserId(userProfile?.id);
       sessionStorage.setItem(`quizkart_has_taken_${canonicalUserId}`, 'true');
+      if (activeContest?.id) {
+        const joinKey = `${canonicalUserId}_${activeContest.id}`;
+        localStorage.setItem(`quizkart_user_contest_joined_${joinKey}`, 'true');
+        setJoinedContestKeys(prev => prev.includes(joinKey) ? prev : [...prev, joinKey]);
+      }
     } catch {}
 
-    // Update real-time user quiz attempts immediately (Strict 30-Day Retention Window)
+    // Update real-time user quiz attempts immediately (Permanent user history)
     setUserQuizAttempts(prev => {
-      const updated = [attemptResult, ...prev.filter(a => a.attemptId !== attemptResult.attemptId)]
-        .filter(a => isWithinRetentionWindow(a.submittedAt));
+      const updated = [attemptResult, ...prev.filter(a => a.attemptId !== attemptResult.attemptId)];
       try {
         localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify(updated));
       } catch {}
       return updated;
     });
 
+    // Isolate user quiz attempt history strictly by email
+    const cleanUserEmail = resolvedUserEmail;
+    if (cleanUserEmail) {
+      try {
+        const emailAttemptKey = `quizkart_user_quiz_attempts_${cleanUserEmail}`;
+        const existingEmailAttempts = JSON.parse(localStorage.getItem(emailAttemptKey) || '[]');
+        const updatedEmailAttempts = [attemptResult, ...(Array.isArray(existingEmailAttempts) ? existingEmailAttempts.filter((a: any) => a && a.attemptId !== attemptResult.attemptId) : [])];
+        localStorage.setItem(emailAttemptKey, JSON.stringify(updatedEmailAttempts));
+      } catch {}
+    }
+
     // 4. Update user profile stats if not practice
     if (!isPracticeMode) {
-      if (currentUser) {
-        recordQuizAttemptInFirestore(attemptResult).catch(err => console.warn('Record attempt error:', err));
+      // Save history persistently in Firestore
+      recordQuizAttemptInFirestore(attemptResult).catch(err => console.warn('Record attempt error:', err));
+
+      // Store pending delayed payout (ensures prizes do not instantly credit on join)
+      if (activeContest?.id && rewardAmount > 0 && (rewardType as string) === 'cashback') {
+        try {
+          const pendingPayout = {
+            contestId: activeContest.id,
+            userId: userProfile.id,
+            rewardAmount,
+            rewardType,
+            rewardText: rewardWonText,
+            timestamp: Date.now()
+          };
+          localStorage.setItem(`quizkart_pending_payout_${activeContest.id}`, JSON.stringify(pendingPayout));
+        } catch {}
       }
 
       setUserProfile(prev => ({
         ...prev,
         quizzesPlayed: prev.quizzesPlayed + 1,
-        totalWonAmount: prev.totalWonAmount + (rewardType === 'cashback' ? rewardAmount : 0),
-        productsWonCount: prev.productsWonCount + (rewardType === 'product' ? 1 : 0),
-        walletBalance: prev.walletBalance + (rewardType === 'cashback' ? rewardAmount : 0)
+        productsWonCount: prev.productsWonCount + (rewardType === 'product' ? 1 : 0)
+        // Delayed payout: walletBalance and totalWonAmount are automatically transferred precisely 1 minute before contest ends
       }));
 
       setPoolData(prev => {
@@ -2885,11 +3708,10 @@ export default function App() {
               onLiveStateChange={setHeroReportedLive}
               contestDurationSeconds={globalQuizTimer}
               questions={userAssignedQuestions}
-              hasCompletedBefore={
-                userQuizAttempts.some(
-                  a => a && (canonicalizeUserId(a.userId) === canonicalizeUserId(userProfile?.id) || a.userName === userProfile.name)
-                )
-              }
+              hasCompletedBefore={hasUserCompletedCurrentContest}
+              leaderboard={leaderboard}
+              currentUserUid={currentUser?.uid || userProfile?.uid || userProfile?.id}
+              isContestLive={isContestLive}
             />
           </div>
         )}
@@ -2900,7 +3722,7 @@ export default function App() {
             {lastQuizResult ? (
               <QuizResult
                 result={lastQuizResult}
-                questions={userAssignedQuestions}
+                questions={lastQuizResult.questions && lastQuizResult.questions.length > 0 ? lastQuizResult.questions : userAssignedQuestions}
                 todayPrize={todayPrize}
                 onViewLeaderboard={() => {
                   setCurrentTab('leaderboard');
@@ -2938,6 +3760,13 @@ export default function App() {
           <LiveLeaderboard
             leaderboard={leaderboard}
             currentUserId={userProfile.name}
+            currentUserUid={currentUser?.uid || userProfile?.uid || userProfile?.id}
+            userAvatar={userProfile.avatarUrl}
+            userProfile={userProfile}
+            activeContest={activeContest}
+            isContestLive={isContestLive}
+            todayPrize={todayPrize}
+            hasUserCompletedAttempt={hasUserCompletedCurrentContest}
             onEnterQuiz={handleStartRealQuiz}
             isQuizActive={isQuizActive}
           />
@@ -2974,20 +3803,28 @@ export default function App() {
               try {
                 localStorage.removeItem('quizkart_is_authenticated');
                 localStorage.removeItem('quizkart_profile_manually_saved');
+                localStorage.removeItem('quizkart_user_quiz_attempts');
                 localStorage.setItem('quizkart_current_tab', 'home');
               } catch {}
+              setUserQuizAttempts([]);
               setIsUserAuthenticated(false);
               setCurrentTab('home');
               setAuthModalStep(1);
               setIsAuthModalOpen(true);
               await logOutUser();
             }}
-            onDeleteAccount={async () => {
+            onDeleteAccount={async (deletedRecord) => {
               try {
                 localStorage.removeItem('quizkart_is_authenticated');
                 localStorage.removeItem('quizkart_profile_manually_saved');
+                localStorage.removeItem('quizkart_user_quiz_attempts');
                 localStorage.setItem('quizkart_current_tab', 'home');
+                const targetEmail = deletedRecord?.email || userProfile.email;
+                if (targetEmail) {
+                  deleteUserProfileFromFirestore(targetEmail).catch(() => {});
+                }
               } catch {}
+              setUserQuizAttempts([]);
               setIsUserAuthenticated(false);
               setCurrentTab('home');
               await logOutUser();
@@ -3073,6 +3910,7 @@ export default function App() {
         {currentTab === 'edit_profile' && (
           <EditProfilePage
             userProfile={userProfile}
+            currentUser={currentUser}
             onUpdateProfile={handleUpdateProfile}
             onRedirectToChangeEmail={() => {
               setIsEmailChangeMode(true);

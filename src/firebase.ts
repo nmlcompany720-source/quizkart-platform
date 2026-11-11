@@ -16,13 +16,16 @@ import {
   collection,
   getDocs,
   deleteDoc,
+  updateDoc,
   query,
   where,
+  orderBy,
   onSnapshot,
+  runTransaction,
   setLogLevel
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import { Question, ActiveContest, LeaderboardEntry, UserProfile, QuizAttemptResult, DepositRequest, WithdrawalRequest, SupportTicket, BannerSlide } from './types';
+import { Question, ActiveContest, LeaderboardEntry, UserProfile, QuizAttemptResult, DepositRequest, WithdrawalRequest, SupportTicket, BannerSlide, ContestEntry, FinancialLedgerRecord } from './types';
 import { isDemoSeedUser } from './data/quizData';
 import { prepareContestForFirestore, sanitizeContestSynchronous } from './utils/imageCompressor';
 
@@ -292,6 +295,270 @@ export function subscribeToAuth(callback: (user: User | null) => void) {
   });
 }
 
+// Helper to extract numeric userNumber (1001, 1002, ...)
+export function extractNumericUserNumber(u?: Partial<UserProfile> | null): number {
+  if (!u) return 999999;
+  if (typeof u.userNumber === 'number' && u.userNumber >= 1000) {
+    return u.userNumber;
+  }
+  const idStr = (u.customUserId || u.id || '').trim();
+  const match = idStr.match(/(\d+)/);
+  if (match) {
+    const val = parseInt(match[1], 10);
+    if (!isNaN(val) && val >= 1000) return val;
+  }
+  return 999999;
+}
+
+/**
+ * Assigns a permanent, unique sequential customUserId (QK-USR-1001, 1002, 1003...)
+ * using Firestore runTransaction on 'settings/user_counter'.
+ * Once assigned, the ID never changes, swaps, or regenerates.
+ */
+export async function assignSequentialUserIdViaTransaction(
+  targetUid: string,
+  targetEmail: string,
+  existingAssignedId?: string
+): Promise<{ customUserId: string; userNumber: number }> {
+  // 1. Strict Immutability Guard: If existingAssignedId is already a valid sequential ID, lock and return it immediately
+  if (existingAssignedId && /^(?:QK-)?USR-\d+$/i.test(existingAssignedId.trim())) {
+    const clean = existingAssignedId.trim().toUpperCase();
+    const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+    const numMatch = idStr.match(/(\d+)/);
+    const num = numMatch ? parseInt(numMatch[1], 10) : 1001;
+    return { customUserId: idStr, userNumber: num };
+  }
+
+  const cleanEmail = (targetEmail || '').trim().toLowerCase();
+  const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : null;
+
+  // 2. Prevent ID Hijacking & Reassignment: Check if user already has an assigned ID in Firestore
+  try {
+    if (safeEmailDocId) {
+      const snap = await getDoc(doc(db, 'users', safeEmailDocId));
+      if (snap.exists()) {
+        const d = snap.data();
+        const foundId = d?.customUserId || d?.id;
+        if (foundId && /^(?:QK-)?USR-\d+$/i.test(foundId)) {
+          const clean = String(foundId).trim().toUpperCase();
+          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
+            ? d.userNumber
+            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
+          return { customUserId: idStr, userNumber: num };
+        }
+      }
+    }
+    if (targetUid) {
+      const snap = await getDoc(doc(db, 'users', targetUid));
+      if (snap.exists()) {
+        const d = snap.data();
+        const foundId = d?.customUserId || d?.id;
+        if (foundId && /^(?:QK-)?USR-\d+$/i.test(foundId)) {
+          const clean = String(foundId).trim().toUpperCase();
+          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
+            ? d.userNumber
+            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
+          return { customUserId: idStr, userNumber: num };
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Check existing user before transaction notice:', e);
+  }
+
+  // Find maximum existing user number across local and known registered users to prevent reuse/collision
+  let maxKnownNum = 1000;
+  try {
+    const raw = localStorage.getItem('quizkart_registered_users');
+    if (raw) {
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        list.forEach((u: any) => {
+          const num = extractNumericUserNumber(u);
+          if (num >= 1000 && num < 999999 && num > maxKnownNum) {
+            maxKnownNum = num;
+          }
+        });
+      }
+    }
+  } catch {}
+
+  // Check deleted users archive in localStorage as well to ensure deleted user numbers are never recycled or collided
+  try {
+    const rawDel = localStorage.getItem('quizkart_deleted_users');
+    if (rawDel) {
+      const delList = JSON.parse(rawDel);
+      if (Array.isArray(delList)) {
+        delList.forEach((u: any) => {
+          const num = extractNumericUserNumber(u);
+          if (num >= 1000 && num < 999999 && num > maxKnownNum) {
+            maxKnownNum = num;
+          }
+        });
+      }
+    }
+  } catch {}
+
+  // 3. Atomic transaction on 'settings/user_counter' and permanent binding to the user's Firestore document
+  try {
+    const counterRef = doc(db, 'settings', 'user_counter');
+    const userDocRef = safeEmailDocId ? doc(db, 'users', safeEmailDocId) : (targetUid ? doc(db, 'users', targetUid) : null);
+    const uidDocRef = (targetUid && safeEmailDocId && targetUid !== safeEmailDocId) ? doc(db, 'users', targetUid) : null;
+
+    const result = await runTransaction(db, async (transaction) => {
+      // All transaction reads first
+      const counterDoc = await transaction.get(counterRef);
+      const existingUserDoc = userDocRef ? await transaction.get(userDocRef) : null;
+      const existingUidDoc = uidDocRef ? await transaction.get(uidDocRef) : null;
+
+      // Check UID doc first (highest confidence permanent binding)
+      if (existingUidDoc && existingUidDoc.exists()) {
+        const d = existingUidDoc.data();
+        const foundId = d?.customUserId || d?.id;
+        if (foundId && /^(?:QK-)?USR-\d+$/i.test(foundId)) {
+          const clean = String(foundId).trim().toUpperCase();
+          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
+            ? d.userNumber
+            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
+          return { customUserId: idStr, userNumber: num };
+        }
+      }
+
+      // Check email userDoc (verify account ownership before restoring)
+      if (existingUserDoc && existingUserDoc.exists()) {
+        const d = existingUserDoc.data();
+        const foundId = d?.customUserId || d?.id;
+        const isVerifiedOwner = !targetUid || !d?.uid || d.uid === targetUid;
+        if (isVerifiedOwner && foundId && /^(?:QK-)?USR-\d+$/i.test(foundId) && !d?.isDeleted) {
+          const clean = String(foundId).trim().toUpperCase();
+          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
+            ? d.userNumber
+            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
+          return { customUserId: idStr, userNumber: num };
+        }
+      }
+
+      let currentCounter = 1000;
+      if (counterDoc.exists()) {
+        const data = counterDoc.data();
+        if (typeof data?.lastUserNumber === 'number' && data.lastUserNumber >= 1000) {
+          currentCounter = data.lastUserNumber;
+        } else if (typeof data?.count === 'number' && data.count >= 1000) {
+          currentCounter = data.count;
+        }
+      }
+
+      const baseline = Math.max(1000, currentCounter, maxKnownNum);
+      const nextUserNumber = baseline + 1;
+      const newCustomUserId = `QK-USR-${nextUserNumber}`;
+
+      // Transaction writes:
+      // 1. Update atomic counter
+      transaction.set(counterRef, {
+        lastUserNumber: nextUserNumber,
+        lastAssignedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+
+      // 2. Permanently bind customUserId and userNumber to user's Firestore document
+      if (uidDocRef) {
+        transaction.set(uidDocRef, {
+          customUserId: newCustomUserId,
+          id: newCustomUserId,
+          userNumber: nextUserNumber,
+          email: cleanEmail,
+          uid: targetUid,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      }
+
+      if (userDocRef) {
+        const canWriteEmailDoc = !existingUserDoc?.exists() || !existingUserDoc.data()?.uid || existingUserDoc.data()?.uid === targetUid;
+        if (canWriteEmailDoc) {
+          transaction.set(userDocRef, {
+            customUserId: newCustomUserId,
+            id: newCustomUserId,
+            userNumber: nextUserNumber,
+            email: cleanEmail,
+            uid: targetUid || newCustomUserId,
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+        }
+      }
+
+      return { customUserId: newCustomUserId, userNumber: nextUserNumber };
+    });
+
+    return result;
+  } catch (txErr) {
+    console.warn('runTransaction user counter notice, computing next safe sequence:', txErr);
+    let maxNum = Math.max(1000, maxKnownNum);
+    const nextNum = maxNum + 1;
+    const fallbackId = `QK-USR-${nextNum}`;
+
+    // Ensure fallback is also stored if possible
+    if (targetUid) {
+      setDoc(doc(db, 'users', targetUid), {
+        customUserId: fallbackId,
+        id: fallbackId,
+        userNumber: nextNum,
+        email: cleanEmail,
+        uid: targetUid,
+        updatedAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+    }
+    if (safeEmailDocId && safeEmailDocId !== targetUid) {
+      setDoc(doc(db, 'users', safeEmailDocId), {
+        customUserId: fallbackId,
+        id: fallbackId,
+        userNumber: nextNum,
+        email: cleanEmail,
+        uid: targetUid || fallbackId,
+        updatedAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+    }
+
+    return { customUserId: fallbackId, userNumber: nextNum };
+  }
+}
+
+// Dedicated single-user block/unblock status update to ensure ONLY the selected user is affected
+export async function updateUserBlockStatusInFirestore(
+  targetUid: string,
+  targetEmail: string,
+  isBlocked: boolean,
+  blockReason: string = ''
+): Promise<void> {
+  if (isFirestoreQuotaExceeded()) return;
+  const updates: Record<string, any> = {
+    isBlocked: Boolean(isBlocked),
+    blockReason: isBlocked ? (blockReason || 'Account Blocked by Admin') : '',
+    updatedAt: new Date().toISOString()
+  };
+
+  const tasks: Promise<any>[] = [];
+  if (targetUid) {
+    tasks.push(setDoc(doc(db, 'users', targetUid), updates, { merge: true }));
+  }
+  const cleanEmail = (targetEmail || '').trim().toLowerCase();
+  if (cleanEmail) {
+    const safeEmailDocId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (safeEmailDocId !== targetUid) {
+      tasks.push(setDoc(doc(db, 'users', safeEmailDocId), updates, { merge: true }));
+    }
+  }
+  try {
+    await Promise.all(tasks);
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
+    console.warn('updateUserBlockStatusInFirestore notice:', error);
+  }
+}
+
 // Firestore persistence helpers for QuizKart
 export async function syncUserProfile(profile: UserProfile): Promise<void> {
   if (!profile || isDemoSeedUser(profile) || isFirestoreQuotaExceeded()) return;
@@ -301,11 +568,17 @@ export async function syncUserProfile(profile: UserProfile): Promise<void> {
   const docId = safeEmailDocId || profile.uid || profile.id || (currentUser?.uid ?? null);
   if (!docId) return;
 
+  const derivedUserNumber = extractNumericUserNumber(profile);
+  const resolvedCustomId = profile.customUserId || profile.id || (derivedUserNumber < 999999 ? `QK-USR-${derivedUserNumber}` : docId);
+
   const path = `users/${docId}`;
   try {
-    await setDoc(doc(db, 'users', docId), {
+    const isUserDeleted = Boolean(profile.isDeleted) || profile.status === 'deleted' || Boolean(profile.deletedAt);
+    const userPayload: Record<string, any> = {
       uid: profile.uid || currentUser?.uid || docId,
-      id: profile.id || docId,
+      id: resolvedCustomId,
+      customUserId: resolvedCustomId,
+      userNumber: derivedUserNumber < 999999 ? derivedUserNumber : undefined,
       name: profile.name || currentUser?.displayName || 'Player',
       email: cleanEmail,
       mobile: profile.mobile || '',
@@ -323,8 +596,23 @@ export async function syncUserProfile(profile: UserProfile): Promise<void> {
       passwordStatus: (profile.passwordStatus && !profile.passwordStatus.includes('••••') && !profile.passwordStatus.includes('Secured')) ? profile.passwordStatus : 'player@123',
       hasPassword: profile.hasPassword ?? true,
       kycStatus: profile.kycStatus || 'Unverified',
+      isDeleted: isUserDeleted,
+      status: isUserDeleted ? 'deleted' : (profile.status || 'active'),
       updatedAt: new Date().toISOString()
-    }, { merge: true });
+    };
+    if (isUserDeleted) {
+      userPayload.deletedAt = profile.deletedAt || new Date().toISOString().split('T')[0];
+      userPayload.deletedTimestampMs = profile.deletedTimestampMs || Date.now();
+    }
+    await setDoc(doc(db, 'users', docId), userPayload, { merge: true });
+    // ONLY mirror to currentUser.uid if the profile being synced actually belongs to the current user
+    if (
+      currentUser?.uid &&
+      currentUser.uid !== docId &&
+      (profile.uid === currentUser.uid || cleanEmail === (currentUser.email || '').toLowerCase())
+    ) {
+      await setDoc(doc(db, 'users', currentUser.uid), userPayload, { merge: true });
+    }
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
     console.warn('Firestore user sync notice:', error);
@@ -336,26 +624,102 @@ export async function deleteUserProfileFromFirestore(emailOrId: string): Promise
   const cleanEmail = emailOrId.trim().toLowerCase();
   const safeDocId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
   try {
+    await setDoc(doc(db, 'users', safeDocId), {
+      isDeleted: true,
+      status: 'deleted',
+      deletedAt: new Date().toISOString().split('T')[0],
+      deletedTimestampMs: Date.now(),
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
     await deleteDoc(doc(db, 'users', safeDocId));
+    if (auth.currentUser?.uid) {
+      await deleteDoc(doc(db, 'users', auth.currentUser.uid)).catch(() => {});
+    }
   } catch (error) {
     handlePossibleQuotaError(error);
   }
 }
 
+// Helper to check if a user is recorded in deleted list
+function isAccountDeleted(u: any): boolean {
+  if (!u) return true;
+  if (u.isDeleted === true || u.status === 'deleted' || Boolean(u.deletedAt) || Boolean(u.deletedTimestampMs)) {
+    return true;
+  }
+  const email = (u.email || '').trim().toLowerCase();
+  const id = (u.customUserId || u.id || '').trim();
+  try {
+    const raw = localStorage.getItem('quizkart_deleted_users');
+    if (raw) {
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        return list.some((d: any) => 
+          (d && d.email && (d.email || '').trim().toLowerCase() === email) ||
+          (d && d.id && (d.id || '').trim() === id)
+        );
+      }
+    }
+  } catch {}
+  return false;
+}
+
 export async function fetchAllUsersFromFirestore(): Promise<UserProfile[]> {
   const path = 'users';
   try {
-    const snap = await getDocs(collection(db, path));
-    const list: UserProfile[] = [];
+    let snap;
+    try {
+      const q = query(collection(db, path), orderBy('userNumber', 'asc'));
+      snap = await getDocs(q);
+    } catch {
+      snap = await getDocs(collection(db, path));
+    }
+    const userMap = new Map<string, UserProfile>();
     snap.forEach((docItem) => {
       const data = docItem.data() as UserProfile;
-      if (data && (data.name || data.email) && !isDemoSeedUser(data)) {
-        list.push({
+      if (!data || isDemoSeedUser(data)) return;
+      if (isAccountDeleted(data)) return; // Exclude deleted users
+
+      if (data.name || data.email) {
+        const uNum = extractNumericUserNumber(data);
+        const cId = data.customUserId || data.id || (uNum < 999999 ? `QK-USR-${uNum}` : docItem.id);
+        const resolvedUid = (data.uid && !data.uid.startsWith('QK-USR-')) 
+          ? data.uid 
+          : (docItem.id && !docItem.id.startsWith('QK-USR-') ? docItem.id : (data.uid || docItem.id));
+        const userObj: UserProfile = {
           ...data,
-          id: data.id || data.uid || docItem.id,
-          uid: data.uid || docItem.id
-        });
+          id: cId,
+          customUserId: cId,
+          userNumber: uNum < 999999 ? uNum : undefined,
+          uid: resolvedUid
+        };
+
+        const cleanEmail = (data.email || '').trim().toLowerCase();
+        const primaryKey = cleanEmail || resolvedUid || cId;
+
+        if (userMap.has(primaryKey)) {
+          const existing = userMap.get(primaryKey)!;
+          userMap.set(primaryKey, {
+            ...existing,
+            ...userObj,
+            uid: (existing.uid && !existing.uid.startsWith('QK-USR-')) ? existing.uid : userObj.uid,
+            customUserId: existing.customUserId || userObj.customUserId,
+            userNumber: existing.userNumber || userObj.userNumber
+          });
+        } else {
+          userMap.set(primaryKey, userObj);
+        }
       }
+    });
+    const list = Array.from(userMap.values());
+    // Strict ascending numeric order (1001, 1002, 1003... 1010)
+    list.sort((a, b) => {
+      const numA = extractNumericUserNumber(a);
+      const numB = extractNumericUserNumber(b);
+      if (numA !== numB) return numA - numB;
+      const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
+      const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
+      if (timeA !== timeB) return timeA - timeB;
+      return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
     });
     return list;
   } catch (error) {
@@ -367,26 +731,73 @@ export async function fetchAllUsersFromFirestore(): Promise<UserProfile[]> {
 export function subscribeToAllUsersFromFirestore(callback: (users: UserProfile[]) => void): () => void {
   const path = 'users';
   try {
-    return onSnapshot(
-      collection(db, path),
-      (snap) => {
-        const list: UserProfile[] = [];
-        snap.forEach((docItem) => {
-          const data = docItem.data() as UserProfile;
-          if (data && (data.name || data.email) && !isDemoSeedUser(data)) {
-            list.push({
-              ...data,
-              id: data.id || data.uid || docItem.id,
-              uid: data.uid || docItem.id
+    const handleSnap = (snap: any) => {
+      const userMap = new Map<string, UserProfile>();
+      snap.forEach((docItem: any) => {
+        const data = docItem.data() as UserProfile;
+        if (!data || isDemoSeedUser(data)) return;
+        if (isAccountDeleted(data)) return; // Exclude deleted users
+
+        if (data.name || data.email) {
+          const uNum = extractNumericUserNumber(data);
+          const cId = data.customUserId || data.id || (uNum < 999999 ? `QK-USR-${uNum}` : docItem.id);
+          const resolvedUid = (data.uid && !data.uid.startsWith('QK-USR-')) 
+            ? data.uid 
+            : (docItem.id && !docItem.id.startsWith('QK-USR-') ? docItem.id : (data.uid || docItem.id));
+          const userObj: UserProfile = {
+            ...data,
+            id: cId,
+            customUserId: cId,
+            userNumber: uNum < 999999 ? uNum : undefined,
+            uid: resolvedUid
+          };
+
+          const cleanEmail = (data.email || '').trim().toLowerCase();
+          const primaryKey = cleanEmail || resolvedUid || cId;
+
+          if (userMap.has(primaryKey)) {
+            const existing = userMap.get(primaryKey)!;
+            userMap.set(primaryKey, {
+              ...existing,
+              ...userObj,
+              uid: (existing.uid && !existing.uid.startsWith('QK-USR-')) ? existing.uid : userObj.uid,
+              customUserId: existing.customUserId || userObj.customUserId,
+              userNumber: existing.userNumber || userObj.userNumber
             });
+          } else {
+            userMap.set(primaryKey, userObj);
           }
-        });
-        callback(list);
-      },
-      (error) => {
+        }
+      });
+      const list = Array.from(userMap.values());
+      // Stable ascending numeric order (1001, 1002, 1003... 1010)
+      list.sort((a, b) => {
+        const numA = extractNumericUserNumber(a);
+        const numB = extractNumericUserNumber(b);
+        if (numA !== numB) return numA - numB;
+        const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
+        const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
+        if (timeA !== timeB) return timeA - timeB;
+        return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
+      });
+      callback(list);
+    };
+
+    try {
+      const q = query(collection(db, path), orderBy('userNumber', 'asc'));
+      return onSnapshot(
+        q,
+        handleSnap,
+        () => {
+          // Fallback to plain collection listener if orderBy index not yet provisioned
+          return onSnapshot(collection(db, path), handleSnap, (err) => console.warn('Users subscription fallback warning:', err));
+        }
+      );
+    } catch {
+      return onSnapshot(collection(db, path), handleSnap, (error) => {
         console.warn('Firestore users subscription warning:', error);
-      }
-    );
+      });
+    }
   } catch {
     return () => {};
   }
@@ -466,16 +877,55 @@ export function subscribeToUserPresenceFromFirestore(
   }
 }
 
-export async function fetchUserProfile(uid: string): Promise<Partial<UserProfile> | null> {
-  const path = `users/${uid}`;
+export async function fetchUserProfile(uid: string, email?: string): Promise<Partial<UserProfile> | null> {
   try {
-    const snap = await getDoc(doc(db, 'users', uid));
-    if (snap.exists()) {
-      return snap.data() as Partial<UserProfile>;
+    if (!uid && !email) return null;
+    let dataFromUid: Partial<UserProfile> | null = null;
+    // 1. Direct doc lookup by UID as the primary single source of truth: "users/{auth.currentUser.uid}"
+    if (uid) {
+      const snap = await getDoc(doc(db, 'users', uid));
+      if (snap.exists()) {
+        dataFromUid = snap.data() as Partial<UserProfile>;
+        const validId = (dataFromUid?.customUserId || dataFromUid?.id || '').trim();
+        if (validId && /^(?:QK-)?USR-\d+$/i.test(validId)) {
+          return dataFromUid;
+        }
+      }
     }
-    return null;
+
+    // 2. Safe email doc lookup if email provided or if uid contains '@' or via currentUser
+    const targetEmail = email || (uid && uid.includes('@') ? uid : auth.currentUser?.email) || dataFromUid?.email;
+    if (targetEmail) {
+      const cleanEmail = targetEmail.trim().toLowerCase();
+      const safeEmailDocId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (safeEmailDocId !== uid) {
+        const snapEmail = await getDoc(doc(db, 'users', safeEmailDocId));
+        if (snapEmail.exists()) {
+          const emailData = snapEmail.data() as Partial<UserProfile>;
+          const validEmailId = (emailData?.customUserId || emailData?.id || '').trim();
+          if (validEmailId && /^(?:QK-)?USR-\d+$/i.test(validEmailId)) {
+            // Mirror to users/{uid} so users/{uid} is permanently populated
+            if (uid && uid !== safeEmailDocId) {
+              setDoc(doc(db, 'users', uid), {
+                ...emailData,
+                uid,
+                updatedAt: new Date().toISOString()
+              }, { merge: true }).catch(() => {});
+            }
+            return {
+              ...(dataFromUid || {}),
+              ...emailData,
+              uid: uid || emailData.uid || safeEmailDocId
+            };
+          }
+          return { ...(dataFromUid || {}), ...emailData };
+        }
+      }
+    }
+    return dataFromUid;
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, path);
+    if (handlePossibleQuotaError(error)) return null;
+    return null;
   }
 }
 
@@ -522,6 +972,7 @@ export async function removeQuestionFromFirestore(qId: number): Promise<void> {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
+
 
 // Contests Sync
 export async function fetchContestsFromFirestore(): Promise<ActiveContest[]> {
@@ -658,6 +1109,47 @@ export async function fetchLeaderboardFromFirestore(): Promise<LeaderboardEntry[
   }
 }
 
+export async function saveLeaderboardEntryToFirestore(entry: LeaderboardEntry): Promise<void> {
+  if (!entry || !entry.id || isFirestoreQuotaExceeded()) return;
+  const path = `leaderboard/${entry.id}`;
+  try {
+    await setDoc(doc(db, 'leaderboard', entry.id), {
+      ...entry,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
+    console.warn(`Firestore leaderboard save notice (${entry.id}):`, error);
+  }
+}
+
+export function subscribeToLeaderboardFromFirestore(
+  callback: (entries: LeaderboardEntry[]) => void
+): () => void {
+  if (isFirestoreQuotaExceeded()) return () => {};
+  const path = 'leaderboard';
+  try {
+    return onSnapshot(
+      collection(db, path),
+      (snap) => {
+        const list: LeaderboardEntry[] = [];
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data && data.userName) {
+            list.push({ ...data, id: data.id || docItem.id } as LeaderboardEntry);
+          }
+        });
+        callback(list.filter(e => e && e.id != null));
+      },
+      (error) => {
+        handlePossibleQuotaError(error);
+      }
+    );
+  } catch {
+    return () => {};
+  }
+}
+
 // 30-Day Rolling Data Retention Window for Tournament History / Activity Logs
 export const RETENTION_DAYS = 30;
 export const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -691,80 +1183,186 @@ export async function pruneExpiredUserQuizAttempts(userId: string): Promise<void
 }
 
 export async function recordQuizAttemptInFirestore(attempt: QuizAttemptResult): Promise<void> {
+  if (!attempt || !attempt.attemptId || isFirestoreQuotaExceeded()) return;
+
   const currentUser = auth.currentUser;
-  if (!currentUser || isFirestoreQuotaExceeded()) return;
+  const resolvedUserId = attempt.userId || attempt.ownerUid || currentUser?.uid || '';
+  const resolvedOwnerUid = attempt.ownerUid || attempt.userId || currentUser?.uid || '';
+  const resolvedEmail = (attempt.userEmail || currentUser?.email || '').trim().toLowerCase();
+
+  if (!resolvedOwnerUid && !resolvedUserId && !resolvedEmail) {
+    return;
+  }
 
   const path = `quiz_attempts/${attempt.attemptId}`;
   try {
     await setDoc(doc(db, 'quiz_attempts', attempt.attemptId), {
       attemptId: attempt.attemptId,
-      userId: currentUser.uid,
-      quizDate: attempt.quizDate,
-      score: attempt.score,
-      totalQuestions: attempt.totalQuestions,
-      timeTakenSeconds: attempt.timeTakenSeconds,
-      rank: attempt.rank,
-      rewardWon: attempt.rewardWon,
-      rewardType: attempt.rewardType,
-      rewardAmount: attempt.rewardAmount || 0,
+      entryId: attempt.entryId || '',
+      userId: resolvedUserId || resolvedOwnerUid,
+      ownerUid: resolvedOwnerUid || resolvedUserId,
+      userEmail: resolvedEmail,
+      userName: attempt.userName || currentUser?.displayName || 'Contestant',
+      contestId: attempt.contestId || '',
       title: attempt.title || 'Cash Tournament',
-      submittedAt: attempt.submittedAt || new Date().toISOString()
-    });
-
-    // Auto-prune any historical entry crossing 31 days
-    pruneExpiredUserQuizAttempts(currentUser.uid).catch(() => {});
+      quizDate: attempt.quizDate || new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+      submittedAt: attempt.submittedAt || new Date().toISOString(),
+      score: attempt.score || 0,
+      totalQuestions: attempt.totalQuestions || 10,
+      timeTakenSeconds: attempt.timeTakenSeconds || 0,
+      rank: attempt.rank || 1,
+      totalParticipants: attempt.totalParticipants || 1,
+      rewardWon: attempt.rewardWon || '',
+      rewardType: attempt.rewardType || 'none',
+      rewardAmount: attempt.rewardAmount || 0,
+      finalPrizeRupees: attempt.finalPrizeRupees !== undefined ? attempt.finalPrizeRupees : (attempt.rewardAmount || 0),
+      settlementStatus: attempt.settlementStatus || 'pending',
+      provisionalPrizeRupees: attempt.provisionalPrizeRupees !== undefined ? attempt.provisionalPrizeRupees : 0,
+      payoutMessage: attempt.payoutMessage || '',
+      selectedMessageOption: attempt.selectedMessageOption || 0
+    }, { merge: true });
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.CREATE, path);
   }
 }
 
-export async function fetchUserQuizAttemptsFromFirestore(userId: string): Promise<QuizAttemptResult[]> {
-  if (!userId) return [];
+export async function fetchUserQuizAttemptsFromFirestore(
+  identifier: string | { ownerUid?: string; userId?: string; userEmail?: string }
+): Promise<QuizAttemptResult[]> {
+  if (!identifier) return [];
   const path = 'quiz_attempts';
+  const targetId = typeof identifier === 'string' ? identifier : (identifier.ownerUid || identifier.userId || auth.currentUser?.uid || '');
+  const targetEmail = typeof identifier === 'object' && identifier.userEmail ? identifier.userEmail.trim().toLowerCase() : '';
+
+  if (!targetId && !targetEmail) return [];
+
   try {
-    const q = query(collection(db, path), where('userId', '==', userId));
-    const snap = await getDocs(q);
-    const list: QuizAttemptResult[] = [];
-    const now = Date.now();
-    const expiredDocIds: string[] = [];
+    const listMap = new Map<string, QuizAttemptResult>();
 
-    snap.forEach((docItem) => {
-      const data = docItem.data();
-      if (data) {
-        const submittedTime = new Date(data.submittedAt || 0).getTime();
-        // Check 30-day retention rule: if crosses 31 days, queue for pruning and exclude
-        if (!isNaN(submittedTime) && submittedTime > 0 && (now - submittedTime > RETENTION_MS)) {
-          expiredDocIds.push(docItem.id);
-          return;
-        }
-
-        list.push({
-          attemptId: data.attemptId || docItem.id,
-          quizDate: data.quizDate || '',
-          score: data.score || 0,
-          totalQuestions: data.totalQuestions || 10,
-          timeTakenSeconds: data.timeTakenSeconds || 0,
-          answers: data.answers || {},
-          markedForReview: data.markedForReview || [],
-          rank: data.rank || 1,
-          totalParticipants: data.totalParticipants || 100,
-          rewardWon: data.rewardWon || '',
-          rewardType: data.rewardType || 'none',
-          rewardAmount: data.rewardAmount || 0,
-          title: data.title || 'Cash Tournament',
-          submittedAt: data.submittedAt || new Date().toISOString()
-        } as QuizAttemptResult);
+    // 1. Query by ownerUid
+    if (targetId) {
+      try {
+        const q1 = query(collection(db, path), where('ownerUid', '==', targetId));
+        const snap1 = await getDocs(q1);
+        snap1.forEach((docItem) => {
+          const data = docItem.data() as Record<string, any> | undefined;
+          if (data && (data.attemptId || docItem.id)) {
+            const attId = data.attemptId || docItem.id;
+            listMap.set(attId, {
+              attemptId: attId,
+              entryId: data.entryId || '',
+              userId: data.userId || targetId,
+              ownerUid: data.ownerUid || targetId,
+              userEmail: data.userEmail || targetEmail,
+              userName: data.userName,
+              quizDate: data.quizDate || '',
+              score: data.score || 0,
+              totalQuestions: data.totalQuestions || 10,
+              timeTakenSeconds: data.timeTakenSeconds || 0,
+              answers: data.answers || {},
+              markedForReview: data.markedForReview || [],
+              rank: data.rank || 1,
+              totalParticipants: data.totalParticipants || 1,
+              rewardWon: data.rewardWon || '',
+              rewardType: data.rewardType || 'none',
+              rewardAmount: data.rewardAmount || 0,
+              finalPrizeRupees: data.finalPrizeRupees !== undefined ? data.finalPrizeRupees : (data.rewardAmount || 0),
+              settlementStatus: data.settlementStatus || 'pending',
+              title: data.title || 'Cash Tournament',
+              submittedAt: data.submittedAt || new Date().toISOString(),
+              contestId: data.contestId || ''
+            } as QuizAttemptResult);
+          }
+        });
+      } catch (err) {
+        console.warn('Error querying attempts by ownerUid:', err);
       }
-    });
 
-    // Automatically prune expired records from backend storage
-    if (expiredDocIds.length > 0 && !isFirestoreQuotaExceeded()) {
-      expiredDocIds.forEach((docId) => {
-        deleteDoc(doc(db, 'quiz_attempts', docId)).catch(() => {});
-      });
+      // Also query by userId if distinct
+      try {
+        const qUser = query(collection(db, path), where('userId', '==', targetId));
+        const snapUser = await getDocs(qUser);
+        snapUser.forEach((docItem) => {
+          const data = docItem.data() as Record<string, any> | undefined;
+          if (data && (data.attemptId || docItem.id)) {
+            const attId = data.attemptId || docItem.id;
+            if (!listMap.has(attId)) {
+              listMap.set(attId, {
+                attemptId: attId,
+                entryId: data.entryId || '',
+                userId: data.userId || targetId,
+                ownerUid: data.ownerUid || targetId,
+                userEmail: data.userEmail || targetEmail,
+                userName: data.userName,
+                quizDate: data.quizDate || '',
+                score: data.score || 0,
+                totalQuestions: data.totalQuestions || 10,
+                timeTakenSeconds: data.timeTakenSeconds || 0,
+                answers: data.answers || {},
+                markedForReview: data.markedForReview || [],
+                rank: data.rank || 1,
+                totalParticipants: data.totalParticipants || 1,
+                rewardWon: data.rewardWon || '',
+                rewardType: data.rewardType || 'none',
+                rewardAmount: data.rewardAmount || 0,
+                finalPrizeRupees: data.finalPrizeRupees !== undefined ? data.finalPrizeRupees : (data.rewardAmount || 0),
+                settlementStatus: data.settlementStatus || 'pending',
+                title: data.title || 'Cash Tournament',
+                submittedAt: data.submittedAt || new Date().toISOString(),
+                contestId: data.contestId || ''
+              } as QuizAttemptResult);
+            }
+          }
+        });
+      } catch (err) {
+        console.warn('Error querying attempts by userId:', err);
+      }
     }
 
+    // 2. Query by userEmail if present
+    if (targetEmail) {
+      try {
+        const q2 = query(collection(db, path), where('userEmail', '==', targetEmail));
+        const snap2 = await getDocs(q2);
+        snap2.forEach((docItem) => {
+          const data = docItem.data() as Record<string, any> | undefined;
+          if (data && (data.attemptId || docItem.id)) {
+            const attId = data.attemptId || docItem.id;
+            if (!listMap.has(attId)) {
+              listMap.set(attId, {
+                attemptId: attId,
+                entryId: data.entryId || '',
+                userId: data.userId || targetId,
+                ownerUid: data.ownerUid || targetId,
+                userEmail: data.userEmail || targetEmail,
+                userName: data.userName,
+                quizDate: data.quizDate || '',
+                score: data.score || 0,
+                totalQuestions: data.totalQuestions || 10,
+                timeTakenSeconds: data.timeTakenSeconds || 0,
+                answers: data.answers || {},
+                markedForReview: data.markedForReview || [],
+                rank: data.rank || 1,
+                totalParticipants: data.totalParticipants || 1,
+                rewardWon: data.rewardWon || '',
+                rewardType: data.rewardType || 'none',
+                rewardAmount: data.rewardAmount || 0,
+                finalPrizeRupees: data.finalPrizeRupees !== undefined ? data.finalPrizeRupees : (data.rewardAmount || 0),
+                settlementStatus: data.settlementStatus || 'pending',
+                title: data.title || 'Cash Tournament',
+                submittedAt: data.submittedAt || new Date().toISOString(),
+                contestId: data.contestId || ''
+              } as QuizAttemptResult);
+            }
+          }
+        });
+      } catch (err) {
+        console.warn('Error querying attempts by userEmail:', err);
+      }
+    }
+
+    const list = Array.from(listMap.values());
     list.sort((a, b) => {
       const timeA = new Date(a.submittedAt || 0).getTime();
       const timeB = new Date(b.submittedAt || 0).getTime();
@@ -778,30 +1376,40 @@ export async function fetchUserQuizAttemptsFromFirestore(userId: string): Promis
 }
 
 export function subscribeToUserQuizAttempts(
-  userId: string,
+  identifier: string | { ownerUid?: string; userId?: string; userEmail?: string },
   onUpdate: (attempts: QuizAttemptResult[]) => void
 ): () => void {
-  if (!userId) return () => {};
+  if (!identifier) return () => {};
   const path = 'quiz_attempts';
+  const targetId = typeof identifier === 'string' ? identifier : (identifier.ownerUid || identifier.userId || auth.currentUser?.uid || '');
+  const targetEmail = typeof identifier === 'object' && identifier.userEmail ? identifier.userEmail.trim().toLowerCase() : '';
+
+  if (!targetId && !targetEmail) return () => {};
+
   try {
-    const q = query(collection(db, path), where('userId', '==', userId));
+    const q = targetId 
+      ? query(collection(db, path), where('ownerUid', '==', targetId))
+      : query(collection(db, path), where('userEmail', '==', targetEmail));
+
     return onSnapshot(q, (snap) => {
       const list: QuizAttemptResult[] = [];
-      const now = Date.now();
-      const expiredDocIds: string[] = [];
 
       snap.forEach((docItem) => {
-        const data = docItem.data();
+        const data = docItem.data() as Record<string, any> | undefined;
         if (data) {
-          const submittedTime = new Date(data.submittedAt || 0).getTime();
-          // Check 30-day retention rule: prune if record crosses 31 days
-          if (!isNaN(submittedTime) && submittedTime > 0 && (now - submittedTime > RETENTION_MS)) {
-            expiredDocIds.push(docItem.id);
-            return;
-          }
+          const matchesUser = 
+            (targetId && (data.userId === targetId || data.ownerUid === targetId)) ||
+            (targetEmail && data.userEmail && data.userEmail.toLowerCase() === targetEmail);
+
+          if (!matchesUser) return;
 
           list.push({
             attemptId: data.attemptId || docItem.id,
+            entryId: data.entryId || '',
+            userId: data.userId || targetId,
+            ownerUid: data.ownerUid || targetId,
+            userEmail: data.userEmail || targetEmail,
+            userName: data.userName,
             quizDate: data.quizDate || '',
             score: data.score || 0,
             totalQuestions: data.totalQuestions || 10,
@@ -809,34 +1417,31 @@ export function subscribeToUserQuizAttempts(
             answers: data.answers || {},
             markedForReview: data.markedForReview || [],
             rank: data.rank || 1,
-            totalParticipants: data.totalParticipants || 100,
+            totalParticipants: data.totalParticipants || 1,
             rewardWon: data.rewardWon || '',
             rewardType: data.rewardType || 'none',
             rewardAmount: data.rewardAmount || 0,
+            finalPrizeRupees: data.finalPrizeRupees !== undefined ? data.finalPrizeRupees : (data.rewardAmount || 0),
+            settlementStatus: data.settlementStatus || 'pending',
             title: data.title || 'Cash Tournament',
-            submittedAt: data.submittedAt || new Date().toISOString()
+            submittedAt: data.submittedAt || new Date().toISOString(),
+            contestId: data.contestId || ''
           } as QuizAttemptResult);
         }
       });
-
-      // Automatically prune expired entries from backend storage
-      if (expiredDocIds.length > 0 && !isFirestoreQuotaExceeded()) {
-        expiredDocIds.forEach((docId) => {
-          deleteDoc(doc(db, 'quiz_attempts', docId)).catch(() => {});
-        });
-      }
 
       list.sort((a, b) => {
         const timeA = new Date(a.submittedAt || 0).getTime();
         const timeB = new Date(b.submittedAt || 0).getTime();
         return timeB - timeA;
       });
+
       onUpdate(list);
-    }, (error) => {
-      console.warn('Error in quiz attempts subscription:', error);
+    }, (err) => {
+      console.warn('Quiz attempts subscription notice:', err);
     });
   } catch (err) {
-    console.warn('Snapshot listener error for quiz attempts:', err);
+    console.warn('Quiz attempts setup notice:', err);
     return () => {};
   }
 }
@@ -846,10 +1451,16 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
   if (!deposit || !deposit.id || isFirestoreQuotaExceeded()) return;
   const path = `deposits/${deposit.id}`;
   const cleanEmail = (deposit.userEmail || deposit.email || auth.currentUser?.email || '').trim().toLowerCase();
+  const resolvedOwnerUid = deposit.ownerUid || deposit.userId || auth.currentUser?.uid || '';
+  const persistentRequestId = deposit.requestId || deposit.id;
+
   try {
     await setDoc(doc(db, 'deposits', deposit.id), {
       id: deposit.id,
-      userName: deposit.userName,
+      requestId: persistentRequestId,
+      ownerUid: resolvedOwnerUid,
+      userId: resolvedOwnerUid,
+      userName: deposit.userName || '',
       userEmail: cleanEmail,
       email: cleanEmail,
       phone: deposit.phone || '',
@@ -859,10 +1470,11 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
       screenshotUrl: deposit.screenshotUrl || '',
       app: deposit.app || 'PhonePe',
       timestamp: deposit.timestamp || new Date().toISOString(),
+      date: deposit.date || new Date().toISOString().split('T')[0],
+      createdAt: deposit.createdAt || new Date().toISOString(),
       status: deposit.status || 'pending',
-      userId: auth.currentUser?.uid || null,
       updatedAt: new Date().toISOString()
-    });
+    }, { merge: true });
 
     if (auth.currentUser && !isFirestoreQuotaExceeded()) {
       await setDoc(doc(db, 'users', auth.currentUser.uid), {
@@ -877,7 +1489,7 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
   }
 }
 
-export async function updateDepositStatusInFirestore(depositId: string, status: 'pending' | 'approved' | 'rejected'): Promise<void> {
+export async function updateDepositStatusInFirestore(depositId: string, status: 'pending' | 'approved' | 'rejected' | 'cancelled'): Promise<void> {
   if (!depositId || isFirestoreQuotaExceeded()) return;
   const path = `deposits/${depositId}`;
   try {
@@ -899,35 +1511,115 @@ export async function updateDepositStatusInFirestore(depositId: string, status: 
   }
 }
 
-export async function fetchDepositsFromFirestore(): Promise<DepositRequest[]> {
+export async function fetchDepositsFromFirestore(ownerUid?: string, userEmail?: string): Promise<DepositRequest[]> {
+  const currentUser = auth.currentUser;
+  if (isFirestoreQuotaExceeded()) return [];
+
+  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
   const path = 'deposits';
   try {
-    const snap = await getDocs(collection(db, path));
+    const q = collection(db, path);
+    const snap = await getDocs(q);
     const list: DepositRequest[] = [];
+    const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
+    const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+
     snap.forEach((docItem) => {
       const data = docItem.data();
       if (data) {
-        list.push({ ...data, id: data.id || docItem.id } as DepositRequest);
+        const item: DepositRequest = {
+          ...data,
+          id: data.id || docItem.id,
+          requestId: data.requestId || data.id || docItem.id,
+          status: (data.status as any) || 'pending'
+        } as DepositRequest;
+
+        if (isAdmin || !cleanTargetUid && !cleanTargetEmail) {
+          list.push(item);
+        } else {
+          const itemUid = (item.ownerUid || item.userId || '').trim();
+          const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+          const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                          (cleanTargetEmail && itemEmail === cleanTargetEmail);
+          if (isMatch) {
+            list.push(item);
+          }
+        }
       }
     });
-    return list;
+
+    return list.sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
   } catch (error) {
-    try {
-      handleFirestoreError(error, OperationType.LIST, path);
-    } catch {}
+    handlePossibleQuotaError(error);
     return [];
   }
 }
 
-export async function deleteDepositFromFirestore(depositId: string): Promise<void> {
-  if (!depositId || isFirestoreQuotaExceeded()) return;
-  const path = `deposits/${depositId}`;
+export function subscribeToDepositsFromFirestore(
+  callback: (deposits: DepositRequest[]) => void,
+  ownerUid?: string,
+  userEmail?: string
+): () => void {
+  if (isFirestoreQuotaExceeded()) return () => {};
+  const path = 'deposits';
+  const currentUser = auth.currentUser;
+  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
+  const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
+  const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+
   try {
-    await deleteDoc(doc(db, 'deposits', depositId));
-  } catch (error) {
-    if (handlePossibleQuotaError(error)) return;
-    console.warn(`Firestore deposit deletion notice (${depositId}):`, error);
+    const unsubscribe = onSnapshot(collection(db, path), (snap) => {
+      const list: DepositRequest[] = [];
+      snap.forEach((docItem) => {
+        const data = docItem.data();
+        if (data) {
+          const item: DepositRequest = {
+            ...data,
+            id: data.id || docItem.id,
+            requestId: data.requestId || data.id || docItem.id,
+            status: (data.status as any) || 'pending'
+          } as DepositRequest;
+
+          if (isAdmin || (!cleanTargetUid && !cleanTargetEmail)) {
+            list.push(item);
+          } else {
+            const itemUid = (item.ownerUid || item.userId || '').trim();
+            const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+            const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                            (cleanTargetEmail && itemEmail === cleanTargetEmail);
+            if (isMatch) {
+              list.push(item);
+            }
+          }
+        }
+      });
+
+      list.sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+        return timeB - timeA;
+      });
+
+      callback(list);
+    }, (err) => {
+      handlePossibleQuotaError(err);
+    });
+
+    return unsubscribe;
+  } catch {
+    return () => {};
   }
+}
+
+export async function deleteDepositFromFirestore(depositId: string): Promise<void> {
+  // STRICT ZERO-DELETION POLICY:
+  // Historical financial records are never deleted from Firestore.
+  // When an admin or user cancels a record, its status is updated to 'cancelled'.
+  await updateDepositStatusInFirestore(depositId, 'cancelled');
 }
 
 export async function saveDepositQrToFirestore(qrDataUrl: string): Promise<void> {
@@ -1018,9 +1710,15 @@ export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<v
   if (!w || !w.id || isFirestoreQuotaExceeded()) return;
   const path = `withdrawals/${w.id}`;
   const cleanEmail = (w.userEmail || w.email || auth.currentUser?.email || '').trim().toLowerCase();
+  const resolvedOwnerUid = w.ownerUid || w.userId || auth.currentUser?.uid || '';
+  const persistentRequestId = w.requestId || w.id;
+
   try {
     await setDoc(doc(db, 'withdrawals', w.id), {
       id: w.id,
+      requestId: persistentRequestId,
+      ownerUid: resolvedOwnerUid,
+      userId: resolvedOwnerUid,
       userName: w.userName || '',
       userEmail: cleanEmail,
       email: cleanEmail,
@@ -1034,9 +1732,8 @@ export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<v
       date: w.date || new Date().toISOString().split('T')[0],
       createdAt: w.createdAt || new Date().toISOString(),
       status: w.status || 'pending',
-      userId: auth.currentUser?.uid || null,
       updatedAt: new Date().toISOString()
-    });
+    }, { merge: true });
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
@@ -1057,35 +1754,114 @@ export async function updateWithdrawalStatusInFirestore(withdrawalId: string, st
   }
 }
 
-export async function fetchWithdrawalsFromFirestore(): Promise<WithdrawalRequest[]> {
+export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail?: string): Promise<WithdrawalRequest[]> {
+  const currentUser = auth.currentUser;
+  if (isFirestoreQuotaExceeded()) return [];
+
+  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
   const path = 'withdrawals';
   try {
-    const snap = await getDocs(collection(db, path));
+    const q = collection(db, path);
+    const snap = await getDocs(q);
     const list: WithdrawalRequest[] = [];
+    const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
+    const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+
     snap.forEach((docItem) => {
       const data = docItem.data();
       if (data) {
-        list.push({ ...data, id: data.id || docItem.id } as WithdrawalRequest);
+        const item: WithdrawalRequest = {
+          ...data,
+          id: data.id || docItem.id,
+          requestId: data.requestId || data.id || docItem.id,
+          status: (data.status as any) || 'pending'
+        } as WithdrawalRequest;
+
+        if (isAdmin || (!cleanTargetUid && !cleanTargetEmail)) {
+          list.push(item);
+        } else {
+          const itemUid = (item.ownerUid || item.userId || '').trim();
+          const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+          const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                          (cleanTargetEmail && itemEmail === cleanTargetEmail);
+          if (isMatch) {
+            list.push(item);
+          }
+        }
       }
     });
-    return list;
+
+    return list.sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
   } catch (error) {
-    try {
-      handleFirestoreError(error, OperationType.LIST, path);
-    } catch {}
+    handlePossibleQuotaError(error);
     return [];
   }
 }
 
-export async function deleteWithdrawalFromFirestore(withdrawalId: string): Promise<void> {
-  if (!withdrawalId || isFirestoreQuotaExceeded()) return;
-  const path = `withdrawals/${withdrawalId}`;
+export function subscribeToWithdrawalsFromFirestore(
+  callback: (withdrawals: WithdrawalRequest[]) => void,
+  ownerUid?: string,
+  userEmail?: string
+): () => void {
+  if (isFirestoreQuotaExceeded()) return () => {};
+  const path = 'withdrawals';
+  const currentUser = auth.currentUser;
+  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
+  const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
+  const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+
   try {
-    await deleteDoc(doc(db, 'withdrawals', withdrawalId));
-  } catch (error) {
-    if (handlePossibleQuotaError(error)) return;
-    console.warn(`Firestore withdrawal deletion notice (${withdrawalId}):`, error);
+    const unsubscribe = onSnapshot(collection(db, path), (snap) => {
+      const list: WithdrawalRequest[] = [];
+      snap.forEach((docItem) => {
+        const data = docItem.data();
+        if (data) {
+          const item: WithdrawalRequest = {
+            ...data,
+            id: data.id || docItem.id,
+            requestId: data.requestId || data.id || docItem.id,
+            status: (data.status as any) || 'pending'
+          } as WithdrawalRequest;
+
+          if (isAdmin || (!cleanTargetUid && !cleanTargetEmail)) {
+            list.push(item);
+          } else {
+            const itemUid = (item.ownerUid || item.userId || '').trim();
+            const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+            const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                            (cleanTargetEmail && itemEmail === cleanTargetEmail);
+            if (isMatch) {
+              list.push(item);
+            }
+          }
+        }
+      });
+
+      list.sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+        return timeB - timeA;
+      });
+
+      callback(list);
+    }, (err) => {
+      handlePossibleQuotaError(err);
+    });
+
+    return unsubscribe;
+  } catch {
+    return () => {};
   }
+}
+
+export async function deleteWithdrawalFromFirestore(withdrawalId: string): Promise<void> {
+  // STRICT ZERO-DELETION POLICY:
+  // Update status to 'cancelled' to preserve ledger and audit history.
+  await updateWithdrawalStatusInFirestore(withdrawalId, 'cancelled');
 }
 
 // Support Tickets Cloud Database Sync
@@ -1104,9 +1880,16 @@ export async function saveSupportTicketToFirestore(ticket: SupportTicket): Promi
 }
 
 export async function fetchSupportTicketsFromFirestore(): Promise<SupportTicket[]> {
+  const currentUser = auth.currentUser;
+  if (!currentUser || isFirestoreQuotaExceeded()) return [];
+
+  const isAdmin = currentUser.email === 'nmlcompany720@gmail.com';
   const path = 'support_tickets';
   try {
-    const snap = await getDocs(collection(db, path));
+    const q = isAdmin 
+      ? collection(db, path) 
+      : query(collection(db, path), where('userEmail', '==', (currentUser.email || '').toLowerCase()));
+    const snap = await getDocs(q);
     const list: SupportTicket[] = [];
     snap.forEach((docItem) => {
       const data = docItem.data();
@@ -1116,6 +1899,7 @@ export async function fetchSupportTicketsFromFirestore(): Promise<SupportTicket[
     });
     return list;
   } catch (error) {
+    handlePossibleQuotaError(error);
     return [];
   }
 }
@@ -1142,5 +1926,350 @@ export async function deleteSupportTicketFromFirestore(ticketId: string): Promis
     }
   } catch {}
 }
+
+// Contest Entries Firestore Cloud Database Persistence
+export async function saveContestEntryToFirestore(entry: ContestEntry): Promise<void> {
+  if (!entry || !entry.entryId || isFirestoreQuotaExceeded()) return;
+  const path = `contest_entries/${entry.entryId}`;
+  try {
+    await setDoc(doc(db, 'contest_entries', entry.entryId), {
+      ...entry,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
+    console.warn(`Firestore contest entry save notice (${entry.entryId}):`, error);
+  }
+}
+
+export async function fetchContestEntriesFromFirestore(contestId: string): Promise<ContestEntry[]> {
+  if (!contestId || isFirestoreQuotaExceeded()) return [];
+  const path = 'contest_entries';
+  try {
+    const q = query(collection(db, path), where('contestId', '==', contestId));
+    const snap = await getDocs(q);
+    const list: ContestEntry[] = [];
+    snap.forEach((docItem) => {
+      const data = docItem.data();
+      if (data && data.entryId) {
+        list.push(data as ContestEntry);
+      }
+    });
+    return list;
+  } catch (error) {
+    return [];
+  }
+}
+
+export function subscribeToContestEntriesFromFirestore(
+  contestId: string,
+  callback: (entries: ContestEntry[]) => void
+): () => void {
+  if (!contestId || isFirestoreQuotaExceeded()) return () => {};
+  const path = 'contest_entries';
+  try {
+    const q = query(collection(db, path), where('contestId', '==', contestId));
+    return onSnapshot(
+      q,
+      (snap) => {
+        const list: ContestEntry[] = [];
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data && data.entryId) {
+            list.push(data as ContestEntry);
+          }
+        });
+        callback(list);
+      },
+      (error) => {
+        handlePossibleQuotaError(error);
+        console.warn(`Firestore contest entries subscription notice (${contestId}):`, error);
+      }
+    );
+  } catch (err) {
+    return () => {};
+  }
+}
+
+export async function fetchAllContestEntriesFromFirestore(): Promise<ContestEntry[]> {
+  if (isFirestoreQuotaExceeded()) return [];
+  const path = 'contest_entries';
+  try {
+    const snap = await getDocs(collection(db, path));
+    const list: ContestEntry[] = [];
+    snap.forEach((docItem) => {
+      const data = docItem.data();
+      if (data && data.entryId) {
+        list.push(data as ContestEntry);
+      }
+    });
+    return list;
+  } catch (error) {
+    return [];
+  }
+}
+
+
+// Financial Ledger Audit Records Persistence
+export async function saveFinancialLedgerToFirestore(record: FinancialLedgerRecord): Promise<void> {
+  if (!record || !record.transactionId || isFirestoreQuotaExceeded()) return;
+  const path = `financial_ledgers/${record.transactionId}`;
+  try {
+    await setDoc(doc(db, 'financial_ledgers', record.transactionId), {
+      ...record,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) return;
+    console.warn(`Firestore ledger save notice (${record.transactionId}):`, error);
+  }
+}
+
+export async function fetchFinancialLedgersFromFirestore(contestId?: string, ownerUid?: string): Promise<FinancialLedgerRecord[]> {
+  if (isFirestoreQuotaExceeded()) return [];
+  const path = 'financial_ledgers';
+  try {
+    let q = query(collection(db, path));
+    if (contestId) {
+      q = query(collection(db, path), where('contestId', '==', contestId));
+    } else if (ownerUid) {
+      q = query(collection(db, path), where('ownerUid', '==', ownerUid));
+    }
+    const snap = await getDocs(q);
+    const list: FinancialLedgerRecord[] = [];
+    snap.forEach((docItem) => {
+      const data = docItem.data();
+      if (data && data.transactionId) {
+        list.push(data as FinancialLedgerRecord);
+      }
+    });
+    list.sort((a, b) => b.timestampMs - a.timestampMs);
+    return list;
+  } catch (error) {
+    return [];
+  }
+}
+
+// Contest Final Settlement Wallet Credit Helper with strict Idempotency Guard
+export async function creditWalletForSettlement(
+  ownerUid: string, 
+  amountRupees: number, 
+  contestId?: string,
+  fallbackUserId?: string,
+  userEmail?: string
+): Promise<boolean> {
+  if (!ownerUid || amountRupees <= 0 || isFirestoreQuotaExceeded()) return false;
+  try {
+    const cleanEmail = (userEmail || '').trim().toLowerCase();
+    const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+    const strippedOwnerUid = ownerUid.replace(/^usr-/, '');
+
+    const userDocRef = doc(db, 'users', ownerUid);
+    const strippedDocRef = strippedOwnerUid !== ownerUid ? doc(db, 'users', strippedOwnerUid) : null;
+    const emailDocRef = safeEmailDocId ? doc(db, 'users', safeEmailDocId) : null;
+    const fallbackDocRef = fallbackUserId && fallbackUserId !== ownerUid ? doc(db, 'users', fallbackUserId) : null;
+    const settlementDocId = contestId ? `settlement_${contestId}_${ownerUid}` : null;
+    const settlementDocRef = settlementDocId ? doc(db, 'contest_settlements', settlementDocId) : null;
+
+    let credited = false;
+    await runTransaction(db, async (transaction) => {
+      if (settlementDocRef) {
+        const existingSettlement = await transaction.get(settlementDocRef);
+        if (existingSettlement.exists()) {
+          // Idempotency: Already credited for this contest and user
+          return;
+        }
+      }
+
+      let targetRef = userDocRef;
+      let userDoc = await transaction.get(userDocRef);
+
+      if (!userDoc.exists() && strippedDocRef) {
+        const snap = await transaction.get(strippedDocRef);
+        if (snap.exists()) {
+          userDoc = snap;
+          targetRef = strippedDocRef;
+        }
+      }
+
+      if (!userDoc.exists() && emailDocRef) {
+        const snap = await transaction.get(emailDocRef);
+        if (snap.exists()) {
+          userDoc = snap;
+          targetRef = emailDocRef;
+        }
+      }
+
+      if (!userDoc.exists() && fallbackDocRef) {
+        const fallbackSnap = await transaction.get(fallbackDocRef);
+        if (fallbackSnap.exists()) {
+          userDoc = fallbackSnap;
+          targetRef = fallbackDocRef;
+        }
+      }
+
+      if (!userDoc.exists() && auth.currentUser?.uid && auth.currentUser.uid !== ownerUid) {
+        const authDocRef = doc(db, 'users', auth.currentUser.uid);
+        const authSnap = await transaction.get(authDocRef);
+        if (authSnap.exists()) {
+          userDoc = authSnap;
+          targetRef = authDocRef;
+        }
+      }
+
+      if (userDoc.exists()) {
+        const data = userDoc.data();
+        const currentBal = Number(data?.walletBalance) || 0;
+        const currentWon = Number(data?.totalWonAmount) || 0;
+
+        transaction.update(targetRef, {
+          walletBalance: currentBal + amountRupees,
+          totalWonAmount: currentWon + amountRupees,
+          updatedAt: new Date().toISOString()
+        });
+      } else {
+        // Initialize user doc if not yet created in Firestore
+        const chosenRef = emailDocRef || (auth.currentUser?.uid ? doc(db, 'users', auth.currentUser.uid) : targetRef);
+        transaction.set(chosenRef, {
+          id: fallbackUserId || ownerUid,
+          uid: auth.currentUser?.uid || ownerUid,
+          email: cleanEmail,
+          walletBalance: amountRupees,
+          totalWonAmount: amountRupees,
+          quizzesPlayed: 1,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      }
+
+      if (settlementDocRef) {
+        transaction.set(settlementDocRef, {
+          contestId: contestId || '',
+          ownerUid,
+          prizeRupees: amountRupees,
+          creditedAt: new Date().toISOString()
+        });
+      }
+      credited = true;
+    });
+    return credited;
+  } catch (err) {
+    console.warn(`Wallet credit transaction notice for ${ownerUid}:`, err);
+    return false;
+  }
+}
+
+export async function updateQuizAttemptPrizeInFirestore(
+  contestId: string,
+  ownerUid: string,
+  finalPrizeRupees: number,
+  finalRank?: number,
+  entryId?: string,
+  fallbackUserId?: string,
+  userEmail?: string
+): Promise<void> {
+  if (!contestId || (!ownerUid && !fallbackUserId && !userEmail) || isFirestoreQuotaExceeded()) return;
+  try {
+    const targetUids = Array.from(new Set([ownerUid, fallbackUserId, auth.currentUser?.uid].filter(Boolean))) as string[];
+    for (const uid of targetUids) {
+      const q = query(collection(db, 'quiz_attempts'), where('ownerUid', '==', uid));
+      const snap = await getDocs(q);
+      snap.forEach((docItem) => {
+        const data = docItem.data();
+        if (data && (data.contestId === contestId || docItem.id.includes(contestId))) {
+          if (!entryId || !data.entryId || data.entryId === entryId) {
+            updateDoc(doc(db, 'quiz_attempts', docItem.id), {
+              finalPrizeRupees,
+              rewardAmount: finalPrizeRupees,
+              rewardWon: finalPrizeRupees > 0 ? `₹${finalPrizeRupees} Won` : 'Better Luck Next Time',
+              settlementStatus: 'settled',
+              ...(finalRank ? { rank: finalRank } : {}),
+              ...(entryId ? { entryId } : {}),
+              updatedAt: new Date().toISOString()
+            }).catch(() => {});
+          }
+        }
+      });
+
+      // Also check where userId == uid
+      const qUser = query(collection(db, 'quiz_attempts'), where('userId', '==', uid));
+      const snapUser = await getDocs(qUser);
+      snapUser.forEach((docItem) => {
+        const data = docItem.data();
+        if (data && (data.contestId === contestId || docItem.id.includes(contestId))) {
+          if (!entryId || !data.entryId || data.entryId === entryId) {
+            updateDoc(doc(db, 'quiz_attempts', docItem.id), {
+              finalPrizeRupees,
+              rewardAmount: finalPrizeRupees,
+              rewardWon: finalPrizeRupees > 0 ? `₹${finalPrizeRupees} Won` : 'Better Luck Next Time',
+              settlementStatus: 'settled',
+              ...(finalRank ? { rank: finalRank } : {}),
+              ...(entryId ? { entryId } : {}),
+              updatedAt: new Date().toISOString()
+            }).catch(() => {});
+          }
+        }
+      });
+    }
+
+    const cleanEmail = (userEmail || '').trim().toLowerCase();
+    if (cleanEmail) {
+      const qEmail = query(collection(db, 'quiz_attempts'), where('userEmail', '==', cleanEmail));
+      const snapEmail = await getDocs(qEmail);
+      snapEmail.forEach((docItem) => {
+        const data = docItem.data();
+        if (data && (data.contestId === contestId || docItem.id.includes(contestId))) {
+          if (!entryId || !data.entryId || data.entryId === entryId) {
+            updateDoc(doc(db, 'quiz_attempts', docItem.id), {
+              finalPrizeRupees,
+              rewardAmount: finalPrizeRupees,
+              rewardWon: finalPrizeRupees > 0 ? `₹${finalPrizeRupees} Won` : 'Better Luck Next Time',
+              settlementStatus: 'settled',
+              ...(finalRank ? { rank: finalRank } : {}),
+              ...(entryId ? { entryId } : {}),
+              updatedAt: new Date().toISOString()
+            }).catch(() => {});
+          }
+        }
+      });
+    }
+  } catch (err) {
+    console.warn('Failed to update quiz attempt prize in Firestore:', err);
+  }
+}
+
+export async function syncUserNameAcrossContestEntriesInFirestore(
+  ownerUid: string,
+  newUserName: string
+): Promise<void> {
+  if (!ownerUid || !newUserName || !newUserName.trim() || isFirestoreQuotaExceeded()) return;
+  const cleanName = newUserName.trim();
+  try {
+    // 1. Synchronize name on all active contest entries for this ownerUid
+    const qEntries = query(collection(db, 'contest_entries'), where('ownerUid', '==', ownerUid));
+    const snapEntries = await getDocs(qEntries);
+    snapEntries.forEach((docItem) => {
+      const data = docItem.data();
+      if (data && data.isActive && data.status === 'active') {
+        updateDoc(doc(db, 'contest_entries', docItem.id), {
+          userName: cleanName,
+          updatedAt: new Date().toISOString()
+        }).catch(() => {});
+      }
+    });
+
+    // 2. Synchronize name on active/pending quiz attempts for this ownerUid
+    const qAttempts = query(collection(db, 'quiz_attempts'), where('ownerUid', '==', ownerUid));
+    const snapAttempts = await getDocs(qAttempts);
+    snapAttempts.forEach((docItem) => {
+      updateDoc(doc(db, 'quiz_attempts', docItem.id), {
+        userName: cleanName,
+        updatedAt: new Date().toISOString()
+      }).catch(() => {});
+    });
+  } catch (err) {
+    console.warn('Failed to sync user name across contest entries in Firestore:', err);
+  }
+}
+
 
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   ShieldCheck, 
   MoreVertical,
@@ -25,6 +25,7 @@ import { soundFx } from '../utils/audio';
 import { DepositPage } from './DepositPage';
 import { WithdrawModal } from './WithdrawModal';
 import { TransactionHistoryPage } from './TransactionHistoryPage';
+import { contestBackend } from '../backend/contestEngine';
 
 const ITEMS_PER_PAGE = 3;
 const BRAND_GRADIENT = 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)';
@@ -130,29 +131,43 @@ function formatParticipationTime(dateStr?: string, submittedAt?: string): string
 }
 
 function formatDuration(seconds?: number): string {
-  if (!seconds || seconds <= 0) return '0s';
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
+  if (seconds === undefined || seconds === null || seconds <= 0) return '—';
+  const total = Math.round(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
   if (mins > 0) {
-    return `${mins}m ${secs}s`;
+    return `${mins}m ${secs.toString().padStart(2, '0')}s`;
   }
   return `${secs}s`;
 }
 
 function formatWinningAmount(attempt: QuizAttemptResult): string {
-  if (attempt.rewardAmount && attempt.rewardAmount > 0) {
-    return `₹${attempt.rewardAmount.toLocaleString('en-IN')}`;
-  }
-  if (attempt.rewardWon) {
-    const match = attempt.rewardWon.match(/₹\s*([0-9,]+)/);
+  // 1. Authoritative check: If contest is settled in backend, derive prize strictly from settlement record
+  if (attempt.contestId && contestBackend.isContestSettled(attempt.contestId)) {
+    const disbursements = contestBackend.getContestDisbursements(attempt.contestId);
+    const match = disbursements.find(d => 
+      (attempt.entryId && d.entryId === attempt.entryId) ||
+      (attempt.ownerUid && d.ownerUid === attempt.ownerUid) ||
+      (attempt.userId && d.ownerUid === attempt.userId)
+    );
     if (match) {
-      return `₹${match[1]}`;
+      return match.prizeRupees > 0 ? `₹${match.prizeRupees.toLocaleString('en-IN')}` : '₹0';
     }
-    if (attempt.rewardType === 'product') {
-      return 'Product';
-    }
+    // Confirmed non-winner in settled contest
+    return '₹0';
   }
-  return '₹0';
+
+  // 2. If attempt is marked settled on the record
+  if (attempt.settlementStatus === 'settled') {
+    const finalAmount = attempt.finalPrizeRupees !== undefined ? attempt.finalPrizeRupees : (attempt.rewardAmount ?? 0);
+    if (finalAmount > 0) {
+      return `₹${finalAmount.toLocaleString('en-IN')}`;
+    }
+    return '₹0';
+  }
+
+  // 3. Before contest finalization and successful settlement, display "Pending"
+  return 'Pending';
 }
 
 export const ProfileWallet: React.FC<ProfileWalletProps> = ({
@@ -416,8 +431,13 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
   );
   const currentCountry = COUNTRY_CALLING_CODES.find(c => c.code === selectedCountryCode) || COUNTRY_CALLING_CODES[0];
 
+  // Authenticated identity for strict data isolation
+  const currentUid = userProfile?.uid || currentUser?.uid || '';
+  const currentId = userProfile?.id || userProfile?.customUserId || '';
+  const currentEmail = (userProfile?.email || currentUser?.email || '').trim().toLowerCase();
+
   // Fallback to local storage cache to guarantee 100% data integrity & persistence
-  const effectiveAttempts: QuizAttemptResult[] = (quizAttempts && quizAttempts.length > 0)
+  const allRawAttempts: QuizAttemptResult[] = (quizAttempts && quizAttempts.length > 0)
     ? quizAttempts
     : (() => {
         try {
@@ -427,7 +447,84 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
         return [];
       })();
 
+  const effectiveAttempts: QuizAttemptResult[] = allRawAttempts
+    .filter(item => {
+      if (!item) return false;
+      if (currentUid && (item.ownerUid === currentUid || item.userId === currentUid)) return true;
+      if (currentId && (item.ownerUid === currentId || item.userId === currentId)) return true;
+      if (currentEmail && item.userEmail && item.userEmail.trim().toLowerCase() === currentEmail) return true;
+      return false;
+    })
+    .map(item => {
+      if (item.contestId && contestBackend.isContestSettled(item.contestId)) {
+        const disbursements = contestBackend.getContestDisbursements(item.contestId);
+        const matchingDisb = disbursements.find(d => 
+          (item.entryId && d.entryId === item.entryId) ||
+          (item.ownerUid && (d.ownerUid === item.ownerUid || d.ownerUid === item.ownerUid.replace(/^usr-/, ''))) ||
+          (item.userId && (d.ownerUid === item.userId || d.ownerUid === item.userId.replace(/^usr-/, ''))) ||
+          (item.userEmail && d.ownerUid && d.ownerUid.toLowerCase().includes(item.userEmail.replace(/[^a-zA-Z0-9]/g, '_')))
+        );
+        const prize = matchingDisb ? matchingDisb.prizeRupees : 0;
+        return {
+          ...item,
+          settlementStatus: 'settled' as const,
+          finalPrizeRupees: prize,
+          rewardAmount: prize,
+          rank: matchingDisb ? matchingDisb.rank : (item.rank || 1)
+        };
+      }
+      return item;
+    })
+    .filter((item): item is QuizAttemptResult => Boolean(item));
+
+  // Authoritative settled winnings derived strictly from settled contest disbursements
+  const userSettledWinnings = useMemo(() => {
+    let total = 0;
+    const creditedContests = new Set<string>();
+    effectiveAttempts.forEach(att => {
+      if (att && att.contestId && !creditedContests.has(att.contestId)) {
+        if (att.settlementStatus === 'settled' && (att.finalPrizeRupees || 0) > 0) {
+          total += (att.finalPrizeRupees || 0);
+          creditedContests.add(att.contestId);
+        } else if (contestBackend.isContestSettled(att.contestId)) {
+          const disbs = contestBackend.getContestDisbursements(att.contestId);
+          const match = disbs.find(d => 
+            (att.entryId && d.entryId === att.entryId) ||
+            (att.ownerUid && (d.ownerUid === att.ownerUid || d.ownerUid === att.ownerUid.replace(/^usr-/, ''))) ||
+            (att.userId && (d.ownerUid === att.userId || d.ownerUid === att.userId.replace(/^usr-/, ''))) ||
+            (att.userEmail && d.ownerUid && d.ownerUid.toLowerCase().includes(att.userEmail.replace(/[^a-zA-Z0-9]/g, '_')))
+          );
+          if (match && match.prizeRupees > 0) {
+            total += match.prizeRupees;
+            creditedContests.add(att.contestId);
+          }
+        }
+      }
+    });
+    return total;
+  }, [effectiveAttempts]);
+
+  // Ensure Wallet Credits and Total Won accurately reflect settled winnings
+  const effectiveTotalWon = Math.max(Number(userProfile.totalWonAmount) || 0, userSettledWinnings);
+  const effectiveWalletBalance = Math.max(Number(userProfile.walletBalance) || 0, userSettledWinnings);
+
+  // Synchronize state, localStorage and Firestore if settled winnings were not yet captured in userProfile
+  useEffect(() => {
+    if (userSettledWinnings > (Number(userProfile.totalWonAmount) || 0)) {
+      const prizeDiff = userSettledWinnings - (Number(userProfile.totalWonAmount) || 0);
+      const updatedProfile: UserProfile = {
+        ...userProfile,
+        walletBalance: (Number(userProfile.walletBalance) || 0) + prizeDiff,
+        totalWonAmount: userSettledWinnings
+      };
+      if (onUpdateProfile) {
+        onUpdateProfile(updatedProfile);
+      }
+    }
+  }, [userSettledWinnings, userProfile, onUpdateProfile]);
+
   const filteredHistory = effectiveAttempts.filter(item => {
+    if (!item) return false;
     const itemDate = item.submittedAt 
       ? new Date(item.submittedAt) 
       : (item.quizDate ? new Date(item.quizDate) : new Date());
@@ -573,7 +670,7 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
               <span>CREDITS</span>
             </span>
             <span className="text-base sm:text-xl md:text-2xl font-black text-[#059669] mt-1">
-              ₹{userProfile.walletBalance ?? 0}
+              ₹{effectiveWalletBalance}
             </span>
           </div>
 
@@ -584,7 +681,7 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
               <span>WON</span>
             </span>
             <span className="text-base sm:text-xl md:text-2xl font-black text-[#6366F1] mt-1">
-              ₹{userProfile.totalWonAmount ?? 0}
+              ₹{effectiveTotalWon}
             </span>
           </div>
 
@@ -749,7 +846,20 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
                   <span className="text-[11px] sm:text-xs text-slate-500 font-medium truncate">
                     Time Taken: <strong className="text-slate-800 font-bold">{formatDuration(item.timeTakenSeconds)}</strong>
                   </span>
-                  <span className="text-sm sm:text-base font-black text-emerald-600 shrink-0">
+                  <span 
+                    className={`text-sm sm:text-base font-black shrink-0 ${
+                      formatWinningAmount(item) === '₹0' 
+                        ? 'text-slate-600' 
+                        : formatWinningAmount(item) !== 'Pending' 
+                        ? 'text-emerald-600' 
+                        : ''
+                    }`}
+                    style={formatWinningAmount(item) === 'Pending' ? {
+                      background: BRAND_GRADIENT,
+                      WebkitBackgroundClip: 'text',
+                      WebkitTextFillColor: 'transparent',
+                    } : undefined}
+                  >
                     {formatWinningAmount(item)}
                   </span>
                 </div>

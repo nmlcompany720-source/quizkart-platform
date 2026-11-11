@@ -17,7 +17,8 @@ import {
 import { UserProfile } from '../types';
 import { soundFx } from '../utils/audio';
 import { compressImage } from '../utils/imageCompressor';
-import { syncUserProfile } from '../firebase';
+import { syncUserProfile, auth, db } from '../firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { User } from 'firebase/auth';
 import { ALL_COUNTRY_CALLING_CODES } from '../data/countryCallingCodes';
 import { DEFAULT_REGISTERED_USERS, isDemoSeedUser } from '../data/quizData';
@@ -181,66 +182,94 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
     };
   }, [isCountryDropdownOpen]);
 
-  // Resolve sequential Registration ID for display at the top of Edit Profile (100% synced with Admin Panel)
-  const displayRegistrationId = (() => {
-    const targetEmail = (userProfile.email || editEmail || '').trim().toLowerCase();
-    const targetMobile = (userProfile.mobile || editMobile || '').replace(/\D/g, '');
-    const rawId = (userProfile.id || '').trim().toUpperCase();
-    const targetId = (/^(?:QK-)?USR-\d+$/i.test(rawId)) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
+  // Real-Time Live Firestore Synchronization for User Registration ID (Single Source of Truth: users/{uid})
+  const [firestoreCustomUserId, setFirestoreCustomUserId] = useState<string | null>(() => {
+    const raw = (userProfile?.customUserId || userProfile?.id || '').trim().toUpperCase();
+    return /^(?:QK-)?USR-\d+$/i.test(raw) ? (raw.startsWith('QK-') ? raw : `QK-${raw}`) : null;
+  });
+  const [isIdLoading, setIsIdLoading] = useState<boolean>(true);
 
-    try {
-      const regRaw = localStorage.getItem('quizkart_registered_users');
-      const parsedList: UserProfile[] = regRaw ? JSON.parse(regRaw) : [];
-      const list = Array.isArray(parsedList)
-        ? parsedList.filter((u) => u && !isDemoSeedUser(u))
-        : [];
+  useEffect(() => {
+    // 1. Resolve authenticated user's Firebase UID
+    const authUid = currentUser?.uid || auth.currentUser?.uid || (userProfile?.uid && !userProfile.uid.startsWith('QK-USR-') ? userProfile.uid : null);
 
-      // Priority 1: Match by email
-      if (targetEmail) {
-        const emailIdx = list.findIndex((u) => {
-          if (!u || !u.email) return false;
-          return u.email.trim().toLowerCase() === targetEmail;
-        });
-        if (emailIdx >= 0) {
-          return `QK-USR-${1001 + emailIdx}`;
+    if (!authUid) {
+      const fallbackId = (userProfile?.customUserId || userProfile?.id || '').trim().toUpperCase();
+      if (/^(?:QK-)?USR-\d+$/i.test(fallbackId)) {
+        setFirestoreCustomUserId(fallbackId.startsWith('QK-') ? fallbackId : `QK-${fallbackId}`);
+      } else {
+        setFirestoreCustomUserId(null);
+      }
+      setIsIdLoading(false);
+      return;
+    }
+
+    setIsIdLoading(true);
+    let isSubscribed = true;
+
+    // 2. Real-time Firestore onSnapshot listener directly on "users/{auth.currentUser.uid}"
+    const userDocRef = doc(db, 'users', authUid);
+    const unsubscribe = onSnapshot(
+      userDocRef,
+      (docSnap) => {
+        if (!isSubscribed) return;
+        setIsIdLoading(false);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          const docCustomId = data?.customUserId || data?.id;
+          if (docCustomId && typeof docCustomId === 'string' && /^(?:QK-)?USR-\d+$/i.test(docCustomId.trim())) {
+            const clean = docCustomId.trim().toUpperCase();
+            const normalizedId = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+            setFirestoreCustomUserId(normalizedId);
+
+            // Synchronize with parent userProfile state without resetting other fields
+            if (userProfile && (userProfile.customUserId !== normalizedId || userProfile.id !== normalizedId)) {
+              onUpdateProfile({
+                ...userProfile,
+                id: normalizedId,
+                customUserId: normalizedId,
+                userNumber: typeof data?.userNumber === 'number' ? data.userNumber : userProfile.userNumber
+              });
+            }
+            return;
+          }
+        }
+
+        // If doc does not yet have customUserId, fallback to userProfile only if already valid sequential ID
+        const validExisting = (userProfile?.customUserId || userProfile?.id || '').trim().toUpperCase();
+        if (/^(?:QK-)?USR-\d+$/i.test(validExisting)) {
+          setFirestoreCustomUserId(validExisting.startsWith('QK-') ? validExisting : `QK-${validExisting}`);
+        } else {
+          setFirestoreCustomUserId(null);
+        }
+      },
+      (error) => {
+        if (!isSubscribed) return;
+        setIsIdLoading(false);
+        console.warn('EditProfilePage: Firestore user doc listener error:', error);
+        const validExisting = (userProfile?.customUserId || userProfile?.id || '').trim().toUpperCase();
+        if (/^(?:QK-)?USR-\d+$/i.test(validExisting)) {
+          setFirestoreCustomUserId(validExisting.startsWith('QK-') ? validExisting : `QK-${validExisting}`);
+        } else {
+          setFirestoreCustomUserId(null);
         }
       }
+    );
 
-      // Priority 2: Match by mobile number only if emails do not conflict
-      if (targetMobile && targetMobile.length >= 7) {
-        const mobIdx = list.findIndex((u) => {
-          if (!u || !u.mobile) return false;
-          const uMob = u.mobile.replace(/\D/g, '');
-          const uEmail = (u.email || '').trim().toLowerCase();
-          if (uMob !== targetMobile) return false;
-          if (targetEmail && uEmail && targetEmail !== uEmail) return false;
-          return true;
-        });
-        if (mobIdx >= 0) {
-          return `QK-USR-${1001 + mobIdx}`;
-        }
-      }
+    return () => {
+      isSubscribed = false;
+      unsubscribe();
+    };
+  }, [currentUser?.uid, userProfile?.uid]);
 
-      // Priority 3: Match by valid QK-USR-XXXX ID only if emails do not conflict
-      if (targetId) {
-        const idIdx = list.findIndex((u) => {
-          if (!u || !u.id) return false;
-          const uId = u.id.trim().toUpperCase();
-          const cleanUId = uId.startsWith('QK-') ? uId : `QK-${uId}`;
-          const uEmail = (u.email || '').trim().toLowerCase();
-          if (cleanUId !== targetId) return false;
-          if (targetEmail && uEmail && targetEmail !== uEmail) return false;
-          return true;
-        });
-        if (idIdx >= 0) {
-          return `QK-USR-${1001 + idIdx}`;
-        }
-        return targetId;
-      }
-    } catch {}
-
-    return 'QK-USR-1001';
-  })();
+  // Exact Registration ID Display: 100% matched with Firestore and Admin Panel
+  const displayRegistrationId = firestoreCustomUserId || (
+    userProfile?.customUserId && /^(?:QK-)?USR-\d+$/i.test(userProfile.customUserId.trim())
+      ? (userProfile.customUserId.trim().toUpperCase().startsWith('QK-') ? userProfile.customUserId.trim().toUpperCase() : `QK-${userProfile.customUserId.trim().toUpperCase()}`)
+      : userProfile?.id && /^(?:QK-)?USR-\d+$/i.test(userProfile.id.trim())
+      ? (userProfile.id.trim().toUpperCase().startsWith('QK-') ? userProfile.id.trim().toUpperCase() : `QK-${userProfile.id.trim().toUpperCase()}`)
+      : null
+  );
 
   // Instant local device image upload
   const handleDeviceImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -374,7 +403,9 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
     setTimeout(async () => {
       const updated: UserProfile = {
         ...userProfile,
-        id: displayRegistrationId,
+        id: displayRegistrationId || userProfile.id,
+        uid: userProfile.uid || currentUser?.uid || userProfile.id || displayRegistrationId,
+        customUserId: displayRegistrationId || userProfile.customUserId || userProfile.id,
         name: editName.trim(),
         email: (editEmail && editEmail.trim()) ? editEmail.trim() : userProfile.email,
         mobile: cleanMobile,
@@ -663,7 +694,13 @@ export const EditProfilePage: React.FC<EditProfilePageProps> = ({
                 WebkitTextFillColor: 'transparent'
               }}
             >
-              {displayRegistrationId}
+              {isIdLoading && !displayRegistrationId ? (
+                <span className="text-slate-400 font-normal">Loading...</span>
+              ) : displayRegistrationId ? (
+                displayRegistrationId
+              ) : (
+                <span className="text-slate-400 font-normal">Unassigned</span>
+              )}
             </span>
           </div>
 

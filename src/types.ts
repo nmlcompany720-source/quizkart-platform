@@ -90,6 +90,8 @@ export interface UserProfile {
   kycDocNumberMasked?: string;
   isVerifiedForOneClickDispatch?: boolean;
   id?: string;
+  customUserId?: string;
+  userNumber?: number;
   uid?: string;
   isBlocked?: boolean;
   blockReason?: string;
@@ -97,6 +99,9 @@ export interface UserProfile {
   passwordStatus?: string;
   hasPassword?: boolean;
   isDeleted?: boolean;
+  status?: string;
+  createdAt?: string;
+  updatedAt?: string;
   deletedAt?: string;
   deletedTimestampMs?: number;
   quizActivity?: QuizAttemptResult[];
@@ -134,9 +139,14 @@ export interface ActiveContest {
   winnersCount?: number;
   realJoins?: number;
   totalRevenue?: number;
+  confirmedPaidEntries?: number;
+  prizePoolPaise?: number;
+  referralPoolPaise?: number;
+  platformMarginPaise?: number;
+  winnerSlots?: number;
   cashConfig?: CashContestConfig;
   productConfig?: ProductContestConfig;
-  status: 'active' | 'scheduled' | 'completed' | 'full';
+  status: 'active' | 'scheduled' | 'completed' | 'expired' | 'full';
   scheduledTime?: string; // Start Timer (ISO timestamp)
   endTime?: string;       // End Timer (ISO timestamp)
   activatedAt?: string;   // Timestamp when contest went LIVE
@@ -182,6 +192,8 @@ export interface AutoPilotSettings {
 
 export interface LeaderboardEntry {
   id: string;
+  entryId?: string;
+  ownerUid?: string;
   rank: number;
   userName: string;
   avatar: string;
@@ -197,11 +209,15 @@ export interface LeaderboardEntry {
   isCurrentUser?: boolean;
   timestamp: string;
   submittedAt: string;
+  securityBreached?: boolean;
 }
 
 export interface QuizAttemptResult {
   attemptId: string;
+  entryId?: string;
   userId?: string;
+  ownerUid?: string;
+  userEmail?: string;
   userName?: string;
   quizDate: string;
   score: number;
@@ -214,12 +230,19 @@ export interface QuizAttemptResult {
   rewardWon: string;
   rewardType: 'product' | 'cashback' | 'none';
   rewardAmount?: number;
+  finalPrizeRupees?: number;
+  settlementStatus?: 'pending' | 'settled';
+  provisionalPrizeRupees?: number;
+  payoutMessage?: string;
+  selectedMessageOption?: number;
   deliveryAddress?: UserAddress;
   upiId?: string;
   securityBreached?: boolean;
   securityBreachReason?: string;
   title?: string;
   submittedAt?: string;
+  contestId?: string;
+  questions?: Question[];
 }
 
 export interface DailyPrizeItem {
@@ -266,6 +289,9 @@ export type PoolBreakdown = PoolEconomics;
 
 export interface DepositRequest {
   id: string;
+  requestId?: string;
+  ownerUid?: string;
+  userId?: string;
   userName: string;
   userEmail?: string;
   email?: string;
@@ -278,11 +304,15 @@ export interface DepositRequest {
   timestamp: string;
   date?: string;
   createdAt?: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  updatedAt?: string;
 }
 
 export interface WithdrawalRequest {
   id: string;
+  requestId?: string;
+  ownerUid?: string;
+  userId?: string;
   userName: string;
   userEmail?: string;
   email?: string;
@@ -297,6 +327,7 @@ export interface WithdrawalRequest {
   createdAt?: string;
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   referenceId?: string;
+  updatedAt?: string;
 }
 
 export interface ChatMessage {
@@ -325,3 +356,84 @@ export interface SupportTicket {
   userReadAdminReply?: boolean;
   messages?: ChatMessage[];
 }
+
+export interface ContestEntry {
+  entryId: string; // e.g. "ENTRY-001"
+  entrySequenceNumber: number;
+  contestId: string;
+  ownerUid: string;
+  userEmail: string;
+  userName: string;
+  avatarUrl?: string;
+  city?: string;
+  state?: string;
+  paidAmountPaise: number;
+  entryFeePaise: number;
+  entryFeeRupees?: number;
+  paymentVerified: boolean;
+  paymentTxId?: string;
+  joinedAt: string;
+  joinedTimestampMs: number;
+  status: 'active' | 'replaced' | 'invalid' | 'settled';
+  isActive: boolean;
+  isValid: boolean;
+  replacedByEntryId?: string;
+  replacedAt?: string;
+  isSubmitted: boolean;
+  submittedAt?: string;
+  submittedTimestampMs?: number;
+  rawScore?: number;
+  score?: number;
+  totalQuestions?: number;
+  correctCount?: number;
+  wrongCount?: number;
+  timeTakenSeconds?: number;
+  answers?: Record<number, number>;
+  rank?: number;
+  projectedPrizePaise?: number;
+  projectedPrizeRupees?: number;
+  settledPrizePaise?: number;
+  settledPrizeRupees?: number;
+  settlementStatus?: 'pending' | 'settled' | 'unsettled';
+  settledAt?: string;
+  securityBreached?: boolean;
+}
+
+export interface ContestPoolCalculation {
+  contestId: string;
+  confirmedPaidEntries: number;
+  totalConfirmedUsers: number;
+  entryFeePaise: number;
+  entryFeeRupees: number;
+  totalRevenuePaise: number;
+  totalRevenueRupees: number;
+  prizePoolPaise: number;
+  prizePoolRupees: number;
+  referralPoolPaise: number;
+  referralPoolRupees: number;
+  platformMarginPaise: number;
+  platformMarginRupees: number;
+  winnerSlots: number;
+  maxPrizePerWinnerPaise: number;
+  maxPrizePerWinnerRupees: number;
+  slotPayoutsPaise: { [rank: number]: number };
+  slotPayoutsRupees: { [rank: number]: number };
+  activeEntriesCount: number;
+  submittedEntriesCount: number;
+  lastRecalculatedAt: string;
+}
+
+export interface FinancialLedgerRecord {
+  transactionId: string;
+  contestId: string;
+  entryId: string;
+  ownerUid: string;
+  userEmail: string;
+  type: 'ENTRY_FEE' | 'REJOIN_FEE' | 'PRIZE_PAYOUT' | 'REFUND';
+  amountPaise: number;
+  amountRupees: number;
+  timestamp: string;
+  timestampMs: number;
+  notes?: string;
+}
+

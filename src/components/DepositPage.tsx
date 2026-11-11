@@ -378,6 +378,9 @@ export const DepositPage: React.FC<DepositPageProps> = ({
 
       const newDepositItem: DepositRequest = {
         id: newId,
+        requestId: newId,
+        ownerUid: userProfile.uid || userProfile.id || '',
+        userId: userProfile.id || userProfile.uid || '',
         userName: userProfile.name,
         userEmail: userProfile.email,
         email: userProfile.email,

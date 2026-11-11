@@ -166,6 +166,9 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
     return unique;
   }, [questions]);
 
+  // Live Test Screen: Options choices (A, B, C, D) render in their exact admin-defined order
+  // without any live dynamic shuffling, ensuring 100% exact match with Admin Question Manager
+
   const currentIndexRef = useRef(currentIndex);
   currentIndexRef.current = currentIndex;
 
@@ -675,69 +678,75 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
               </div>
 
               {/* 4 Option Cards (A, B, C, D): Pure White (#FFFFFF) background always. When selected, Primary Brand Gradient applied strictly to OUTLINE BORDER only */}
-              {currentQuestion && (
-                <div className="space-y-3 pt-1">
-                  {(selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
+              {currentQuestion && (() => {
+                const rawOptions = (currentQuestion.options && currentQuestion.options.length === 4)
+                  ? currentQuestion.options
+                  : (selectedLanguage === 'Hindi' && HINDI_QUESTION_MAP[currentQuestion.id]
                     ? HINDI_QUESTION_MAP[currentQuestion.id].options
-                    : currentQuestion.options
-                  ).map((optText, optIdx) => {
-                    const isSelected = selectedOption === optIdx;
-                    const letter = String.fromCharCode(65 + optIdx);
+                    : currentQuestion.options) || [];
+                const letters = ['A', 'B', 'C', 'D'];
 
-                    return (
-                      <button
-                        key={optIdx}
-                        type="button"
-                        id={`quiz-option-${letter}`}
-                        onClick={() => handleSelectOption(optIdx)}
-                        className={`w-full p-4 sm:p-5 rounded-2xl text-left transition-all flex items-center gap-4 cursor-pointer active:scale-[0.99] shadow-xs`}
-                        style={
-                          isSelected
-                            ? { 
-                                border: '2px solid transparent',
-                                background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box',
-                                color: '#0F172A',
-                                boxShadow: '0 4px 14px rgba(65, 124, 244, 0.18)'
-                              }
-                            : { 
-                                background: '#FFFFFF', 
-                                border: '2px solid #E2E8F0', 
-                                color: '#1E293B' 
-                              }
-                        }
-                      >
-                        {/* Option Letter (A, B, C, D): Internal background strictly pure white (#FFFFFF) across all question views */}
-                        <span 
-                          className={`w-10 h-10 rounded-xl font-black text-base flex items-center justify-center shrink-0 border transition-all ${
+                return (
+                  <div className="space-y-3 pt-1">
+                    {rawOptions.map((optText, optIdx) => {
+                      const isSelected = selectedOption === optIdx;
+                      const letter = letters[optIdx] || String.fromCharCode(65 + optIdx);
+
+                      return (
+                        <button
+                          key={optIdx}
+                          type="button"
+                          id={`quiz-option-${letter}`}
+                          onClick={() => handleSelectOption(optIdx)}
+                          className={`w-full p-4 sm:p-5 rounded-2xl text-left transition-all flex items-center gap-4 cursor-pointer active:scale-[0.99] shadow-xs`}
+                          style={
                             isSelected
-                              ? 'border-blue-500 text-blue-600 shadow-xs'
-                              : 'border-slate-300 text-slate-700'
+                              ? { 
+                                  border: '2px solid transparent',
+                                  background: 'linear-gradient(#ffffff, #ffffff) padding-box, linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%) border-box',
+                                  color: '#0F172A',
+                                  boxShadow: '0 4px 14px rgba(65, 124, 244, 0.18)'
+                                }
+                              : { 
+                                  background: '#FFFFFF', 
+                                  border: '2px solid #E2E8F0', 
+                                  color: '#1E293B' 
+                                }
+                          }
+                        >
+                          {/* Option Letter (A, B, C, D): Internal background strictly pure white (#FFFFFF) across all question views */}
+                          <span 
+                            className={`w-10 h-10 rounded-xl font-black text-base flex items-center justify-center shrink-0 border transition-all ${
+                              isSelected
+                                ? 'border-blue-500 text-blue-600 shadow-xs'
+                                : 'border-slate-300 text-slate-700'
+                            }`}
+                            style={{ background: '#FFFFFF' }}
+                          >
+                            {letter}
+                          </span>
+
+                          {/* Option Choice Text - Bold & Larger typography */}
+                          <span className={`text-base sm:text-lg font-bold leading-snug flex-1 ${
+                            isSelected ? 'text-slate-900 font-extrabold' : 'text-slate-800'
+                          }`}>
+                            {optText}
+                          </span>
+
+                          {/* Selection Checkmark Indicator: Stays visible when marked for review */}
+                          <span className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-all ${
+                            isSelected ? 'border-transparent text-white' : 'border-2 border-slate-300 bg-white'
                           }`}
-                          style={{ background: '#FFFFFF' }}
-                        >
-                          {letter}
-                        </span>
-
-                        {/* Option Choice Text - Bold & Larger typography */}
-                        <span className={`text-base sm:text-lg font-bold leading-snug flex-1 ${
-                          isSelected ? 'text-slate-900 font-extrabold' : 'text-slate-800'
-                        }`}>
-                          {optText}
-                        </span>
-
-                        {/* Selection Checkmark Indicator: Stays visible when marked for review */}
-                        <span className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-all ${
-                          isSelected ? 'border-transparent text-white' : 'border-2 border-slate-300 bg-white'
-                        }`}
-                        style={isSelected ? { background: BRAND_GRADIENT } : undefined}
-                        >
-                          {isSelected && <Check className="w-3.5 h-3.5 stroke-[3]" />}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
+                          style={isSelected ? { background: BRAND_GRADIENT } : undefined}
+                          >
+                            {isSelected && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
 
               {/* Question Footer Actions - STRICTLY STACKED IN TWO ROWS */}
               <div className="flex flex-col gap-3 pt-4 border-t border-slate-100 w-full">

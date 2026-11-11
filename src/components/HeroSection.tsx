@@ -17,11 +17,11 @@ import {
   Calendar,
   Bell
 } from 'lucide-react';
-import { DailyPrizeItem, PoolEconomics, ActiveContest, Question } from '../types';
+import { DailyPrizeItem, PoolEconomics, ActiveContest, Question, LeaderboardEntry } from '../types';
 import { UPCOMING_PRIZES } from '../data/quizData';
 import { soundFx } from '../utils/audio';
 import { parseTargetTimestamp, getCountdown, formatCountdown } from '../utils/timerUtils';
-import { calculateDynamicPool } from '../utils/poolUtils';
+import { calculateDynamicPool, calculateDynamicWinnerSlots } from '../utils/poolUtils';
 
 // Official Website Primary Brand Gradient: #5F69EF -> #417CF4 -> #3A81F5 -> #20A5AC (Main Teal: #20A5AC, Main Blue: #4A7DF3)
 const BRAND_GRADIENT = 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)';
@@ -49,6 +49,9 @@ interface HeroSectionProps {
   contestDurationSeconds?: number;
   questions?: Question[];
   hasCompletedBefore?: boolean;
+  leaderboard?: LeaderboardEntry[];
+  currentUserUid?: string;
+  isContestLive?: boolean;
 }
 
 // Full-featured Upcoming Contest Card matching exact Live Card layout
@@ -107,7 +110,8 @@ const UpcomingContestCard: React.FC<{
   };
 
   const badgeText = (contest.badge || (isCash ? 'INSTANT UPI' : 'RANK #1')).toUpperCase();
-  const winnersCount = contest.winnersCount || (isCash ? 5 : 1);
+  const upcomingJoins = contest.realJoins || 0;
+  const winnersCount = calculateDynamicWinnerSlots(upcomingJoins);
 
   return (
     <div className="rounded-2xl bg-white p-4.5 shadow-sm border border-slate-200/90 transition-all hover:border-slate-300 flex flex-col justify-between group" style={{ backgroundColor: '#FFFFFF' }}>
@@ -263,7 +267,10 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   onLiveStateChange,
   contestDurationSeconds,
   questions,
-  hasCompletedBefore = false
+  hasCompletedBefore = false,
+  leaderboard = [],
+  currentUserUid,
+  isContestLive = false
 }) => {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -273,6 +280,43 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
     }, 500); // 500ms smooth ticking rate for animated progress
     return () => clearInterval(timer);
   }, []);
+
+  const isRealSubmission = (e?: LeaderboardEntry | null) => {
+    if (!e) return false;
+    // Exclude demo placeholder rows
+    if (e.userName === 'User 1' || e.userName === 'User 2') return false;
+    if (e.id && e.id.startsWith('lb-')) return false;
+    if (e.ownerUid && (e.ownerUid.startsWith('demo-') || e.ownerUid.startsWith('seed-'))) return false;
+
+    // Explicit real submission indicators
+    if (e.id && (e.id.startsWith('ENTRY-') || e.id.startsWith('user-') || e.id.startsWith('sub-') || e.id.startsWith('att-') || e.id.startsWith('real-'))) return true;
+    if (e.entryId && (e.entryId.startsWith('ENTRY-') || e.entryId.startsWith('user-') || e.entryId.startsWith('sub-') || e.entryId.startsWith('att-'))) return true;
+    if (e.score !== undefined && e.score !== null && !isNaN(Number(e.score))) return true;
+    return Boolean(e.submittedAt && !e.id?.startsWith('lb-'));
+  };
+
+  const realLeaderboardEntries = useMemo(() => {
+    return (leaderboard || [])
+      .filter(e => isRealSubmission(e) && e.rank != null && e.rank >= 1 && e.rank <= 5)
+      .sort((a, b) => (a.rank || 0) - (b.rank || 0));
+  }, [leaderboard]);
+
+  const currentUserHeroEntry = useMemo(() => {
+    if (!currentUserUid) return null;
+    return (leaderboard || []).find(e => 
+      e && 
+      isRealSubmission(e) && 
+      e.rank != null && 
+      e.rank > 0 &&
+      Boolean(e.ownerUid && e.ownerUid === currentUserUid)
+    ) || null;
+  }, [leaderboard, currentUserUid]);
+
+  const shouldShowCurrentRankCard = Boolean(
+    currentUserHeroEntry &&
+    currentUserHeroEntry.rank != null &&
+    currentUserHeroEntry.rank >= 6
+  );
 
   // Dynamic boosted higher participant count for public front-end card urgency
   const boostedParticipants = useMemo(() => {
@@ -325,7 +369,24 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
     }
 
     const upcoming = (contests || []).find(isRealUpcoming);
-    return upcoming || null;
+    if (upcoming) return upcoming;
+
+    // ISSUE 1 FIX: Contest persistence — no automatic deletion.
+    // A created contest must remain visible on the website until the Admin explicitly deletes it.
+    // Timer expiry updates its status to Expired, but preserves its record and makes it available on the website/admin sections.
+    const isRealNonDeleted = (c?: ActiveContest | null) => {
+      if (!c || !c.id) return false;
+      if (deletedList.includes(c.id)) return false;
+      if (c.id === 'CNT-CASH-LIVE' || c.id === 'CNT-FALLBACK-PLACEHOLDER' || c.id === 'CNT-PROD-101' || c.id === 'CNT-CASH-202') return false;
+      return true;
+    };
+
+    if (isRealNonDeleted(activeContest)) {
+      return activeContest;
+    }
+
+    const anyCreatedContest = (contests || []).find(isRealNonDeleted);
+    return anyCreatedContest || null;
   }, [activeContest, contests, nowMs]);
 
   const effectiveContest = realTournament;
@@ -341,17 +402,19 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
       }
       return true;
     }
-    if (effectiveContest.scheduledTime) {
-      const target = parseTargetTimestamp(effectiveContest.scheduledTime);
-      if (target > 0 && nowMs < target) {
-        return true;
-      }
-    }
     return false;
   }, [effectiveContest, nowMs]);
 
+  const isExpired = Boolean(
+    effectiveContest && (
+      effectiveContest.status === 'completed' || 
+      effectiveContest.status === 'expired' || 
+      (!isUpcoming && effectiveContest.endTime && parseTargetTimestamp(effectiveContest.endTime) > 0 && nowMs >= parseTargetTimestamp(effectiveContest.endTime))
+    )
+  );
+
   // Report live state to parent for synchronization with Top Lightning Nav Icon
-  const isContestCardLive = Boolean(hasRealActiveContest && !isUpcoming);
+  const isContestCardLive = Boolean(hasRealActiveContest && !isUpcoming && !isExpired);
   useEffect(() => {
     onLiveStateChange?.(isContestCardLive);
   }, [isContestCardLive, onLiveStateChange]);
@@ -410,7 +473,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   const targetMs = parseTargetTimestamp(scheduledTimeStr);
   const countdown = getCountdown(targetMs, nowMs);
   const countdownFormatted = formatCountdown(countdown);
-  const timerPrefix = isUpcoming ? 'STARTS IN: ' : 'ENDS IN: ';
+  const timerPrefix = isExpired ? '' : (isUpcoming ? 'STARTS IN: ' : 'ENDS IN: ');
 
   // Track handled expired contest IDs to avoid duplicate calls and render loops
   const handledExpiredRef = useRef<Set<string>>(new Set());
@@ -475,11 +538,15 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
     return <span className="text-white font-semibold">{text}</span>;
   };
 
-  const isIdleOrUpcoming = !hasRealActiveContest || isUpcoming;
-  const activeContestTitle = isIdleOrUpcoming 
+  const isIdleOrUpcoming = !hasRealActiveContest || (isUpcoming && !effectiveContest?.title);
+  const activeContestTitle = effectiveContest?.title || (isIdleOrUpcoming 
     ? 'Next Contest Starting Soon...' 
-    : (effectiveContest?.title || '');
-  const activeContestBadge = isUpcoming ? 'UPCOMING' : (effectiveContest?.badge || todayPrize.badge || (isCashTournament ? 'INSTANT UPI' : '• LIVE'));
+    : '');
+  const activeContestBadge = isExpired
+    ? 'EXPIRED'
+    : isUpcoming
+    ? 'UPCOMING'
+    : (effectiveContest?.badge || todayPrize.badge || (isCashTournament ? 'INSTANT UPI' : '• LIVE'));
 
   // Flexible 2-line title wrapping (Live Contest Card Only) based on word count:
   // e.g. 1-2 words on 1 line (liveLine2 is empty); 3-4 words split gracefully across 2 lines.
@@ -500,8 +567,8 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
     liveLine2 = liveTitleWords.slice(mid).join(' ');
   }
 
-  const titleLine1 = isIdleOrUpcoming ? 'Next Contest' : liveLine1;
-  const titleLine2 = isIdleOrUpcoming ? 'Starting Soon...' : liveLine2;
+  const titleLine1 = !effectiveContest ? 'Next Contest' : liveLine1;
+  const titleLine2 = !effectiveContest ? 'Starting Soon...' : liveLine2;
 
   // Independently configurable banner overlay title (empty if not specified by admin)
   const bannerOverlayTitle = effectiveContest?.overlayTitle || (
@@ -623,9 +690,14 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   </h3>
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 shadow-2xs">
-                    🏆 {effectiveContest?.winnersCount || (isCashTournament ? 5 : 1)} Winners
-                  </span>
+                  {(() => {
+                    const dynamicWinners = calculateDynamicWinnerSlots(liveRealJoins);
+                    return (
+                      <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 shadow-2xs">
+                        🏆 {dynamicWinners} {dynamicWinners === 1 ? 'Winner' : 'Winners'}
+                      </span>
+                    );
+                  })()}
                   <span 
                     className="text-[10px] font-bold px-2.5 py-0.5 rounded-full uppercase shrink-0 text-white shadow-xs"
                     style={{ background: 'linear-gradient(135deg, #6366F1 0%, #3B82F6 50%, #10B981 100%)' }}
@@ -733,13 +805,18 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                         handleShowContestFull();
                         return;
                       }
+                      if (isExpired) {
+                        soundFx.playClick();
+                        onShowNotice?.("This contest round has ended. View final rankings below or stay tuned for the next tournament!");
+                        return;
+                      }
                       handleTimerBarClick();
                     }}
                     title="Click to explore"
                     className="w-full py-2.5 px-4 rounded-xl text-white font-mono font-bold text-xs flex items-center justify-center transition-all shadow-sm hover:shadow active:scale-95 cursor-pointer tracking-wider"
-                    style={{ background: 'linear-gradient(135deg, #6366F1 0%, #3B82F6 50%, #10B981 100%)' }}
+                    style={{ background: isExpired ? 'linear-gradient(135deg, #F59E0B 0%, #D97706 100%)' : 'linear-gradient(135deg, #6366F1 0%, #3B82F6 50%, #10B981 100%)' }}
                   >
-                    <span>{isLivePoolFull ? 'POOL FULL (100%)' : `${timerPrefix}${countdownFormatted}`}</span>
+                    <span>{isLivePoolFull ? 'POOL FULL (100%)' : isExpired ? 'CONTEST EXPIRED' : `${timerPrefix}${countdownFormatted}`}</span>
                   </button>
                 </div>
               </div>
@@ -782,7 +859,16 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
 
                   {/* Micro Status Badges: Positioned strictly at top-right corner */}
                   <div className="shrink-0 pt-0.5">
-                    {isUpcoming ? (
+                    {isExpired ? (
+                      <span 
+                        className="inline-flex items-center px-3 py-1 rounded-full text-xs font-black tracking-wide text-white uppercase shadow-xs select-none"
+                        style={{
+                          background: 'linear-gradient(135deg, #F59E0B 0%, #D97706 100%)'
+                        }}
+                      >
+                        EXPIRED
+                      </span>
+                    ) : isUpcoming ? (
                       <span 
                         className="inline-flex items-center px-3 py-1 rounded-full text-xs font-black tracking-wide text-white uppercase shadow-xs select-none"
                         style={{
@@ -856,11 +942,16 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   />
                   <button
                     id="hero-enter-quiz-cta"
-                    aria-disabled={isUpcoming || !hasRealActiveContest || isLivePoolFull}
-                    disabled={isUpcoming || !hasRealActiveContest || isLivePoolFull}
+                    aria-disabled={isUpcoming || !hasRealActiveContest || isLivePoolFull || isExpired}
+                    disabled={isUpcoming || !hasRealActiveContest || isLivePoolFull || isExpired}
                     onClick={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
+                      if (isExpired) {
+                        soundFx.playClick();
+                        onShowNotice?.("This contest round has ended. View final rankings below or stay tuned for the next tournament!");
+                        return;
+                      }
                       if (isUpcoming || !hasRealActiveContest) {
                         handleShowComingSoon();
                         return;
@@ -873,22 +964,26 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                       onEnterQuiz();
                     }}
                     className={`relative z-10 w-full flex items-center justify-center px-6 py-3.5 rounded-xl font-bold text-sm text-white select-none transition-all shadow-md ${
-                      (isUpcoming || !hasRealActiveContest)
+                      isExpired
+                        ? 'cursor-not-allowed opacity-90 shadow-none'
+                        : (isUpcoming || !hasRealActiveContest)
                         ? 'cursor-not-allowed opacity-90'
                         : isLivePoolFull
                         ? 'cursor-not-allowed opacity-75 shadow-none'
                         : 'cursor-pointer opacity-100 active:scale-98 hover:shadow-lg'
                     }`}
                     style={{
-                      background: isLivePoolFull
+                      background: isExpired
+                        ? 'linear-gradient(135deg, #F59E0B 0%, #D97706 100%)'
+                        : isLivePoolFull
                         ? 'linear-gradient(135deg, #64748B 0%, #475569 100%)'
                         : 'linear-gradient(135deg, #6366F1 0%, #3B82F6 50%, #10B981 100%)',
                       color: '#FFFFFF',
-                      cursor: (isUpcoming || !hasRealActiveContest || isLivePoolFull) ? 'not-allowed' : 'pointer',
-                      opacity: (isUpcoming || !hasRealActiveContest) ? 0.9 : (isLivePoolFull ? 0.75 : 1),
+                      cursor: (isUpcoming || !hasRealActiveContest || isLivePoolFull || isExpired) ? 'not-allowed' : 'pointer',
+                      opacity: (isUpcoming || !hasRealActiveContest || isExpired) ? 0.9 : (isLivePoolFull ? 0.75 : 1),
                     }}
                   >
-                    {(isUpcoming || !hasRealActiveContest) ? 'Coming Soon' : (isLivePoolFull ? 'CONTEST FULL' : (hasCompletedBefore ? 'Re-join Contest' : 'Join Now'))}
+                    {isExpired ? 'CONTEST EXPIRED' : (isUpcoming || !hasRealActiveContest) ? 'Coming Soon' : (isLivePoolFull ? 'CONTEST FULL' : (hasCompletedBefore ? 'RE - JOIN' : 'Join Now'))}
                   </button>
                 </div>
               </div>
@@ -927,65 +1022,88 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   <tr className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
                     <th className="py-2 px-2.5 text-black font-extrabold" style={{ color: '#000000' }}>#</th>
                     <th className="py-2 px-2 text-black font-extrabold" style={{ color: '#000000' }}>USER</th>
-                    <th className="py-2 px-2 text-black font-extrabold" style={{ color: '#000000' }}>SCORE</th>
-                    <th className="py-2 text-right pr-2.5 text-black font-extrabold" style={{ color: '#000000' }}>TIME</th>
+                    <th className="py-2 px-2 text-center text-black font-extrabold" style={{ color: '#000000' }}>SCORE</th>
+                    <th className="py-2 px-2 text-center text-black font-extrabold" style={{ color: '#000000' }}>TIME</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-[11px] bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                  {/* Rank 1: Winner row with normal regular weight (#4B5563) matching ranks 2-5 */}
-                  <tr 
-                    className="transition-colors"
-                    style={{ background: 'linear-gradient(135deg, rgba(95, 105, 239, 0.12) 0%, rgba(65, 124, 244, 0.12) 35%, rgba(58, 129, 245, 0.12) 65%, rgba(32, 165, 172, 0.12) 100%)' }}
-                  >
-                    <td className="py-2.5 px-2.5 text-[#4B5563] font-normal" style={{ color: '#4B5563', fontWeight: 400 }}>
-                      1
-                    </td>
-                    <td className="py-2.5 px-2 text-[#4B5563] truncate max-w-[90px] font-normal" style={{ color: '#4B5563', fontWeight: 400 }}>Rohan S.</td>
-                    <td className="py-2.5 px-2 font-black text-[#417CF4]">10/10</td>
-                    <td className="py-2.5 text-right pr-2.5 font-mono text-slate-700">4m 12s</td>
-                  </tr>
-                  <tr className="hover:bg-slate-50/50 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                    <td className="py-2 px-2.5 text-slate-400 font-bold">2</td>
-                    <td className="py-2 px-2 text-slate-800 truncate max-w-[90px]">Ananya V.</td>
-                    <td className="py-2 px-2 font-bold text-slate-800">10/10</td>
-                    <td className="py-2 text-right pr-2.5 font-mono text-slate-500">4m 38s</td>
-                  </tr>
-                  <tr className="hover:bg-slate-50/50 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                    <td className="py-2 px-2.5 text-slate-400 font-bold">3</td>
-                    <td className="py-2 px-2 text-slate-800 truncate max-w-[90px]">Vikram K.</td>
-                    <td className="py-2 px-2 font-bold text-slate-800">9/10</td>
-                    <td className="py-2 text-right pr-2.5 font-mono text-slate-500">3m 55s</td>
-                  </tr>
-                  <tr className="hover:bg-slate-50/50 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                    <td className="py-2 px-2.5 text-slate-400 font-bold">4</td>
-                    <td className="py-2 px-2 text-slate-800 truncate max-w-[90px]">Sanya M.</td>
-                    <td className="py-2 px-2 font-bold text-slate-800">9/10</td>
-                    <td className="py-2 text-right pr-2.5 font-mono text-slate-500">4m 02s</td>
-                  </tr>
-                  <tr className="hover:bg-slate-50/50 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                    <td className="py-2 px-2.5 text-slate-400 font-bold">5</td>
-                    <td className="py-2 px-2 text-slate-800 truncate max-w-[90px]">Amit Jha</td>
-                    <td className="py-2 px-2 font-bold text-slate-800">9/10</td>
-                    <td className="py-2 text-right pr-2.5 font-mono text-slate-500">4m 45s</td>
-                  </tr>
+                  {realLeaderboardEntries.length === 0 ? (
+                    // Demo state: exactly two demo rows
+                    <>
+                      <tr className="hover:bg-slate-50/50 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                        <td className="py-2.5 px-2.5 text-slate-400 font-bold">1</td>
+                        <td className="py-2.5 px-2 text-slate-800 font-medium">User 1</td>
+                        <td className="py-2.5 px-2 text-center text-slate-400 font-mono font-bold">—</td>
+                        <td className="py-2.5 px-2 text-center text-slate-400 font-mono font-medium">—</td>
+                      </tr>
+                      <tr className="hover:bg-slate-50/50 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                        <td className="py-2.5 px-2.5 text-slate-400 font-bold">2</td>
+                        <td className="py-2.5 px-2 text-slate-800 font-medium">User 2</td>
+                        <td className="py-2.5 px-2 text-center text-slate-400 font-mono font-bold">—</td>
+                        <td className="py-2.5 px-2 text-center text-slate-400 font-mono font-medium">—</td>
+                      </tr>
+                    </>
+                  ) : (
+                    realLeaderboardEntries.map((entry) => {
+                      const isUser = Boolean(
+                        currentUserUid && entry.ownerUid && entry.ownerUid === currentUserUid
+                      );
+                      const formattedTime = entry.formattedTime ? entry.formattedTime.replace(/^in\s+/, '') : (entry.timeTakenSeconds ? `${Math.round(entry.timeTakenSeconds)}s` : '0s');
+
+                      return (
+                        <tr 
+                          key={entry.id}
+                          className={`transition-colors ${isUser ? 'bg-blue-50/70 font-semibold' : 'hover:bg-slate-50/50 bg-white'}`}
+                          style={{ backgroundColor: isUser ? undefined : '#FFFFFF' }}
+                        >
+                          <td className="py-2.5 px-2.5 text-slate-500 font-bold">
+                            {entry.rank}
+                          </td>
+                          <td className="py-2.5 px-2 text-slate-900 font-bold truncate max-w-[95px]">
+                            <span className="truncate">{entry.userName}</span>
+                            {isUser && (
+                              <span className="ml-1 text-[8px] text-white px-1.5 py-0.5 rounded-full font-bold shadow-2xs inline-block" style={{ background: BRAND_GRADIENT }}>
+                                YOU
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-2 text-center font-bold text-[#417CF4]">
+                            {entry.score}/{entry.totalQuestions || 10}
+                          </td>
+                          <td className="py-2.5 px-2 text-center font-mono text-slate-600">
+                            {formattedTime}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
 
-            {/* Your Current Rank: Outer container Pure White, sub-text removed, '#' icon box in brand gradient */}
-            <div className="bg-white p-3 border-t border-slate-100" style={{ backgroundColor: '#FFFFFF' }}>
-              <div className="flex items-center gap-2.5 rounded-xl bg-white border border-slate-200 p-2.5 shadow-xs" style={{ backgroundColor: '#FFFFFF' }}>
-                <div 
-                  className="h-7 w-7 rounded-lg text-white font-black text-xs flex items-center justify-center shadow-xs shrink-0"
-                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
-                >
-                  #
-                </div>
-                <div className="flex-1">
-                  <p className="text-xs font-bold text-slate-900">Your Current Rank</p>
+            {/* Current Rank Row: Displayed ONLY when user rank is 6 or higher; hidden when rank is 1-5 or not joined */}
+            {shouldShowCurrentRankCard && currentUserHeroEntry && (
+              <div className="bg-white p-3 border-t border-slate-100" style={{ backgroundColor: '#FFFFFF' }}>
+                <div className="flex items-center rounded-xl bg-white border border-slate-200 p-2.5 shadow-xs" style={{ backgroundColor: '#FFFFFF' }}>
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div 
+                      className="h-7 w-7 rounded-lg text-white font-black text-xs flex items-center justify-center shadow-xs shrink-0"
+                      style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                    >
+                      {currentUserHeroEntry.rank}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold text-slate-900 truncate flex items-center gap-1.5">
+                        <span className="truncate">{currentUserHeroEntry.userName}</span>
+                        <span className="text-[8px] text-white px-1.5 py-0.5 rounded-full font-bold shadow-2xs inline-block" style={{ background: BRAND_GRADIENT }}>
+                          YOU
+                        </span>
+                      </p>
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
         </aside>
       </div>

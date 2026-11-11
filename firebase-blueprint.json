@@ -473,6 +473,81 @@
         }
       },
       "required": ["email", "isOnline", "lastSeen"]
+    },
+    "ContestEntry": {
+      "title": "Contest Entry",
+      "description": "Participant entry record in a contest with status and ranking",
+      "type": "object",
+      "properties": {
+        "entryId": {
+          "type": "string",
+          "description": "Unique Entry ID e.g. ENTRY-001",
+          "maxLength": 64
+        },
+        "contestId": {
+          "type": "string",
+          "description": "Associated contest ID",
+          "maxLength": 64
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the entrant",
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "replaced", "invalid", "settled"],
+          "description": "Entry lifecycle status",
+          "maxLength": 30
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "True only for latest active entry of user"
+        },
+        "isValid": {
+          "type": "boolean",
+          "description": "True if entry is valid"
+        }
+      },
+      "required": ["entryId", "contestId", "ownerUid", "status"]
+    },
+    "FinancialLedgerRecord": {
+      "title": "Financial Ledger Record",
+      "description": "Payment and prize settlement ledger record",
+      "type": "object",
+      "properties": {
+        "transactionId": {
+          "type": "string",
+          "description": "Unique transaction ID",
+          "maxLength": 80
+        },
+        "contestId": {
+          "type": "string",
+          "description": "Contest ID",
+          "maxLength": 64
+        },
+        "entryId": {
+          "type": "string",
+          "description": "Entry ID",
+          "maxLength": 64
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID",
+          "maxLength": 128
+        },
+        "type": {
+          "type": "string",
+          "enum": ["ENTRY_FEE", "REJOIN_FEE", "PRIZE_PAYOUT", "REFUND"],
+          "description": "Ledger entry type",
+          "maxLength": 30
+        },
+        "amountPaise": {
+          "type": "number",
+          "description": "Amount in integer paise"
+        }
+      },
+      "required": ["transactionId", "contestId", "entryId", "ownerUid", "type", "amountPaise"]
     }
   },
   "firestore": {
@@ -499,6 +574,14 @@
     "/contests/{contestId}": {
       "schema": { "$ref": "#/entities/ActiveContest" },
       "description": "Tournament contests scheduled or active"
+    },
+    "/contest_entries/{entryId}": {
+      "schema": { "$ref": "#/entities/ContestEntry" },
+      "description": "Contest participation entries, statuses, and live rankings"
+    },
+    "/financial_ledgers/{ledgerId}": {
+      "schema": { "$ref": "#/entities/FinancialLedgerRecord" },
+      "description": "Financial ledger transactions and prize settlement audit trail"
     },
     "/leaderboard/{entryId}": {
       "schema": { "$ref": "#/entities/LeaderboardEntry" },

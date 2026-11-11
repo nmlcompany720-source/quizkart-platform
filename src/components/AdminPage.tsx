@@ -96,13 +96,14 @@ import {
   ALLOWED_SUBJECTS,
   ALLOWED_DIFFICULTIES
 } from '../utils/aiQuestionParser';
-import { questionPoolManager, getBlockAssignedUserId, createInitialUserBlocksFromPool } from '../utils/questionPoolManager';
+import { questionPoolManager, getBlockAssignedUserId, createInitialUserBlocksFromPool, getQuestionCorrectIndex, getQuestionCorrectKey } from '../utils/questionPoolManager';
 import { ContestManagerTab } from './ContestManagerTab';
 import { safeCopyToClipboard } from '../utils/clipboard';
 import { compressImage, normalizeImageUrl, isGifImage } from '../utils/imageCompressor';
 import { 
   updateDepositStatusInFirestore, 
   syncUserProfile, 
+  updateUserBlockStatusInFirestore,
   fetchAllUsersFromFirestore,
   subscribeToAllUsersFromFirestore,
   subscribeToUserPresenceFromFirestore,
@@ -116,9 +117,15 @@ import {
   saveSupportTicketToFirestore,
   saveBannerSlidesToFirestore,
   saveQuestionToFirestore,
-  removeQuestionFromFirestore
+  removeQuestionFromFirestore,
+  extractNumericUserNumber,
+  fetchContestEntriesFromFirestore,
+  subscribeToContestEntriesFromFirestore,
+  fetchAllContestEntriesFromFirestore
 } from '../firebase';
+import { contestBackend, mapEntriesToLeaderboard } from '../backend/contestEngine';
 import { 
+
   formatDepositId, 
   formatWithdrawalId, 
   formatDepositTimestamp, 
@@ -262,6 +269,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [isCustomDateModalOpen, setIsCustomDateModalOpen] = useState<boolean>(false);
   const [userStartDate, setUserStartDate] = useState<string>('');
   const [userEndDate, setUserEndDate] = useState<string>('');
+  const [registeredUserPage, setRegisteredUserPage] = useState<number>(1);
+
+  useEffect(() => {
+    setRegisteredUserPage(1);
+  }, [userSearchQuery, userDatePreset, userStartDate, userEndDate]);
 
   // Customer Support Dashboard State
   const [supportTickets, setSupportTickets] = useState<SupportTicket[]>(() => {
@@ -494,55 +506,152 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   // Helper to strictly deduplicate real registered users (purging all demo/dummy seed users) and assign sequential QK-USR-1001+ IDs
+  // Helper to check if a user account is deleted
+  const isDeletedAccountRecord = (u: any): boolean => {
+    if (!u) return true;
+    if (u.isDeleted === true || u.status === 'deleted' || Boolean(u.deletedAt) || Boolean(u.deletedTimestampMs)) {
+      return true;
+    }
+    const email = (u.email || '').trim().toLowerCase();
+    const id = (u.customUserId || u.id || '').trim();
+    try {
+      const raw = localStorage.getItem('quizkart_deleted_users');
+      if (raw) {
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          return list.some((d: any) => 
+            (d && d.email && (d.email || '').trim().toLowerCase() === email) ||
+            (d && d.id && (d.id || '').trim() === id)
+          );
+        }
+      }
+    } catch {}
+    return false;
+  };
+
+  // Helper to strictly deduplicate real registered users and preserve permanent sequential QK-USR-1001+ IDs
   const deduplicateRegisteredUsers = (users: UserProfile[]): UserProfile[] => {
     const result: UserProfile[] = [];
 
     users.forEach((u) => {
       if (!u || (!u.email && !u.name && !u.id)) return;
-      if (isDemoSeedUser(u)) return;
+      if (isDemoSeedUser(u) || isDeletedAccountRecord(u)) return;
 
       const normEmail = (u.email || '').trim().toLowerCase();
-      const rawId = (u.id || '').trim().toUpperCase();
+      const rawId = (u.customUserId || u.id || '').trim().toUpperCase();
       const validUsrId = /^(?:QK-)?USR-\d+$/i.test(rawId) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
+      const uNumber = typeof u.userNumber === 'number' && u.userNumber >= 1000 
+        ? u.userNumber 
+        : extractNumericUserNumber(u);
 
-      // Priority 1: Match by email
+      // Priority 1: Match by UID if present (not fallback string)
       let existingIdx = -1;
-      if (normEmail) {
+      if (u.uid && !u.uid.startsWith('QK-USR-')) {
+        existingIdx = result.findIndex((item) => item.uid === u.uid);
+      }
+
+      // Priority 2: Match by email
+      if (existingIdx === -1 && normEmail) {
         existingIdx = result.findIndex((item) => (item.email || '').trim().toLowerCase() === normEmail);
       }
 
-      // Priority 2: Match by valid QK-USR-XXXX ID only if emails do not belong to different users
+      // Priority 3: Match by valid QK-USR-XXXX ID
       if (existingIdx === -1 && validUsrId) {
         existingIdx = result.findIndex((item) => {
-          const itemId = (item.id || '').trim().toUpperCase();
-          const itemEmail = (item.email || '').trim().toLowerCase();
-          if (itemId !== validUsrId) return false;
-          if (normEmail && itemEmail && normEmail !== itemEmail) return false;
-          return true;
+          const itemId = (item.customUserId || item.id || '').trim().toUpperCase();
+          return itemId === validUsrId;
         });
       }
 
       const normalizedUser: UserProfile = {
         ...u,
+        id: validUsrId || u.id,
+        customUserId: validUsrId || u.customUserId || u.id,
+        userNumber: uNumber < 999999 ? uNumber : undefined,
         registrationDate: normalizeRegistrationTimestamp(u.registrationDate),
         passwordStatus: normalizePlainPassword(u.passwordStatus)
       };
 
       if (existingIdx >= 0) {
+        const existing = result[existingIdx];
+        // Ensure active sequential ID from incoming user takes precedence over stale cached IDs (e.g., QK-USR-1011 over QK-USR-1009)
+        const incomingId = validUsrId;
+        const existingRaw = (existing.customUserId || existing.id || '').trim();
+        const existingUsrId = /^(?:QK-)?USR-\d+$/i.test(existingRaw) 
+          ? (existingRaw.startsWith('QK-') ? existingRaw : `QK-${existingRaw}`) 
+          : '';
+        const incomingNum = extractNumericUserNumber(normalizedUser);
+        const existingNum = extractNumericUserNumber(existing);
+
+        let preservedId = incomingId;
+        if (!preservedId) {
+          preservedId = existingUsrId || existing.id || incomingId;
+        } else if (existingUsrId && existingNum > incomingNum && existingNum < 999999) {
+          preservedId = existingUsrId;
+        }
+
+        const preservedNum = (incomingNum >= 1001 && incomingNum < 999999 && incomingNum >= existingNum)
+          ? incomingNum
+          : (existingNum >= 1001 && existingNum < 999999 ? existingNum : normalizedUser.userNumber || existing.userNumber || 1001);
+
         result[existingIdx] = {
-          ...result[existingIdx],
-          ...normalizedUser
+          ...existing,
+          ...normalizedUser,
+          id: preservedId,
+          customUserId: preservedId,
+          userNumber: preservedNum < 999999 ? preservedNum : undefined,
+          uid: (normalizedUser.uid && !normalizedUser.uid.startsWith('QK-USR-')) 
+            ? normalizedUser.uid 
+            : ((existing.uid && !existing.uid.startsWith('QK-USR-')) ? existing.uid : (existing.uid || normalizedUser.uid || preservedId))
         };
       } else {
         result.push(normalizedUser);
       }
     });
 
-    // Guarantee every real registered entry has a strictly sequential QK-USR-1001, QK-USR-1002... ID
-    return result.map((u, idx) => ({
-      ...u,
-      id: `QK-USR-${1001 + idx}`
-    }));
+    // Collect all existing assigned numbers so we never reassign an ID to another user
+    const usedNums = new Set<number>();
+    result.forEach((u) => {
+      const n = extractNumericUserNumber(u);
+      if (n >= 1001 && n < 999999) usedNums.add(n);
+    });
+
+    // Strictly ensure every user gets a unique customUserId (no duplicate QK-USR-1001)
+    const finalUsers = result.map((u) => {
+      const rawId = (u.customUserId || u.id || '').trim().toUpperCase();
+      const validUsrId = /^(?:QK-)?USR-\d+$/i.test(rawId) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
+      
+      if (validUsrId) {
+        const num = u.userNumber || extractNumericUserNumber(u);
+        return {
+          ...u,
+          id: validUsrId,
+          customUserId: validUsrId,
+          userNumber: num < 999999 ? num : undefined,
+          uid: (u.uid && !u.uid.startsWith('QK-USR-')) ? u.uid : (u.uid || validUsrId)
+        };
+      }
+
+      // Preserve existing user identifiers without fabricating new sequential IDs on display
+      return {
+        ...u,
+        id: u.id || u.uid || '',
+        customUserId: u.customUserId || u.id || '',
+        uid: u.uid || u.id || ''
+      };
+    });
+
+    // Strictly sort registered users in ascending numeric userNumber order (1001, 1002, 1003...) with timestamp tie-breaker
+    finalUsers.sort((a, b) => {
+      const numA = extractNumericUserNumber(a);
+      const numB = extractNumericUserNumber(b);
+      if (numA !== numB) return numA - numB;
+      const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
+      const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
+      if (timeA !== timeB) return timeA - timeB;
+      return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
+    });
+    return finalUsers;
   };
 
   // Registered Users State (Real-Time Data Only - Zero Hardcoded/Dummy/Demo Users)
@@ -562,7 +671,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   // Automatically sync current active real userProfile and cloud users into registeredUsersList in real time
   useEffect(() => {
-    if (!userProfile || userProfile.isDeleted || !userProfile.isRegistered || !userProfile.email || isDemoSeedUser(userProfile)) {
+    if (!userProfile || userProfile.isDeleted || !userProfile.isRegistered || !userProfile.email || isDemoSeedUser(userProfile) || isDeletedAccountRecord(userProfile)) {
+      if (userProfile?.isDeleted || isDeletedAccountRecord(userProfile)) {
+        setRegisteredUsersList((prev) => prev.filter((u) => (u.email || '').toLowerCase() !== (userProfile.email || '').toLowerCase() && u.id !== userProfile.id));
+      }
       return;
     }
     setRegisteredUsersList((prev) => {
@@ -573,13 +685,27 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         ? list.findIndex((u) => (u?.email || '').trim().toLowerCase() === targetEmail)
         : -1;
 
-      const canonicalId = `QK-USR-${1001 + (idx >= 0 ? idx : list.length)}`;
+      // Synchronize User ID with the user's active frontend website profile view
+      // If userProfile has an active sequential ID (e.g., QK-USR-1011), prioritize it over outdated cached list ID (e.g. QK-USR-1009)
+      const activeProfileId = (userProfile.customUserId || userProfile.id || '').trim();
+      const validProfileId = /^(?:QK-)?USR-\d+$/i.test(activeProfileId)
+        ? (activeProfileId.startsWith('QK-') ? activeProfileId : `QK-${activeProfileId}`)
+        : '';
+      const cachedListId = (idx >= 0 && (list[idx]?.customUserId || list[idx]?.id))
+        ? (list[idx].customUserId || list[idx].id)!.trim()
+        : '';
+      const validCachedId = /^(?:QK-)?USR-\d+$/i.test(cachedListId)
+        ? (cachedListId.startsWith('QK-') ? cachedListId : `QK-${cachedListId}`)
+        : '';
+
+      const canonicalId = validProfileId || validCachedId || userProfile.customUserId || userProfile.id || '';
 
       const syncedActiveUser: UserProfile = {
         ...(idx >= 0 ? list[idx] : {}),
         ...userProfile,
-        id: canonicalId,
-        uid: userProfile.uid || (idx >= 0 ? list[idx].uid : canonicalId),
+        id: canonicalId || userProfile.id,
+        customUserId: canonicalId || userProfile.customUserId,
+        uid: userProfile.uid || (idx >= 0 ? list[idx].uid : (canonicalId || userProfile.id)),
         registrationDate: normalizeRegistrationTimestamp(
           userProfile.registrationDate || (idx >= 0 ? list[idx].registrationDate : undefined)
         ),
@@ -597,8 +723,16 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       try {
         localStorage.setItem('quizkart_registered_users', JSON.stringify(deduped));
         const matchedFinal = deduped.find((u) => (u.email || '').trim().toLowerCase() === targetEmail);
-        if (matchedFinal && userProfile.id !== matchedFinal.id) {
-          localStorage.setItem('quizkart_user_profile', JSON.stringify({ ...userProfile, id: matchedFinal.id }));
+        // Only update if userProfile lacked a valid sequential ID and matchedFinal has one
+        if (
+          matchedFinal && 
+          matchedFinal.id && 
+          userProfile.id !== matchedFinal.id && 
+          /^(?:QK-)?USR-\d+$/i.test(matchedFinal.id) &&
+          !/^(?:QK-)?USR-\d+$/i.test(userProfile.id || '')
+        ) {
+          localStorage.setItem('quizkart_user_profile', JSON.stringify({ ...userProfile, id: matchedFinal.id, customUserId: matchedFinal.id }));
+          onUpdateProfile?.({ ...userProfile, id: matchedFinal.id, customUserId: matchedFinal.id });
         }
       } catch {}
       return deduped;
@@ -655,11 +789,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const handleToggleBlockUser = (targetUser: UserProfile) => {
     soundFx.playClick();
     const nextBlocked = !targetUser.isBlocked;
+    const targetUid = (targetUser.uid && !targetUser.uid.startsWith('QK-USR-')) 
+      ? targetUser.uid 
+      : (targetUser.id || targetUser.uid || '');
+    const targetEmail = (targetUser.email || '').trim().toLowerCase();
+    const targetCustomId = (targetUser.customUserId || targetUser.id || '').trim().toUpperCase();
+
+    // 1. Trace and update ONLY the selected user row in registeredUsersList by exact UID / ID / email
     const updatedList = registeredUsersList.map((u) => {
-      const isMatch =
-        (u.id && targetUser.id && u.id === targetUser.id) ||
-        (u.email && targetUser.email && u.email.toLowerCase() === targetUser.email.toLowerCase());
-      if (isMatch) {
+      const isTarget = Boolean(
+        (targetUid && u.uid && u.uid === targetUid) ||
+        (targetCustomId && ((u.customUserId || '').toUpperCase() === targetCustomId || (u.id || '').toUpperCase() === targetCustomId)) ||
+        (targetEmail && (u.email || '').trim().toLowerCase() === targetEmail)
+      );
+
+      if (isTarget) {
         return {
           ...u,
           isBlocked: nextBlocked,
@@ -677,13 +821,15 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       localStorage.setItem('quizkart_registered_users', JSON.stringify(updatedList));
     } catch {}
 
-    // If this matches the currently active userProfile, immediately update userProfile as well!
-    if (
+    // 2. ONLY update active userProfile if the currently logged-in user matches the exact target UID or email
+    const activeUid = userProfile?.uid || userProfile?.id;
+    const isTargetCurrentUser = Boolean(
       userProfile &&
-      ((userProfile.email && targetUser.email && userProfile.email.toLowerCase() === targetUser.email.toLowerCase()) ||
-        (userProfile.mobile && targetUser.mobile && userProfile.mobile === targetUser.mobile) ||
-        (userProfile.name && targetUser.name && userProfile.name.toLowerCase() === targetUser.name.toLowerCase()))
-    ) {
+      ((targetUid && activeUid && activeUid === targetUid) ||
+       (targetEmail && (userProfile.email || '').trim().toLowerCase() === targetEmail))
+    );
+
+    if (isTargetCurrentUser && userProfile) {
       const updatedActiveProfile: UserProfile = {
         ...userProfile,
         isBlocked: nextBlocked,
@@ -695,22 +841,28 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       } catch {}
     }
 
-    syncUserProfile({
-      ...targetUser,
-      isBlocked: nextBlocked,
-      blockReason: nextBlocked ? 'Account Blocked by Admin' : ''
-    }).catch(() => {});
+    // 3. Update Firestore using target user's exact document paths and UID, preserving all other fields
+    updateUserBlockStatusInFirestore(
+      targetUid,
+      targetEmail,
+      nextBlocked,
+      nextBlocked ? 'Account Blocked by Admin' : ''
+    ).catch(() => {});
 
     if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_user_block_changed', { detail: { email: targetUser.email, isBlocked: nextBlocked } }));
+      window.dispatchEvent(
+        new CustomEvent('quizkart_user_block_changed', { 
+          detail: { uid: targetUid, email: targetEmail, isBlocked: nextBlocked } 
+        })
+      );
     }
 
     if (nextBlocked) {
       soundFx.playWrong();
-      showToast(`🚫 ${targetUser.name} (${targetUser.email}) has been BLOCKED by Admin.`, 'info');
+      showToast(`🚫 ${targetUser.name || 'User'} (${targetUser.email || targetUser.id}) has been BLOCKED by Admin.`, 'info');
     } else {
       soundFx.playSuccess();
-      showToast(`✅ ${targetUser.name} (${targetUser.email}) has been UNBLOCKED.`);
+      showToast(`✅ ${targetUser.name || 'User'} (${targetUser.email || targetUser.id}) has been UNBLOCKED.`);
     }
   };
 
@@ -1024,6 +1176,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [unmaskedBlockIds, setUnmaskedBlockIds] = useState<number[]>([]);
   const [passcodeModalBlock, setPasscodeModalBlock] = useState<{ blockNumber: number; userId: string } | null>(null);
   const [passcodeInput, setPasscodeInput] = useState<string>('');
+  const [showPasscodeText, setShowPasscodeText] = useState<boolean>(false);
   const [passcodeError, setPasscodeError] = useState<string>('');
 
   // Bulk AI Importer State
@@ -1442,14 +1595,13 @@ RULES:
       localStorage.setItem('quizkart_questions_initialized', 'true');
     } catch {}
 
+    // Guarantee Firestore permanence for all validated block questions
+    try {
+      Promise.allSettled(finalPool.map(q => saveQuestionToFirestore(q))).catch(e => console.warn('Batch Firestore write notice:', e));
+    } catch {}
+
     soundFx.playCelebration();
-    const assignedCount = distinctUsers.length;
-    const queueCount = Math.max(0, totalBlocks - assignedCount);
-    showToast(
-      queueCount > 0
-        ? `Created ${totalBlocks} blocks (${allBlockQuestions.length} questions): Blocks 1-${assignedCount} assigned to users, Blocks ${assignedCount + 1}-${totalBlocks} reserved in queue!`
-        : `Successfully created ${totalBlocks} dedicated 10-question blocks (${allBlockQuestions.length} questions) for registered users!`
-    );
+    showToast(`Created ${totalBlocks} blocks (${allBlockQuestions.length} questions) in Unassigned state awaiting user Join/Re-join!`);
     setBulkInputText('');
     setBulkParsedResults([]);
     setBulkJsonError(null);
@@ -1460,18 +1612,34 @@ RULES:
     if (e) e.preventDefault();
     if (passcodeInput.trim() === 'password1') {
       soundFx.playCelebration();
-      if (passcodeModalBlock) {
-        setUnmaskedBlockIds(prev => Array.from(new Set([...prev, passcodeModalBlock.blockNumber])));
-        showToast(`Registration ID unmasked: ${passcodeModalBlock.userId}`);
-      }
+      // Auto-Lock Session Guard: Display all unmasked IDs across all question blocks
+      const allBlocks = Array.from({ length: 500 }, (_, i) => i + 1);
+      setUnmaskedBlockIds(allBlocks);
+      showToast('All User IDs unmasked across question blocks');
       setPasscodeModalBlock(null);
       setPasscodeInput('');
+      setShowPasscodeText(false);
       setPasscodeError('');
     } else {
       soundFx.playWrong();
       setPasscodeError('Incorrect passcode. Please try again.');
     }
   };
+
+  // Auto-Lock Session Guard: When navigating away from Question Manager tab or page,
+  // INSTANTLY auto-lock and re-mask all IDs back to User ID: ********
+  useEffect(() => {
+    if (activeTab !== 'questions') {
+      setUnmaskedBlockIds([]);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    return () => {
+      // Auto-lock when AdminPage unmounts or user navigates away
+      setUnmaskedBlockIds([]);
+    };
+  }, []);
 
   const handleCopyPromptTemplate = async () => {
     soundFx.playClick();
@@ -1536,12 +1704,10 @@ RULES:
     } catch {}
 
     soundFx.playCelebration();
-    const assignedCount = distinctUsers.length;
-    const queueCount = Math.max(0, totalBlocks - assignedCount);
     showToast(
       mode === 'replace'
-        ? `Replaced pool with ${totalBlocks} blocks (${finalPool.length} questions): Blocks 1-${assignedCount} assigned to users, Blocks ${assignedCount + 1}-${totalBlocks} in queue!`
-        : `Appended ${totalBlocks} blocks (${allBlockQuestions.length} questions): Blocks 1-${assignedCount} assigned to users, Blocks ${assignedCount + 1}-${totalBlocks} in queue!`
+        ? `Replaced pool with ${totalBlocks} blocks (${finalPool.length} questions) in Unassigned state!`
+        : `Appended ${totalBlocks} blocks (${allBlockQuestions.length} questions) in Unassigned state!`
     );
 
     // Reset Bulk State
@@ -1721,10 +1887,15 @@ RULES:
   }, [propDeposits]);
 
   const [selectedScreenshotModal, setSelectedScreenshotModal] = useState<string | null>(null);
-  const [depositFilter, setDepositFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
+  const [depositFilter, setDepositFilter] = useState<'all' | 'pending' | 'approved' | 'rejected' | 'cancelled'>('all');
   const [depositSearch, setDepositSearch] = useState<string>('');
   const [depositDateFilter, setDepositDateFilter] = useState<string>('');
   const [selectedDepositIds, setSelectedDepositIds] = useState<string[]>([]);
+  const [depositPage, setDepositPage] = useState<number>(1);
+
+  useEffect(() => {
+    setDepositPage(1);
+  }, [depositFilter, depositSearch, depositDateFilter]);
 
   const saveDeposits = (newDeposits: DepositRequest[]) => {
     setDeposits(newDeposits);
@@ -1736,75 +1907,69 @@ RULES:
     } catch {}
   };
 
-  const handleDeleteDeposit = (id: string) => {
-    const target = (deposits || []).find(d => d && d.id === id);
-    if (target && target.status === 'pending') {
-      soundFx.playWrong();
-      showToast('Action Required: You must Approve or Reject this deposit before deleting.', 'info');
-      return;
-    }
-
-    const updated = (deposits || []).filter(d => d && d.id !== id);
+  const handleCancelDeposit = (id: string) => {
+    const dep = (deposits || []).find(d => d && d.id === id);
+    if (!dep) return;
+    const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'cancelled' as const } : d);
     saveDeposits(updated);
-    setSelectedDepositIds(prev => prev.filter(selId => selId !== id));
 
-    // Permanent deletion registry: prevents reappearance on refresh or re-sync
-    addDeletedDepositId(id);
-
+    // Update status in user permanent audit log (never deleted)
     try {
-      const activePendingId = localStorage.getItem('quizkart_active_pending_deposit_id');
-      if (activePendingId === id || formatDepositId(activePendingId) === formatDepositId(id)) {
-        localStorage.removeItem('quizkart_active_pending_deposit_id');
+      const permDeposits = localStorage.getItem('quizkart_user_deposits_permanent');
+      const list: DepositRequest[] = permDeposits ? JSON.parse(permDeposits) : [];
+      let found = false;
+      const updatedPerm = list.map((item: any) => {
+        if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
+          found = true;
+          return { ...item, status: 'cancelled' };
+        }
+        return item;
+      });
+      if (!found && dep) {
+        updatedPerm.unshift({ ...dep, status: 'cancelled' });
       }
+      localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
     } catch {}
 
-    // NOTICE: User-side transaction history is decoupled and immutable - never delete from user transaction logs!
+    try {
+      localStorage.removeItem('quizkart_active_pending_deposit_id');
+    } catch {}
 
-    deleteDepositFromFirestore(id).catch(() => {});
-    soundFx.playClick();
-    showToast(`Deposit record removed from Admin ledger.`);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id, status: 'cancelled' } }));
+    }
+
+    updateDepositStatusInFirestore(id, 'cancelled').catch(() => {});
+    soundFx.playWrong();
+    showToast(`Deposit #${id} marked as Cancelled.`, 'info');
+  };
+
+  const handleDeleteDeposit = (id: string) => {
+    handleCancelDeposit(id);
   };
 
   const handleBulkDeleteDeposits = () => {
     if (selectedDepositIds.length === 0) return;
-
-    // Strict validation: never delete pending deposits
-    const allowedIds = selectedDepositIds.filter(id => {
-      const dep = (deposits || []).find(d => d && d.id === id);
-      return dep && dep.status !== 'pending';
-    });
-
-    if (allowedIds.length === 0) {
-      soundFx.playWrong();
-      showToast('Action Required: Cannot delete pending deposits. Approve or Reject them first.', 'info');
-      return;
-    }
-
-    const count = allowedIds.length;
-    const toDeleteSet = new Set(allowedIds);
-    const updated = (deposits || []).filter(d => d && !toDeleteSet.has(d.id));
+    const count = selectedDepositIds.length;
+    const toCancelSet = new Set(selectedDepositIds);
+    const updated = (deposits || []).map(d => d && toCancelSet.has(d.id) ? { ...d, status: 'cancelled' as const } : d);
     saveDeposits(updated);
 
-    allowedIds.forEach(id => {
-      addDeletedDepositId(id);
+    selectedDepositIds.forEach(id => {
+      updateDepositStatusInFirestore(id, 'cancelled').catch(() => {});
     });
 
     try {
-      const activePendingId = localStorage.getItem('quizkart_active_pending_deposit_id');
-      if (activePendingId && toDeleteSet.has(activePendingId)) {
-        localStorage.removeItem('quizkart_active_pending_deposit_id');
-      }
+      localStorage.removeItem('quizkart_active_pending_deposit_id');
     } catch {}
 
-    // NOTICE: User-side transaction history is decoupled and immutable - never delete from user transaction logs!
-
-    allowedIds.forEach(id => {
-      deleteDepositFromFirestore(id).catch(() => {});
-    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { status: 'cancelled' } }));
+    }
 
     setSelectedDepositIds([]);
     soundFx.playClick();
-    showToast(`Removed ${count} deposit record${count > 1 ? 's' : ''} from Admin ledger.`);
+    showToast(`Marked ${count} deposit record${count > 1 ? 's' : ''} as Cancelled.`);
   };
 
   const handleApproveDeposit = (id: string) => {
@@ -2471,13 +2636,17 @@ RULES:
     }, 1000);
   };
 
-  // Filtered Questions for Tab 1 Table with High-Capacity Indexing
+  // Filtered Questions for Tab 1 Table with High-Capacity Indexing & User ID Search Filtering
   const filteredQuestions = (questions || []).filter(q => {
     if (!q || q.id == null) return false;
 
     if (questionSearch.trim()) {
       const s = questionSearch.toLowerCase().trim();
-      const searchable = `${q.id} ${q.stem || ''} ${q.question || ''} ${q.category || ''} ${q.explanation || ''}`.toLowerCase();
+      const blockNum = Number(q.blockNumber) || 0;
+      const assignedUser = q.assignedUserId 
+        ? String(q.assignedUserId).toLowerCase() 
+        : (blockNum > 0 ? getBlockAssignedUserId(blockNum, [q], registeredUsersList).toLowerCase() : '');
+      const searchable = `${q.id} ${q.stem || ''} ${q.question || ''} ${q.category || ''} ${q.subject || ''} ${q.explanation || ''} ${assignedUser} block ${blockNum}`.toLowerCase();
       if (!searchable.includes(s)) return false;
     }
 
@@ -2526,19 +2695,62 @@ RULES:
     return true;
   });
 
+  const DEPOSIT_PAGE_SIZE = 10;
+  const totalDepositPages = Math.max(1, Math.ceil(filteredDeposits.length / DEPOSIT_PAGE_SIZE));
+  const safeDepositPage = Math.min(Math.max(1, depositPage), totalDepositPages);
+  const paginatedDeposits = filteredDeposits.slice(
+    (safeDepositPage - 1) * DEPOSIT_PAGE_SIZE,
+    safeDepositPage * DEPOSIT_PAGE_SIZE
+  );
+
   // Only resolved (approved or rejected) deposits can be deleted
   const resolvableDeposits = (filteredDeposits || []).filter(d => d && d.status !== 'pending');
 
-  // Filtered Leaderboard for Tab 4
+  // Hydrate persistent Firebase contest entries into Tab 4 Winner Payout Ledger
+  useEffect(() => {
+    const contestId = activeContest?.id;
+    if (!contestId) return;
+
+    const handleEntries = (cloudEntries: any[]) => {
+      contestBackend.loadContestEntries(contestId, cloudEntries || []);
+      const activeList = contestBackend.getActiveEntries(contestId);
+      const mapped = activeList.length > 0
+        ? mapEntriesToLeaderboard(
+            activeList,
+            undefined,
+            activeContest?.type === 'product',
+            todayPrize?.brand,
+            todayPrize?.retailValue
+          )
+        : [];
+      onUpdateLeaderboard(mapped);
+    };
+
+    fetchContestEntriesFromFirestore(contestId).then(handleEntries).catch(() => {});
+    const unsub = subscribeToContestEntriesFromFirestore(contestId, handleEntries);
+    return () => unsub();
+  }, [activeContest?.id]);
+
+  // Filtered Leaderboard for Tab 4 (strictly by name, preserving all valid contest entries)
   const filteredLeaderboard = (leaderboard || []).filter(item => {
     if (!item || !item.id) return false;
-    const matchesSearch = (item.userName || '').toLowerCase().includes(ledgerSearch.toLowerCase()) ||
-      (item.city || '').toLowerCase().includes(ledgerSearch.toLowerCase());
+    const isReal = item.isCurrentUser || 
+      item.id.startsWith('ENTRY-') ||
+      item.id.startsWith('entry-') ||
+      item.id.startsWith('user-') || 
+      item.id.startsWith('sub-') || 
+      item.id.startsWith('att-') || 
+      item.id.startsWith('real-') ||
+      !item.id.startsWith('lb-') ||
+      Boolean(item.submittedAt);
+    if (!isReal) return false;
+    const matchesSearch = (item.userName || '').toLowerCase().includes(ledgerSearch.toLowerCase());
     if (!matchesSearch) return false;
     const status = payoutStatuses[item.id] || 'pending';
     if (ledgerFilter === 'all') return true;
     return status === ledgerFilter;
   });
+
 
   // Filtered Security Logs for Tab 5
   const filteredSecurityLogs = (securityLogsList || []).filter(log => {
@@ -2762,9 +2974,10 @@ RULES:
             onClick={() => setActiveTab('payouts')}
             className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
               activeTab === 'payouts'
-                ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-md shadow-blue-500/20'
+                ? 'text-white shadow-md shadow-blue-500/20'
                 : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
             }`}
+            style={activeTab === 'payouts' ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' } : undefined}
           >
             <Trophy className="w-4 h-4" />
             <span>Winner Payout Ledger</span>
@@ -2860,19 +3073,16 @@ RULES:
                 >
                   <Users className="w-5 h-5" />
                 </div>
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="text-base font-black text-slate-900">
-                      Registered Users
-                    </h3>
-                    <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-blue-100 text-blue-800 border border-blue-200">
-                      Total: {registeredUsersList.length}
-                    </span>
-                    <span className="px-2 py-0.5 rounded-full text-xs font-bold text-white flex items-center gap-1.5 shadow-2xs" style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}>
-                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
-                      Active: {registeredUsersList.filter((u) => isUserSessionActive(u)).length}
-                    </span>
-                  </div>
+                <div className="flex items-center gap-2 flex-nowrap shrink-0">
+                  <h3 className="text-base font-black text-slate-900 whitespace-nowrap">
+                    Registered Users
+                  </h3>
+                  <span className="px-2.5 py-0.5 rounded-full text-xs font-black text-white shadow-2xs whitespace-nowrap" style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}>
+                    Total: {registeredUsersList.length}
+                  </span>
+                  <span className="px-2.5 py-0.5 rounded-full text-xs font-black text-white shadow-2xs whitespace-nowrap inline-flex items-center" style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}>
+                    Active: {registeredUsersList.filter((u) => isUserSessionActive(u)).length}
+                  </span>
                 </div>
               </div>
 
@@ -2946,15 +3156,14 @@ RULES:
                 </div>
 
                 {/* Compact Search Bar */}
-                <div className="relative w-28 sm:w-36 max-w-full min-w-0 shrink-0 box-border overflow-hidden">
-                  <Search className="w-3 h-3 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <div className="relative w-36 sm:w-48 max-w-full min-w-0 shrink-0 box-border overflow-hidden">
                   <input
                     type="text"
                     value={userSearchQuery}
                     onChange={(e) => setUserSearchQuery(e.target.value)}
                     placeholder="Search users..."
                     style={{ backgroundColor: '#FFFFFF' }}
-                    className="pure-white-input w-full min-w-0 box-border pl-6 pr-2 py-1 rounded-xl border border-slate-200 text-[11px] bg-white focus:bg-white focus:border-blue-500 outline-none transition-colors"
+                    className="pure-white-input w-full min-w-0 box-border px-3 py-1 rounded-xl border border-slate-200 text-[11px] bg-white focus:bg-white focus:border-blue-500 outline-none transition-colors"
                   />
                 </div>
               </div>
@@ -3063,188 +3272,252 @@ RULES:
             )}
 
             {/* Registered Users Table (Sleek, Concise & Professional - Real-Time Data Only) */}
-            <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-              <table className="w-full text-left text-xs border-collapse bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                <thead className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                  <tr className="bg-white border-b border-slate-200 text-slate-600 text-[11px] uppercase tracking-wider" style={{ backgroundColor: '#FFFFFF' }}>
-                    <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Avatar &amp; Full Name</th>
-                    <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Mobile Number</th>
-                    <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Email Address</th>
-                    <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Password Status</th>
-                    <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Registration Date</th>
-                    <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Balance</th>
-                    <th className="py-2.5 px-3.5 font-semibold text-right bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                  {(() => {
-                    const getOffsetDateStr = (daysOffset = 0, monthsOffset = 0, yearsOffset = 0): string => {
-                      const d = new Date();
-                      if (yearsOffset !== 0) d.setFullYear(d.getFullYear() + yearsOffset);
-                      if (monthsOffset !== 0) d.setMonth(d.getMonth() + monthsOffset);
-                      if (daysOffset !== 0) d.setDate(d.getDate() + daysOffset);
-                      const yyyy = d.getFullYear();
-                      const mm = String(d.getMonth() + 1).padStart(2, '0');
-                      const dd = String(d.getDate()).padStart(2, '0');
-                      return `${yyyy}-${mm}-${dd}`;
-                    };
+            {(() => {
+              const getOffsetDateStr = (daysOffset = 0, monthsOffset = 0, yearsOffset = 0): string => {
+                const d = new Date();
+                if (yearsOffset !== 0) d.setFullYear(d.getFullYear() + yearsOffset);
+                if (monthsOffset !== 0) d.setMonth(d.getMonth() + monthsOffset);
+                if (daysOffset !== 0) d.setDate(d.getDate() + daysOffset);
+                const yyyy = d.getFullYear();
+                const mm = String(d.getMonth() + 1).padStart(2, '0');
+                const dd = String(d.getDate()).padStart(2, '0');
+                return `${yyyy}-${mm}-${dd}`;
+              };
 
-                    const todayLocalStr = getOffsetDateStr(0);
-                    const todayIsoStr = new Date().toISOString().split('T')[0];
-                    const maxTodayStr = todayLocalStr > todayIsoStr ? todayLocalStr : todayIsoStr;
+              const todayLocalStr = getOffsetDateStr(0);
+              const todayIsoStr = new Date().toISOString().split('T')[0];
+              const maxTodayStr = todayLocalStr > todayIsoStr ? todayLocalStr : todayIsoStr;
 
-                    const filteredRealUsers = registeredUsersList.filter((u, idx) => {
-                      if (!u || u.isDeleted || isDemoSeedUser(u)) return false;
-                      const regDateOnly = normalizeRegistrationTimestamp(u.registrationDate);
+              const filteredRealUsers = registeredUsersList.filter((u, idx) => {
+                if (!u || u.isDeleted || isDemoSeedUser(u) || isDeletedAccountRecord(u)) return false;
+                const regDateOnly = normalizeRegistrationTimestamp(u.registrationDate);
 
-                      if (userDatePreset === 'today') {
-                        if (regDateOnly !== todayLocalStr && regDateOnly !== todayIsoStr) return false;
-                      } else if (userDatePreset === 'yesterday') {
-                        const yestLocal = getOffsetDateStr(-1);
-                        const yestIso = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-                        if (regDateOnly !== yestLocal && regDateOnly !== yestIso) return false;
-                      } else if (userDatePreset === '7_days_ago') {
-                        const cutoff = getOffsetDateStr(-7);
-                        if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
-                      } else if (userDatePreset === '1_month_ago') {
-                        const cutoff = getOffsetDateStr(0, -1);
-                        if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
-                      } else if (userDatePreset === '6_months_ago') {
-                        const cutoff = getOffsetDateStr(0, -6);
-                        if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
-                      } else if (userDatePreset === '1_year_ago') {
-                        const cutoff = getOffsetDateStr(0, 0, -1);
-                        if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
-                      } else if (userDatePreset === 'custom_time') {
-                        if (userStartDate && regDateOnly < userStartDate) return false;
-                        if (userEndDate && regDateOnly > userEndDate) return false;
-                      }
+                if (userDatePreset === 'today') {
+                  if (regDateOnly !== todayLocalStr && regDateOnly !== todayIsoStr) return false;
+                } else if (userDatePreset === 'yesterday') {
+                  const yestLocal = getOffsetDateStr(-1);
+                  const yestIso = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+                  if (regDateOnly !== yestLocal && regDateOnly !== yestIso) return false;
+                } else if (userDatePreset === '7_days_ago') {
+                  const cutoff = getOffsetDateStr(-7);
+                  if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
+                } else if (userDatePreset === '1_month_ago') {
+                  const cutoff = getOffsetDateStr(0, -1);
+                  if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
+                } else if (userDatePreset === '6_months_ago') {
+                  const cutoff = getOffsetDateStr(0, -6);
+                  if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
+                } else if (userDatePreset === '1_year_ago') {
+                  const cutoff = getOffsetDateStr(0, 0, -1);
+                  if (regDateOnly < cutoff || regDateOnly > maxTodayStr) return false;
+                } else if (userDatePreset === 'custom_time') {
+                  if (userStartDate && regDateOnly < userStartDate) return false;
+                  if (userEndDate && regDateOnly > userEndDate) return false;
+                }
 
-                      if (!userSearchQuery.trim()) return true;
-                      const q = userSearchQuery.toLowerCase();
-                      const seqId = (u.id || `QK-USR-${1001 + idx}`).toLowerCase();
-                      return (
-                        (u.name || '').toLowerCase().includes(q) ||
-                        (u.email || '').toLowerCase().includes(q) ||
-                        (u.mobile || '').toLowerCase().includes(q) ||
-                        (u.id || '').toLowerCase().includes(q) ||
-                        seqId.includes(q)
-                      );
-                    });
+                if (!userSearchQuery.trim()) return true;
+                const q = userSearchQuery.toLowerCase();
+                const uNum = extractNumericUserNumber(u);
+                const seqId = (u.customUserId || u.id || (uNum < 999999 ? `QK-USR-${uNum}` : `QK-USR-${1001 + idx}`)).toLowerCase();
+                return (
+                  (u.name || '').toLowerCase().includes(q) ||
+                  (u.email || '').toLowerCase().includes(q) ||
+                  (u.mobile || '').toLowerCase().includes(q) ||
+                  (u.id || '').toLowerCase().includes(q) ||
+                  (u.customUserId || '').toLowerCase().includes(q) ||
+                  seqId.includes(q)
+                );
+              }).sort((a, b) => {
+                const numA = extractNumericUserNumber(a);
+                const numB = extractNumericUserNumber(b);
+                if (numA !== numB) return numA - numB;
+                const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
+                const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
+                if (timeA !== timeB) return timeA - timeB;
+                return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
+              });
 
-                    if (filteredRealUsers.length === 0) {
-                      return (
-                        <tr className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                          <td colSpan={7} className="py-6 px-4 text-center text-xs font-medium text-slate-400 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                            No registered users found.
-                          </td>
+              const USER_PAGE_SIZE = 10;
+              const totalUserPages = Math.max(1, Math.ceil(filteredRealUsers.length / USER_PAGE_SIZE));
+              const safeUserPage = Math.min(Math.max(1, registeredUserPage), totalUserPages);
+              const paginatedRealUsers = filteredRealUsers.slice(
+                (safeUserPage - 1) * USER_PAGE_SIZE,
+                safeUserPage * USER_PAGE_SIZE
+              );
+              const usedRowKeys = new Set<string>();
+
+              return (
+                <>
+                  <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                    <table className="w-full text-left text-xs border-collapse bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                      <thead className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                        <tr className="bg-white border-b border-slate-200 text-slate-600 text-[11px] uppercase tracking-wider" style={{ backgroundColor: '#FFFFFF' }}>
+                          <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Avatar &amp; Full Name</th>
+                          <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Mobile Number</th>
+                          <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Email Address</th>
+                          <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Password Status</th>
+                          <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Registration Date</th>
+                          <th className="py-2.5 px-3.5 font-semibold bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Balance</th>
+                          <th className="py-2.5 px-3.5 font-semibold text-right bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>Action</th>
                         </tr>
-                      );
-                    }
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                        {filteredRealUsers.length === 0 ? (
+                          <tr className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                            <td colSpan={7} className="py-6 px-4 text-center text-xs font-medium text-slate-400 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                              No registered users found.
+                            </td>
+                          </tr>
+                        ) : (
+                          paginatedRealUsers.map((u, pIdx) => {
+                            const globalIdx = (safeUserPage - 1) * USER_PAGE_SIZE + pIdx;
+                            const isActiveCurrentUser = isUserSessionActive(u);
+                            const cleanPasswordText = normalizePlainPassword(u.passwordStatus);
+                            const dateOnlyRegTimestamp = normalizeRegistrationTimestamp(u.registrationDate);
+                            const userNum = extractNumericUserNumber(u);
+                            const sequentialRegId = u.customUserId || u.id || (userNum < 999999 ? `QK-USR-${userNum}` : (u.uid ? `USR-${u.uid.slice(0, 8)}` : ''));
+                            const primaryKey = (u.uid && u.uid.trim()) ? u.uid.trim() : (u.customUserId || u.id || `usr-${userNum}`);
+                            const stableRowKey = usedRowKeys.has(primaryKey) ? `${primaryKey}-${pIdx}` : primaryKey;
+                            usedRowKeys.add(stableRowKey);
 
-                    return filteredRealUsers.map((u, idx) => {
-                      const isActiveCurrentUser = isUserSessionActive(u);
-                      const cleanPasswordText = normalizePlainPassword(u.passwordStatus);
-                      const dateOnlyRegTimestamp = normalizeRegistrationTimestamp(u.registrationDate);
-                      const sequentialRegId = u.id || `QK-USR-${1001 + idx}`;
-
-                      return (
-                        <tr
-                          key={`${u.id || 'usr'}_${u.email || 'email'}_${idx}`}
-                          className="bg-white hover:bg-white transition-colors"
-                          style={{ backgroundColor: '#FFFFFF' }}
-                        >
-                          {/* Avatar & Full Name (Sleek & Concise) */}
-                          <td className="py-2.5 px-3.5 bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
-                            <div className="flex items-center gap-2.5 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                              <div
-                                className="w-8 h-8 rounded-lg overflow-hidden border border-slate-200 shrink-0 flex items-center justify-center text-white font-bold text-xs"
-                                style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                            return (
+                              <tr
+                                key={stableRowKey}
+                                className="bg-white hover:bg-white transition-colors"
+                                style={{ backgroundColor: '#FFFFFF' }}
                               >
-                                {u.avatarUrl ? (
-                                  <img src={u.avatarUrl} alt={u.name} className="w-full h-full object-cover" />
-                                ) : (
-                                  <span>{u.name ? u.name.charAt(0).toUpperCase() : 'U'}</span>
-                                )}
-                              </div>
-                              <div className="leading-tight">
-                                <div className="font-semibold text-slate-900 text-xs flex items-center gap-1.5">
-                                  <span>{u.name}</span>
-                                  {isActiveCurrentUser && !u.isBlocked && (
-                                    <span
-                                      className="px-1.5 py-0.5 rounded text-white text-[9px] font-black uppercase tracking-wide inline-flex items-center gap-1"
+                                {/* Avatar & Full Name (Sleek & Concise) */}
+                                <td className="py-2.5 px-3.5 bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
+                                  <div className="flex items-center gap-2.5 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                                    <div
+                                      className="w-8 h-8 rounded-lg overflow-hidden border border-slate-200 shrink-0 flex items-center justify-center text-white font-bold text-xs"
                                       style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                                     >
-                                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
-                                      ACTIVE
-                                    </span>
-                                  )}
-                                  {u.isBlocked && (
-                                    <span className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 text-[9px] font-black uppercase">
-                                      BLOCKED
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-[10px] text-slate-400 font-mono mt-0.5">
-                                  ID: {sequentialRegId}
-                                </div>
-                              </div>
-                            </div>
-                          </td>
+                                      {u.avatarUrl ? (
+                                        <img src={u.avatarUrl} alt={u.name} className="w-full h-full object-cover" />
+                                      ) : (
+                                        <span>{u.name ? u.name.charAt(0).toUpperCase() : 'U'}</span>
+                                      )}
+                                    </div>
+                                    <div className="leading-tight">
+                                      <div className="font-semibold text-slate-900 text-xs flex items-center gap-1.5">
+                                        <span>{u.name}</span>
+                                        {isActiveCurrentUser && !u.isBlocked && (
+                                          <span
+                                            className="px-1.5 py-0.5 rounded text-white text-[9px] font-black uppercase tracking-wide inline-flex items-center gap-1"
+                                            style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                                          >
+                                            <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
+                                            ACTIVE
+                                          </span>
+                                        )}
+                                        {u.isBlocked && (
+                                          <span className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 text-[9px] font-black uppercase">
+                                            BLOCKED
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                                        ID: {sequentialRegId}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </td>
 
-                          {/* Mobile Number (Sleek & Concise) */}
-                          <td className="py-2.5 px-3.5 font-mono text-xs font-medium text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                            {u.countryCode || '+91'} {u.mobile || '9876543210'}
-                          </td>
+                                {/* Mobile Number (Sleek & Concise) */}
+                                <td className="py-2.5 px-3.5 font-mono text-xs font-medium text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                                  {u.countryCode || '+91'} {u.mobile || '9876543210'}
+                                </td>
 
-                          {/* Email Address */}
-                          <td className="py-2.5 px-3.5 text-xs font-normal text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                            {u.email || 'player@quizkart.in'}
-                          </td>
+                                {/* Email Address */}
+                                <td className="py-2.5 px-3.5 text-xs font-normal text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                                  {u.email || 'player@quizkart.in'}
+                                </td>
 
-                          {/* Password Status */}
-                          <td className="py-2.5 px-3.5 bg-white font-mono text-xs font-medium text-slate-800 whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
-                            {cleanPasswordText}
-                          </td>
+                                {/* Password Status */}
+                                <td className="py-2.5 px-3.5 bg-white font-mono text-xs font-medium text-slate-800 whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
+                                  {cleanPasswordText}
+                                </td>
 
-                          {/* Registration Date */}
-                          <td className="py-2.5 px-3.5 font-mono text-xs text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                            {dateOnlyRegTimestamp}
-                          </td>
+                                {/* Registration Date */}
+                                <td className="py-2.5 px-3.5 font-mono text-xs text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
+                                  {dateOnlyRegTimestamp}
+                                </td>
 
-                          {/* Wallet Balance */}
-                          <td className="py-2.5 px-3.5 bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
-                            <span className="font-bold text-xs sm:text-sm text-emerald-600">
-                              ₹{Number(u.walletBalance || 0).toLocaleString('en-IN')}
-                            </span>
-                          </td>
+                                {/* Wallet Balance */}
+                                <td className="py-2.5 px-3.5 bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
+                                  <span className="font-bold text-xs sm:text-sm text-emerald-600">
+                                    ₹{Number(u.walletBalance || 0).toLocaleString('en-IN')}
+                                  </span>
+                                </td>
 
-                          {/* Block / Unblock Action Button */}
-                          <td className="py-2.5 px-3.5 text-right bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
-                            <button
-                              type="button"
-                              onClick={() => handleToggleBlockUser(u)}
-                              className="px-3.5 py-1.5 rounded-xl font-bold text-xs text-white shadow-xs transition-all cursor-pointer inline-flex items-center justify-center active:scale-95 hover:opacity-95"
-                              style={
-                                u.isBlocked
-                                  ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)', color: '#FFFFFF' }
-                                  : { backgroundColor: '#DC2626', color: '#FFFFFF' }
-                              }
-                            >
-                              {u.isBlocked ? (
-                                <span>Unblock User</span>
-                              ) : (
-                                <span>Block User</span>
-                              )}
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    });
-                  })()}
-                </tbody>
-              </table>
-            </div>
+                                {/* Block / Unblock Action Button */}
+                                <td className="py-2.5 px-3.5 text-right bg-white whitespace-nowrap" style={{ backgroundColor: '#FFFFFF' }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleToggleBlockUser(u)}
+                                    className="px-3.5 py-1.5 rounded-xl font-bold text-xs text-white shadow-xs transition-all cursor-pointer inline-flex items-center justify-center active:scale-95 hover:opacity-95"
+                                    style={
+                                      u.isBlocked
+                                        ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)', color: '#FFFFFF' }
+                                        : { backgroundColor: '#DC2626', color: '#FFFFFF' }
+                                    }
+                                  >
+                                    {u.isBlocked ? (
+                                      <span>Unblock User</span>
+                                    ) : (
+                                      <span>Block User</span>
+                                    )}
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Exact Unified Single-Pill Capsule Pagination: `< X / Y >` inside ONE single brand gradient container at bottom right */}
+                  <div className="flex items-center justify-end pt-3 border-t border-[#EAECF0]">
+                    <div 
+                      className="inline-flex items-center rounded-full text-white font-bold text-xs shadow-md overflow-hidden select-none"
+                      style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                    >
+                      <button
+                        type="button"
+                        disabled={safeUserPage <= 1}
+                        onClick={() => {
+                          soundFx.playClick();
+                          setRegisteredUserPage(prev => Math.max(1, prev - 1));
+                        }}
+                        className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+                        title="Previous Page"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5 text-white" />
+                      </button>
+
+                      <span className="px-3 py-2 text-white font-bold text-xs tracking-wider min-w-[56px] text-center">
+                        {safeUserPage} / {totalUserPages}
+                      </span>
+
+                      <button
+                        type="button"
+                        disabled={safeUserPage >= totalUserPages}
+                        onClick={() => {
+                          soundFx.playClick();
+                          setRegisteredUserPage(prev => Math.min(totalUserPages, prev + 1));
+                        }}
+                        className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+                        title="Next Page"
+                      >
+                        <ChevronRight className="w-3.5 h-3.5 text-white" />
+                      </button>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
 
             {/* DELETED USERS PERMANENT ARCHIVE SECTION */}
             <div
@@ -3680,30 +3953,21 @@ RULES:
                 className="bg-white rounded-3xl border border-[#EAECF0] p-6 sm:p-8 shadow-sm space-y-6"
               >
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-[#EAECF0]">
-                  <div>
-                    <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                      <span>{editingId !== null ? `Edit Question #${editingId}` : 'Add Question'}</span>
-                      {editingId !== null && (
-                        <span className="px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200 text-[11px] font-semibold">
-                          Editing Mode
-                        </span>
-                      )}
+                  <div className="flex items-center gap-3">
+                    <h3 className="text-base font-bold text-slate-900">
+                      <span>{editingId !== null ? 'Edit Question' : 'Add Question'}</span>
                     </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      {editingId !== null 
-                        ? `Update the details below. Saving will update Question #${editingId} in the library.`
-                        : 'Define the question text, four choices, correct answer, subject, difficulty, and explanation.'}
-                    </p>
+                    {editingId !== null && (
+                      <button
+                        type="button"
+                        onClick={handleCancelEdit}
+                        className="px-3.5 py-1.5 rounded-xl text-white text-xs font-bold shadow-xs hover:opacity-95 active:scale-95 transition-all cursor-pointer"
+                        style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)', color: '#FFFFFF' }}
+                      >
+                        Cancel Edit
+                      </button>
+                    )}
                   </div>
-                  {editingId !== null && (
-                    <button
-                      type="button"
-                      onClick={handleCancelEdit}
-                      className="px-3.5 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold border border-[#EAECF0] transition-all cursor-pointer shadow-xs self-start sm:self-auto"
-                    >
-                      Cancel Edit
-                    </button>
-                  )}
                 </div>
 
                 {/* Form-Level Validation Error Alert */}
@@ -3723,12 +3987,9 @@ RULES:
 
                 {/* Question Text */}
                 <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <label className="block text-xs font-bold text-slate-900 uppercase tracking-wider">
-                      Question Text <span className="text-red-500">*</span>
-                    </label>
-                    <span className="text-[11px] text-slate-400">Clear question stem</span>
-                  </div>
+                  <label className="block text-xs font-bold text-slate-900 uppercase tracking-wider mb-2">
+                    Question Text <span className="text-red-500">*</span>
+                  </label>
                   <textarea
                     rows={2}
                     value={qText}
@@ -3736,10 +3997,10 @@ RULES:
                       setQText(e.target.value);
                       if (formErrors.qText) setFormErrors(prev => ({ ...prev, qText: '' }));
                     }}
-                    placeholder="e.g. Which layer of the Earth's atmosphere contains the Ozone Layer?"
-                    className={`w-full px-4 py-3 rounded-2xl border text-xs text-slate-900 bg-white placeholder:text-slate-400 focus:outline-none transition-all ${
+                    style={{ backgroundColor: '#FFFFFF' }}
+                    className={`w-full px-4 py-3 rounded-2xl border text-xs text-slate-900 bg-white focus:outline-none transition-all ${
                       formErrors.qText 
-                        ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20' 
+                        ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200' 
                         : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
                     }`}
                   />
@@ -3752,15 +4013,10 @@ RULES:
                 </div>
 
                 {/* 4 Choices: A, B, C, D */}
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-xs font-bold text-slate-900 uppercase tracking-wider">
-                      Answer Choices <span className="text-red-500">*</span>
-                    </label>
-                    <span className="text-[11px] text-slate-500">
-                      Provide 4 options and mark which one is the correct answer
-                    </span>
-                  </div>
+                <div className="space-y-3">
+                  <label className="block text-xs font-bold text-slate-900 uppercase tracking-wider">
+                    Answer Choices <span className="text-red-500">*</span>
+                  </label>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {[
@@ -3775,15 +4031,16 @@ RULES:
                       return (
                         <div 
                           key={opt.idx}
-                          className={`p-4 rounded-2xl border transition-all ${
+                          style={{ backgroundColor: '#FFFFFF' }}
+                          className={`p-4 rounded-2xl border transition-all bg-white ${
                             isCorrect 
-                              ? 'border-emerald-400 bg-emerald-50/40 ring-1 ring-emerald-300 shadow-xs' 
+                              ? 'border-emerald-500 ring-1 ring-emerald-400 shadow-xs' 
                               : hasErr
-                                ? 'border-red-300 bg-red-50/10'
-                                : 'border-[#EAECF0] bg-white'
+                                ? 'border-red-300'
+                                : 'border-[#EAECF0]'
                           }`}
                         >
-                          <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center justify-between mb-2.5">
                             <div className="flex items-center gap-2">
                               <span className={`w-6 h-6 rounded-lg text-xs font-black flex items-center justify-center shrink-0 ${
                                 isCorrect 
@@ -3792,7 +4049,6 @@ RULES:
                               }`}>
                                 {opt.letter}
                               </span>
-                              <label className="text-xs font-bold text-slate-900">{opt.label}</label>
                             </div>
 
                             <button
@@ -3803,21 +4059,14 @@ RULES:
                                   setFormErrors(prev => ({ ...prev, qCorrect: '' }));
                                 }
                               }}
-                              className={`px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1 ${
+                              className={`px-3 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer ${
                                 isCorrect
                                   ? 'bg-emerald-600 text-white shadow-xs'
                                   : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
                               }`}
                               title={`Set Option ${opt.letter} as the correct answer`}
                             >
-                              {isCorrect ? (
-                                <>
-                                  <Check className="w-3 h-3 text-white" />
-                                  <span>✓ Correct Answer</span>
-                                </>
-                              ) : (
-                                <span>Select Correct</span>
-                              )}
+                              <span>{isCorrect ? 'Correct Answer' : 'Select Correct'}</span>
                             </button>
                           </div>
 
@@ -3833,10 +4082,10 @@ RULES:
                                 setFormErrors(prev => ({ ...prev, qCorrect: '' }));
                               }
                             }}
-                            placeholder={`Enter ${opt.label} text...`}
-                            className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white placeholder:text-slate-400 focus:outline-none transition-all ${
+                            style={{ backgroundColor: '#FFFFFF' }}
+                            className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white focus:outline-none transition-all ${
                               hasErr 
-                                ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20' 
+                                ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200' 
                                 : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
                             }`}
                           />
@@ -3850,57 +4099,6 @@ RULES:
                       );
                     })}
                   </div>
-                </div>
-
-                {/* Correct Answer Selection Bar */}
-                <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#EAECF0] space-y-2">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                    <div>
-                      <span className="text-xs font-bold text-slate-900 uppercase tracking-wider block">
-                        Correct Answer Selection <span className="text-red-500">*</span>
-                      </span>
-                      <p className="text-[11px] text-slate-500">
-                        Choose the designated correct choice. The answer text matches the selected option.
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      {(['A', 'B', 'C', 'D'] as const).map((letter, idx) => {
-                        const isSelected = qCorrectIdx === idx;
-                        return (
-                          <button
-                            key={letter}
-                            type="button"
-                            onClick={() => {
-                              setQCorrectIdx(idx);
-                              if (formErrors.qCorrect) {
-                                setFormErrors(prev => ({ ...prev, qCorrect: '' }));
-                              }
-                            }}
-                            className={`w-9 h-9 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center ${
-                              isSelected
-                                ? 'bg-emerald-600 text-white shadow-xs scale-105'
-                                : 'bg-white text-slate-700 hover:bg-slate-50 border border-[#EAECF0]'
-                            }`}
-                          >
-                            {letter}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="text-xs text-[#15803d] font-semibold flex items-center gap-2 pt-1 border-t border-[#EAECF0]">
-                    <span className="w-5 h-5 rounded-md bg-emerald-100 text-[#15803d] flex items-center justify-center text-[10px] font-black shrink-0">
-                      {['A', 'B', 'C', 'D'][qCorrectIdx]}
-                    </span>
-                    <span className="truncate">
-                      Selected: Option {['A', 'B', 'C', 'D'][qCorrectIdx]} —{' '}
-                      <span className="font-bold">
-                        {[qOptionA, qOptionB, qOptionC, qOptionD][qCorrectIdx].trim() || '(Option is currently blank)'}
-                      </span>
-                    </span>
-                  </div>
-
                   {formErrors.qCorrect && (
                     <p className="text-[11px] text-red-600 font-semibold mt-1 flex items-center gap-1">
                       <AlertCircle className="w-3 h-3 text-red-500 shrink-0" />
@@ -3922,13 +4120,14 @@ RULES:
                         setQCategory(e.target.value);
                         if (formErrors.qCategory) setFormErrors(prev => ({ ...prev, qCategory: '' }));
                       }}
+                      style={{ backgroundColor: '#FFFFFF' }}
                       className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white cursor-pointer focus:outline-none transition-all ${
                         formErrors.qCategory
-                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20'
+                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200'
                           : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
                       }`}
                     >
-                      <option value="">Select Subject...</option>
+                      <option value="">Select Subject</option>
                       <option value="Reasoning">Reasoning</option>
                       <option value="Hindi">Hindi</option>
                       <option value="English">English</option>
@@ -3955,13 +4154,14 @@ RULES:
                         setQDifficulty(e.target.value);
                         if (formErrors.qDifficulty) setFormErrors(prev => ({ ...prev, qDifficulty: '' }));
                       }}
+                      style={{ backgroundColor: '#FFFFFF' }}
                       className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white cursor-pointer focus:outline-none transition-all ${
                         formErrors.qDifficulty
-                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20'
+                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200'
                           : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
                       }`}
                     >
-                      <option value="">Select Difficulty...</option>
+                      <option value="">Select Difficulty</option>
                       <option value="Easy">Easy</option>
                       <option value="Medium">Medium</option>
                       <option value="Hard">Hard</option>
@@ -3987,10 +4187,10 @@ RULES:
                         setQExplanation(e.target.value);
                         if (formErrors.qExplanation) setFormErrors(prev => ({ ...prev, qExplanation: '' }));
                       }}
-                      placeholder="e.g. Detailed step-by-step solution..."
-                      className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white placeholder:text-slate-400 focus:outline-none transition-all ${
+                      style={{ backgroundColor: '#FFFFFF' }}
+                      className={`w-full px-3.5 py-2.5 rounded-xl border text-xs text-slate-900 bg-white focus:outline-none transition-all ${
                         formErrors.qExplanation
-                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200 bg-red-50/20'
+                          ? 'border-red-400 focus:border-red-500 focus:ring-1 focus:ring-red-200'
                           : 'border-[#EAECF0] focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20'
                       }`}
                     />
@@ -4005,34 +4205,17 @@ RULES:
 
                 {/* Submit Actions */}
                 <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#EAECF0]">
-                  {editingId !== null && (
-                    <button
-                      type="button"
-                      onClick={handleCancelEdit}
-                      disabled={isSavingQuestion}
-                      className="px-5 py-2.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs border border-[#EAECF0] transition-all cursor-pointer shadow-xs disabled:opacity-50"
-                    >
-                      Cancel Edit
-                    </button>
-                  )}
-
                   <button
                     type="submit"
                     disabled={isSavingQuestion}
-                    className="px-6 py-2.5 rounded-xl text-white font-bold text-xs shadow-md shadow-blue-500/20 flex items-center gap-2 transition-all cursor-pointer active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                    className="px-6 py-2.5 rounded-xl text-white font-bold text-xs shadow-md shadow-blue-500/20 flex items-center justify-center transition-all cursor-pointer active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
                     style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                   >
-                    {isSavingQuestion ? (
-                      <>
-                        <Loader2 className="w-4 h-4 text-white animate-spin" />
-                        <span>{editingId !== null ? 'Updating Question...' : 'Saving Question...'}</span>
-                      </>
-                    ) : (
-                      <>
-                        <Save className="w-4 h-4 text-white" />
-                        <span>{editingId !== null ? 'Update Question' : 'Save Question'}</span>
-                      </>
-                    )}
+                    <span>
+                      {isSavingQuestion
+                        ? (editingId !== null ? 'Updating Question...' : 'Saving Question...')
+                        : (editingId !== null ? 'Update Question' : 'Save Question')}
+                    </span>
                   </button>
                 </div>
               </form>
@@ -4069,7 +4252,6 @@ RULES:
                   </button>
 
                   <div className="relative w-full sm:w-80">
-                    <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
                     <input
                       type="text"
                       value={questionSearch}
@@ -4078,7 +4260,7 @@ RULES:
                         setQuestionPage(1);
                       }}
                       placeholder="Search Question Library..."
-                      className="w-full pl-10 pr-4 py-3 rounded-xl border border-[#EAECF0] text-xs sm:text-sm focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20 bg-white text-slate-900 placeholder:text-slate-400 shadow-2xs transition-all"
+                      className="w-full px-4 py-3 rounded-xl border border-[#EAECF0] text-xs sm:text-sm focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20 bg-white text-slate-900 placeholder:text-slate-400 shadow-2xs transition-all"
                     />
                   </div>
                 </div>
@@ -4127,7 +4309,7 @@ RULES:
                   <tbody className="divide-y divide-[#EAECF0] bg-white">
                     {/* Masked User ID Bar: Top-left of each 10-question block just below table header */}
                     {paginatedQuestions.length > 0 && (() => {
-                      const blockNumber = safeQuestionPage;
+                      const blockNumber = paginatedQuestions[0]?.blockNumber != null ? Number(paginatedQuestions[0].blockNumber) : safeQuestionPage;
                       const assignedUserId = getBlockAssignedUserId(blockNumber, paginatedQuestions, registeredUsersList);
                       const isUnmasked = unmaskedBlockIds.includes(blockNumber);
 
@@ -4140,8 +4322,7 @@ RULES:
                                   User ID:
                                 </span>
                                 {assignedUserId.includes('Unassigned') ? (
-                                  <span className="font-semibold text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 inline-flex items-center gap-1.5">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                  <span className="font-semibold text-[11px] text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200 tracking-wide inline-flex items-center">
                                     Unassigned
                                   </span>
                                 ) : isUnmasked ? (
@@ -4160,10 +4341,10 @@ RULES:
                                     <button
                                       type="button"
                                       onClick={() => setUnmaskedBlockIds(prev => prev.filter(b => b !== blockNumber))}
-                                      className="text-[9px] font-medium text-slate-500 hover:text-slate-800 px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50/80 hover:bg-slate-100 shadow-2xs transition-all cursor-pointer inline-flex items-center gap-1 active:scale-95 leading-none"
-                                      title="Hide / re-mask ID"
+                                      className="text-[10px] font-semibold text-slate-500 hover:text-slate-800 px-2 py-0.5 rounded-md border border-slate-200 bg-slate-100 hover:bg-slate-200 shadow-2xs transition-all cursor-pointer inline-flex items-center active:scale-95 leading-none"
+                                      title="Mask ID"
                                     >
-                                      (Hide / Re-mask)
+                                      Mask ID
                                     </button>
                                   </div>
                                 ) : (
@@ -4201,10 +4382,11 @@ RULES:
                       </tr>
                     ) : (
                       paginatedQuestions.map((q) => {
-                        const normCat = normalizeCategory(q.category);
                         const isSelected = selectedQuestionIds.includes(Number(q.id));
-                        const correctLetter = q.correctKey || ['A', 'B', 'C', 'D'][q.correctIndex] || 'A';
-                        const rawOptionText = q.options ? q.options[q.correctIndex != null && q.correctIndex >= 0 ? q.correctIndex : Math.max(0, ['A', 'B', 'C', 'D'].indexOf(correctLetter))] : '';
+                        const normCat = normalizeCategory(q.subject || q.category, `${q.stem || q.question || ''} ${q.explanation || ''}`);
+                        const correctIdx = getQuestionCorrectIndex(q);
+                        const correctLetter = (['A', 'B', 'C', 'D'][correctIdx] || 'A');
+                        const rawOptionText = q.options ? q.options[correctIdx] : '';
                         const cleanOptionText = (rawOptionText || '').replace(/^[A-Da-d][).:\s-]+/, '').trim();
                         const fullAnswerString = `${correctLetter}) ${cleanOptionText || rawOptionText}`;
 
@@ -5087,7 +5269,8 @@ RULES:
                       { key: 'all', label: `All Deposits (${deposits.length})` },
                       { key: 'pending', label: `Pending (${deposits.filter(d => d.status === 'pending').length})` },
                       { key: 'approved', label: `Approved (${deposits.filter(d => d.status === 'approved').length})` },
-                      { key: 'rejected', label: `Rejected (${deposits.filter(d => d.status === 'rejected').length})` }
+                      { key: 'rejected', label: `Rejected (${deposits.filter(d => d.status === 'rejected').length})` },
+                      { key: 'cancelled', label: `Cancelled (${deposits.filter(d => d.status === 'cancelled').length})` }
                     ].map((pill) => (
                       <button
                         key={pill.key}
@@ -5162,14 +5345,15 @@ RULES:
                         </td>
                       </tr>
                     ) : (
-                      filteredDeposits.map((dep, idx) => {
-                        const displayId = formatDepositId(dep.id, idx + 1);
+                      paginatedDeposits.map((dep, pIdx) => {
+                        const globalIdx = (safeDepositPage - 1) * DEPOSIT_PAGE_SIZE + pIdx;
+                        const displayId = formatDepositId(dep.id, globalIdx + 1);
                         const isSelected = selectedDepositIds.includes(dep.id);
                         const isPending = dep.status === 'pending';
 
                         return (
                           <tr 
-                            key={dep.id ? `admin-dep-${dep.id}-${idx}` : `admin-dep-${dep.utrNumber || idx}-${idx}`} 
+                            key={dep.id ? `admin-dep-${dep.id}-${globalIdx}` : `admin-dep-${dep.utrNumber || globalIdx}-${globalIdx}`} 
                             className={`hover:bg-slate-50/70 transition-colors ${isSelected ? 'bg-blue-50/40' : ''}`}
                           >
                             <td className="py-3.5 px-3 text-center">
@@ -5233,12 +5417,14 @@ RULES:
                                   ? 'bg-emerald-100 text-emerald-800'
                                   : dep.status === 'rejected'
                                   ? 'bg-rose-100 text-rose-800'
+                                  : dep.status === 'cancelled'
+                                  ? 'bg-slate-100 text-slate-700'
                                   : 'bg-amber-100 text-amber-900'
                               }`}>
                                 {dep.status}
                               </span>
                             </td>
-                            {/* ACTIONS: Approve, Reject, and Delete */}
+                            {/* ACTIONS: Approve, Reject, and Cancel */}
                             <td className="py-3.5 px-4 text-right">
                               <div className="flex items-center justify-end gap-1.5">
                                 {dep.status === 'pending' && (
@@ -5257,6 +5443,13 @@ RULES:
                                       className="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-xs border border-rose-200 transition-all cursor-pointer"
                                     >
                                       Reject
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleCancelDeposit(dep.id)}
+                                      className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs border border-slate-300 transition-all cursor-pointer"
+                                    >
+                                      Cancel
                                     </button>
                                   </>
                                 )}
@@ -5290,6 +5483,44 @@ RULES:
                     )}
                   </tbody>
                 </table>
+              </div>
+
+              {/* Exact Unified Single-Pill Capsule Pagination: `< X / Y >` inside ONE single brand gradient container at bottom right */}
+              <div className="flex items-center justify-end pt-3 border-t border-[#EAECF0]">
+                <div 
+                  className="inline-flex items-center rounded-full text-white font-bold text-xs shadow-md overflow-hidden select-none"
+                  style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                >
+                  <button
+                    type="button"
+                    disabled={safeDepositPage <= 1}
+                    onClick={() => {
+                      soundFx.playClick();
+                      setDepositPage(prev => Math.max(1, prev - 1));
+                    }}
+                    className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+                    title="Previous Page"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5 text-white" />
+                  </button>
+
+                  <span className="px-3 py-2 text-white font-bold text-xs tracking-wider min-w-[56px] text-center">
+                    {safeDepositPage} / {totalDepositPages}
+                  </span>
+
+                  <button
+                    type="button"
+                    disabled={safeDepositPage >= totalDepositPages}
+                    onClick={() => {
+                      soundFx.playClick();
+                      setDepositPage(prev => Math.min(totalDepositPages, prev + 1));
+                    }}
+                    className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+                    title="Next Page"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5 text-white" />
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -5417,61 +5648,8 @@ RULES:
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-100">
                 <div>
                   <h3 className="text-base font-black text-slate-900">
-                    Daily Contest Winner Payout & Dispatch Ledger
+                    Winner Payout Ledger
                   </h3>
-                  <p className="text-xs text-slate-500">
-                    Declare results based on accuracy and speed, copy UPI IDs with 1-click, and track disbursement status.
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <button
-                    type="button"
-                    onClick={handleDeclareWinner}
-                    className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold shadow-md shadow-blue-500/20 flex items-center gap-1.5 transition-all cursor-pointer active:scale-95"
-                  >
-                    <Trophy className="w-4 h-4 text-amber-300" />
-                    <span>Declare Today's Winners</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleBatchPayAllCashbacks}
-                    className="px-4 py-2.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-bold border border-emerald-200 transition-all cursor-pointer"
-                  >
-                    Mark All UPI Cashbacks Sent
-                  </button>
-                </div>
-              </div>
-
-              {/* Rank 1 Amazon/Meesho Courier AWB Input */}
-              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  <Truck className="w-5 h-5 text-indigo-600 shrink-0" />
-                  <div>
-                    <h4 className="text-xs font-bold text-slate-900">
-                      Rank #1 Product Dispatch Tracking ({todayPrize.deliveryPartner})
-                    </h4>
-                    <p className="text-[11px] text-slate-500">
-                      Awarded to {leaderboard.find(l => l.rank === 1)?.userName || 'Top Contestant'}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2 w-full sm:w-auto">
-                  <input
-                    type="text"
-                    value={orderTrackingId}
-                    onChange={(e) => setOrderTrackingId(e.target.value)}
-                    placeholder="e.g. AMZN-IN-9812401"
-                    className="px-3.5 py-2 rounded-xl border border-slate-200 text-xs font-mono bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleSaveTrackingId}
-                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-xs cursor-pointer"
-                  >
-                    Save AWB
-                  </button>
                 </div>
               </div>
 
@@ -5481,17 +5659,18 @@ RULES:
                   {[
                     { key: 'all', label: 'All Ranks' },
                     { key: 'pending', label: 'Pending Payout' },
-                    { key: 'sent', label: 'Paid via UPI' }
+                    { key: 'sent', label: 'Paid via Bank' }
                   ].map((p) => (
                     <button
                       key={p.key}
                       type="button"
                       onClick={() => setLedgerFilter(p.key as typeof ledgerFilter)}
-                      className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                      className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs ${
                         ledgerFilter === p.key
-                          ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
-                          : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          ? 'text-white shadow-sm'
+                          : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
                       }`}
+                      style={ledgerFilter === p.key ? { background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' } : { backgroundColor: '#FFFFFF' }}
                     >
                       {p.label}
                     </button>
@@ -5504,8 +5683,9 @@ RULES:
                     type="text"
                     value={ledgerSearch}
                     onChange={(e) => setLedgerSearch(e.target.value)}
-                    placeholder="Search candidate or city..."
-                    className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20 bg-white"
+                    placeholder="Search by name"
+                    className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs focus:outline-none focus:ring-2 focus:ring-[#3A81F5]/20 shadow-2xs text-slate-900"
+                    style={{ backgroundColor: '#FFFFFF' }}
                   />
                 </div>
               </div>
@@ -5515,146 +5695,195 @@ RULES:
                 <table className="w-full text-left text-xs border-collapse">
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-slate-700">
-                      <th className="py-3 px-4 font-bold w-12">Rank</th>
-                      <th className="py-3 px-4 font-bold">Contestant</th>
-                      <th className="py-3 px-4 font-bold">Score & Speed</th>
-                      <th className="py-3 px-4 font-bold">Allocated Reward</th>
-                      <th className="py-3 px-4 font-bold">UPI ID (Direct Copy)</th>
-                      <th className="py-3 px-4 font-bold text-right">Disbursement Status</th>
+                      <th className="py-3 px-4 font-bold w-16 whitespace-nowrap">Rank</th>
+                      <th className="py-3 px-4 font-bold min-w-[140px]">Contestant</th>
+                      <th className="py-3 px-4 font-bold text-center w-52 whitespace-nowrap">Score & Speed</th>
+                      <th className="py-3 px-4 font-bold text-center w-36 whitespace-nowrap">Allocated Reward</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {filteredLeaderboard.map((item) => {
-                      const isPaid = payoutStatuses[item.id] === 'sent';
-                      const defaultUpi = `${item.userName.toLowerCase().replace(/\s+/g, '.')}@okhdfcbank`;
-                      const isCopied = copiedUpiId === item.id;
-
-                      return (
-                        <tr key={item.id} className="hover:bg-slate-50/70 transition-colors">
-                          <td className="py-3.5 px-4 font-black">
-                            <span className={`w-7 h-7 rounded-xl flex items-center justify-center text-xs font-black ${
-                              item.rank === 1
-                                ? 'bg-amber-100 text-amber-900 border border-amber-300 shadow-xs'
-                                : item.rank === 2
-                                ? 'bg-slate-100 text-slate-800 border border-slate-300'
-                                : item.rank === 3
-                                ? 'bg-amber-50 text-amber-800 border border-amber-200'
-                                : 'text-slate-500'
-                            }`}>
-                              {item.rank}
-                            </span>
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <div className="flex items-center gap-2.5">
-                              {item.avatar ? (
-                                <img src={item.avatar} alt={item.userName} className="w-7 h-7 rounded-full object-cover border border-slate-200 shrink-0" />
-                              ) : (
-                                <div className="w-7 h-7 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center text-xs font-bold shrink-0">
-                                  {item.userName ? item.userName.charAt(0).toUpperCase() : 'U'}
-                                </div>
-                              )}
-                              <div>
-                                <p className="font-bold text-slate-900 flex items-center gap-1.5">
-                                  <span>{item.userName}</span>
-                                  {item.isCurrentUser && (
-                                    <span className="px-1.5 py-0.5 rounded-sm bg-indigo-100 text-indigo-700 text-[10px] font-extrabold">
-                                      YOU
-                                    </span>
-                                  )}
-                                </p>
-                                <p className="text-[11px] text-slate-400">{item.city}, {item.state}</p>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <p className="font-mono font-bold text-slate-900">{item.score}/10 Correct</p>
-                            <p className="text-[11px] font-mono text-slate-500">⏱️ {item.formattedTime}</p>
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <span className={`px-2.5 py-1 rounded-xl text-xs font-bold inline-flex items-center gap-1 ${
-                              item.rank === 1
-                                ? 'bg-amber-100 text-amber-950 border border-amber-300'
-                                : item.rank <= 10
-                                ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                                : 'bg-slate-100 text-slate-600'
-                            }`}>
-                              {item.rewardText || 'Participation'}
-                            </span>
-                          </td>
-                          <td className="py-3.5 px-4 font-mono text-[11px]">
-                            <div className="flex items-center gap-2">
-                              <span className="text-slate-700 truncate max-w-[150px]">{defaultUpi}</span>
-                              <button
-                                type="button"
-                                onClick={() => handleCopyUpi(defaultUpi, item.id)}
-                                title="1-Click Copy UPI to Clipboard"
-                                className={`p-1.5 rounded-lg border transition-all cursor-pointer shrink-0 ${
-                                  isCopied
-                                    ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
-                                    : 'bg-white hover:bg-slate-100 text-slate-600 border-slate-200'
-                                }`}
+                    {filteredLeaderboard.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="py-12 px-4 text-center text-slate-400 font-medium text-xs bg-white">
+                          No active contest participants or test submissions found.
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredLeaderboard.map((item) => {
+                        return (
+                          <tr key={item.id} className="hover:bg-slate-50/70 transition-colors bg-white">
+                            {/* Rank */}
+                            <td className="py-3.5 px-4 font-black whitespace-nowrap align-middle">
+                              <span
+                                className="w-7 h-7 rounded-xl flex items-center justify-center text-xs font-black text-white shadow-2xs"
+                                style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                               >
-                                {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                              </button>
-                            </div>
-                          </td>
-                          <td className="py-3.5 px-4 text-right">
-                            {item.rank === 1 ? (
-                              <span className="text-[11px] font-bold text-indigo-600 px-2.5 py-1 rounded-lg bg-indigo-50 border border-indigo-200">
-                                Courier Dispatched
+                                {item.rank}
                               </span>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => handleTogglePayoutStatus(item.id)}
-                                className={`px-3.5 py-1.5 rounded-xl font-bold text-xs transition-all cursor-pointer ${
-                                  isPaid
-                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                                    : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300'
-                                }`}
-                              >
-                                {isPaid ? '✓ UPI Transferred' : 'Mark Transferred'}
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                            </td>
+
+                            {/* Contestant: clean name and YOU badge without location or avatar thumbnail */}
+                            <td className="py-3.5 px-4 align-middle">
+                              <div className="font-bold text-slate-900 flex items-center gap-1.5 truncate">
+                                <span className="truncate">{item.userName}</span>
+                                {item.isCurrentUser && (
+                                  <span
+                                    className="text-[9px] text-white px-2 py-0.5 rounded-full font-bold shadow-2xs shrink-0"
+                                    style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                                  >
+                                    YOU
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+
+                            {/* Score & Speed: standardized neat boxes with clean divider, centered */}
+                            <td className="py-3.5 px-4 whitespace-nowrap text-center align-middle">
+                              <div className="flex items-center justify-center gap-2">
+                                <span className="w-14 h-7 inline-flex items-center justify-center rounded-lg font-black text-xs text-[#3A81F5] bg-blue-50 border border-blue-200/80 shadow-2xs tabular-nums whitespace-nowrap">
+                                  {item.score}/10
+                                </span>
+                                <span className="text-slate-300 font-bold">|</span>
+                                <span className="min-w-[76px] px-2.5 h-7 inline-flex items-center justify-center rounded-lg font-mono font-semibold text-xs text-slate-700 bg-slate-50 border border-slate-200 shadow-2xs tabular-nums whitespace-nowrap">
+                                  {item.formattedTime ? item.formattedTime.replace(/^in\s+/, '') : (item.timeTakenSeconds ? `${Math.round(item.timeTakenSeconds)}s` : '0m 00s')}
+                                </span>
+                              </div>
+                            </td>
+
+                            {/* Allocated Reward: all prize boxes have identical dimensions w-20 h-7, centered */}
+                            <td className="py-3.5 px-4 whitespace-nowrap text-center align-middle">
+                              <div className="flex items-center justify-center">
+                                <span className="w-20 h-7 inline-flex items-center justify-center rounded-lg text-xs font-extrabold bg-emerald-50 text-emerald-800 border border-emerald-200 shadow-2xs whitespace-nowrap tabular-nums">
+                                  {item.rewardAmount !== undefined
+                                    ? (item.rewardAmount > 0 ? `₹${item.rewardAmount.toLocaleString('en-IN')}` : '₹0')
+                                    : (item.rewardText && item.rewardText.includes('₹')
+                                        ? (item.rewardText.match(/₹\s*(\d+)/) ? `₹${Number(item.rewardText.match(/₹\s*(\d+)/)![1]).toLocaleString('en-IN')}` : item.rewardText)
+                                        : '₹0')}
+                                </span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
                   </tbody>
                 </table>
               </div>
 
-              {/* Collapsible Platform Economics & Margins Overview */}
-              <div className="rounded-2xl border border-slate-200 overflow-hidden bg-slate-50/60">
+              {/* Economics Breakdown */}
+              <div className="pt-2 border-t border-slate-100 space-y-4">
                 <button
                   type="button"
                   onClick={() => setIsFinancialsExpanded(!isFinancialsExpanded)}
-                  className="w-full p-4 flex items-center justify-between text-xs font-bold text-slate-700 hover:bg-slate-100/70 transition-colors cursor-pointer"
+                  className="w-full flex items-center justify-between text-xs font-bold text-slate-800 hover:text-slate-900 transition-colors cursor-pointer py-1"
                 >
                   <div className="flex items-center gap-2">
-                    <PieChart className="w-4 h-4 text-indigo-600" />
-                    <span>View Platform Margins & Economics Breakdown</span>
+                    <PieChart className="w-4 h-4 text-[#3A81F5]" />
+                    <span className="text-slate-900 font-extrabold text-xs sm:text-sm">Economics Breakdown</span>
                   </div>
-                  {isFinancialsExpanded ? <ChevronUp className="w-4 h-4 text-slate-500" /> : <ChevronDown className="w-4 h-4 text-slate-500" />}
+                  <div className="flex items-center gap-1.5 text-slate-500 text-xs">
+                    <span className="text-[11px] font-semibold hidden sm:inline">
+                      {isFinancialsExpanded ? 'Hide Details' : 'View Details'}
+                    </span>
+                    {isFinancialsExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                  </div>
                 </button>
 
-                {isFinancialsExpanded && (
-                  <div className="p-4 pt-0 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
-                    <div className="p-3.5 rounded-xl bg-white border border-slate-200">
-                      <p className="text-slate-500 text-[11px] font-medium">Rank 1 Mega Prize (50%)</p>
-                      <p className="text-base font-black text-indigo-700 mt-1">₹{poolData.productPrizeValue.toLocaleString('en-IN')}</p>
+                {isFinancialsExpanded && (() => {
+                  const hasActiveContest = Boolean(activeContest && activeContest.status === 'active');
+                  const feeRupees = hasActiveContest
+                    ? (activeContest!.entryFee || poolData.entryFee || 100)
+                    : 100;
+                  const poolCalc = hasActiveContest
+                    ? contestBackend.getPoolCalculation(activeContest!.id, feeRupees)
+                    : null;
+                  const confirmedPaidCount = hasActiveContest
+                    ? (activeContest!.confirmedPaidEntries !== undefined
+                        ? activeContest!.confirmedPaidEntries
+                        : (activeContest!.realJoins !== undefined
+                            ? activeContest!.realJoins
+                            : (poolCalc?.confirmedPaidEntries || 0)))
+                    : 0;
+
+                  const hasPaidJoins = hasActiveContest && confirmedPaidCount > 0;
+                  const totalRevenue = confirmedPaidCount * feeRupees;
+                  const winnerPoolAmount = hasPaidJoins ? Math.floor(totalRevenue * 0.60) : 0;
+                  const referralPoolAmount = hasPaidJoins ? Math.floor(totalRevenue * 0.10) : 0;
+                  const platformMarginAmount = hasPaidJoins ? (totalRevenue - winnerPoolAmount - referralPoolAmount) : 0;
+                  const totalAmount = hasPaidJoins ? (winnerPoolAmount + referralPoolAmount + platformMarginAmount) : 0;
+
+                  return (
+                    <div className="space-y-3.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                        {/* Card 1: 60% Winner Pool */}
+                        <div 
+                          className="p-4 rounded-xl border border-slate-200/90 shadow-2xs"
+                          style={{ backgroundColor: '#FFFFFF' }}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">Winner Prize Pool</span>
+                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                              60%
+                            </span>
+                          </div>
+                          <p className="text-xl font-black mt-1" style={{ color: '#3A81F5' }}>
+                            {hasPaidJoins ? `₹${winnerPoolAmount.toLocaleString('en-IN')}` : '₹0'}
+                          </p>
+                        </div>
+
+                        {/* Card 2: 10% Referral */}
+                        <div 
+                          className="p-4 rounded-xl border border-slate-200/90 shadow-2xs"
+                          style={{ backgroundColor: '#FFFFFF' }}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">Referral & Affiliates</span>
+                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200">
+                              10%
+                            </span>
+                          </div>
+                          <p className="text-xl font-black mt-1" style={{ color: '#20A5AC' }}>
+                            {hasPaidJoins ? `₹${referralPoolAmount.toLocaleString('en-IN')}` : '₹0'}
+                          </p>
+                        </div>
+
+                        {/* Card 3: 30% Platform Margin */}
+                        <div 
+                          className="p-4 rounded-xl border border-slate-200/90 shadow-2xs"
+                          style={{ backgroundColor: '#FFFFFF' }}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">Platform Margin</span>
+                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                              30%
+                            </span>
+                          </div>
+                          <p className="text-xl font-black mt-1" style={{ color: '#0F172A' }}>
+                            {hasPaidJoins ? `₹${platformMarginAmount.toLocaleString('en-IN')}` : '₹0'}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Card 4: Total (Combined Amount) */}
+                      <div 
+                        className="p-4 rounded-xl border border-slate-200/90 shadow-2xs"
+                        style={{ backgroundColor: '#FFFFFF' }}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-500 text-[11px] font-semibold uppercase tracking-wider">Total</span>
+                          <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200">
+                            100%
+                          </span>
+                        </div>
+                        <p className="text-xl font-black mt-1 text-slate-900">
+                          {hasPaidJoins ? `₹${totalAmount.toLocaleString('en-IN')}` : '₹0'}
+                        </p>
+                      </div>
                     </div>
-                    <div className="p-3.5 rounded-xl bg-white border border-slate-200">
-                      <p className="text-slate-500 text-[11px] font-medium">Rank 2-10 Cashbacks (45%)</p>
-                      <p className="text-base font-black text-emerald-700 mt-1">₹{poolData.runnerUpPoolValue.toLocaleString('en-IN')}</p>
-                    </div>
-                    <div className="p-3.5 rounded-xl bg-white border border-slate-200">
-                      <p className="text-slate-500 text-[11px] font-medium">Platform Fee & Margins (5%)</p>
-                      <p className="text-base font-black text-slate-900 mt-1">₹{poolData.platformFeeValue.toLocaleString('en-IN')}</p>
-                    </div>
-                  </div>
-                )}
+                  );
+                })()}
               </div>
+
             </div>
           </div>
         )}
@@ -6606,16 +6835,27 @@ RULES:
 
             <form onSubmit={handleVerifyPasscode} className="space-y-4">
               <div>
-                <input
-                  type="password"
-                  value={passcodeInput}
-                  onChange={(e) => {
-                    setPasscodeInput(e.target.value);
-                    if (passcodeError) setPasscodeError('');
-                  }}
-                  autoFocus
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#EAECF0] text-sm text-slate-900 focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20"
-                />
+                <div className="relative">
+                  <input
+                    type={showPasscodeText ? "text" : "password"}
+                    value={passcodeInput}
+                    onChange={(e) => {
+                      setPasscodeInput(e.target.value);
+                      if (passcodeError) setPasscodeError('');
+                    }}
+                    autoFocus
+                    className="w-full px-3.5 py-2.5 pr-10 rounded-xl border border-[#EAECF0] text-sm text-slate-900 focus:outline-none focus:border-[#4A7DF3] focus:ring-1 focus:ring-[#4A7DF3]/20"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPasscodeText(prev => !prev)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors p-1 cursor-pointer"
+                    title={showPasscodeText ? "Hide password" : "Show password"}
+                    aria-label={showPasscodeText ? "Hide password" : "Show password"}
+                  >
+                    {showPasscodeText ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
                 {passcodeError && (
                   <p className="text-xs text-rose-600 font-semibold mt-1.5 flex items-center gap-1">
                     <AlertCircle className="w-3.5 h-3.5 shrink-0" />
@@ -6630,6 +6870,7 @@ RULES:
                   onClick={() => {
                     setPasscodeModalBlock(null);
                     setPasscodeInput('');
+                    setShowPasscodeText(false);
                     setPasscodeError('');
                   }}
                   className="flex-1 py-2.5 px-4 rounded-xl text-white text-xs font-bold shadow-md hover:opacity-95 active:scale-[0.99] transition-all cursor-pointer"

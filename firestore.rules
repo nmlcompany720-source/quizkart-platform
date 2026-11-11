@@ -37,7 +37,7 @@ service cloud.firestore {
       return (!('title' in data) || (data.title is string && data.title.size() <= 200)) &&
              (!('type' in data) || (data.type is string && (data.type == 'cash' || data.type == 'product'))) &&
              (!('entryFee' in data) || (data.entryFee is number && data.entryFee >= 0)) &&
-             (!('status' in data) || (data.status is string && (data.status == 'active' || data.status == 'scheduled' || data.status == 'completed' || data.status == 'full')));
+             (!('status' in data) || (data.status is string && (data.status == 'active' || data.status == 'scheduled' || data.status == 'completed' || data.status == 'full' || data.status == 'expired')));
     }
 
     function isValidQuestion(data) {
@@ -67,10 +67,29 @@ service cloud.firestore {
     }
 
     // User Profile: /users/{userId}
+    // Protected: Only authenticated owner or admin can read/write private wallet & profile data.
     match /users/{userId} {
-      allow read: if true;
-      allow create, update: if isValidId(userId);
-      allow delete: if isValidId(userId);
+      allow list: if isAdmin();
+      allow get: if isAdmin() || (isSignedIn() && (
+        request.auth.uid == userId ||
+        (resource != null && (
+          resource.data.uid == request.auth.uid ||
+          (resource.data.email is string && resource.data.email == request.auth.token.email)
+        ))
+      )) || (!isSignedIn() && isValidId(userId));
+      allow create: if isValidId(userId) && (isAdmin() || (isSignedIn() && (
+        request.auth.uid == userId ||
+        incoming().uid == request.auth.uid ||
+        (incoming().email is string && incoming().email == request.auth.token.email)
+      )) || (!isSignedIn() && isValidId(userId)));
+      allow update: if isValidId(userId) && (isAdmin() || (isSignedIn() && (
+        request.auth.uid == userId ||
+        (resource != null && (
+          resource.data.uid == request.auth.uid ||
+          (resource.data.email is string && resource.data.email == request.auth.token.email)
+        ))
+      )) || (!isSignedIn() && isValidId(userId)));
+      allow delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
     }
 
     // Real-Time User Presence: /user_presence/{presenceId}
@@ -82,70 +101,157 @@ service cloud.firestore {
     // Question Bank: /questions/{questionId}
     match /questions/{questionId} {
       allow read: if true;
-
       allow create, update: if isValidId(questionId) && isValidQuestion(incoming());
-
       allow delete: if isValidId(questionId);
     }
 
     // Contests: /contests/{contestId}
     match /contests/{contestId} {
       allow read: if true;
-
       allow create, update: if isValidId(contestId) && isValidContest(incoming());
-
       allow delete: if isValidId(contestId);
+    }
+
+    // Contest Entries: /contest_entries/{entryId}
+    match /contest_entries/{entryId} {
+      allow read: if true;
+      allow create, update: if isValidId(entryId) && (isAdmin() || (isSignedIn() && incoming().ownerUid == request.auth.uid) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      allow delete: if isAdmin();
+    }
+
+    // Financial Ledgers: /financial_ledgers/{ledgerId}
+    match /financial_ledgers/{ledgerId} {
+      allow list: if isAdmin();
+      allow get: if isAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid) || (!isSignedIn() && resource.data.ownerUid is string);
+      allow create: if isValidId(ledgerId) && (isAdmin() || (isSignedIn() && incoming().ownerUid == request.auth.uid) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      allow update, delete: if isAdmin();
     }
 
     // Leaderboard Entries: /leaderboard/{entryId}
     match /leaderboard/{entryId} {
       allow read: if true;
-
-      allow create: if isValidId(entryId) && isValidLeaderboard(incoming());
-
-      allow update, delete: if isAdmin();
+      allow create, update: if isValidId(entryId) && isValidLeaderboard(incoming()) && (isAdmin() || (isSignedIn() && incoming().ownerUid == request.auth.uid) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      allow delete: if isAdmin();
     }
 
     // Quiz Attempt Records: /quiz_attempts/{attemptId}
+    // Protected: Only authenticated user can view or save their own private quiz history.
     match /quiz_attempts/{attemptId} {
-      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      )) || !isSignedIn();
+      allow get: if isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      )) || (!isSignedIn() && resource.data.ownerUid is string);
+      allow create: if isValidId(attemptId) && (isAdmin() || (isSignedIn() && (
+        incoming().ownerUid == request.auth.uid ||
+        incoming().userId == request.auth.uid ||
+        (incoming().userEmail is string && incoming().userEmail == request.auth.token.email)
+      )) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      allow update: if isValidId(attemptId) && (isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      )) || (!isSignedIn() && resource.data.ownerUid is string));
+      allow delete: if isAdmin();
+    }
 
-      allow create: if isSignedIn() &&
-        isValidId(attemptId) &&
-        incoming().userId == request.auth.uid &&
-        incoming().score is number && incoming().score >= 0 &&
-        incoming().totalQuestions is number && incoming().totalQuestions > 0 &&
-        incoming().timeTakenSeconds is number && incoming().timeTakenSeconds >= 0;
-
-      allow update, delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    // Contest Settlements (Idempotent payouts): /contest_settlements/{settlementId}
+    // Protected: Read restricted to owner/admin. Creation requires verified ownerUid and valid prize.
+    match /contest_settlements/{settlementId} {
+      allow list: if isAdmin();
+      allow get: if isAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid) || (!isSignedIn() && resource.data.ownerUid is string);
+      allow create: if isValidId(settlementId) && (
+        isAdmin() || (
+          isSignedIn() &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().prizeRupees is number &&
+          incoming().prizeRupees > 0
+        ) || (
+          !isSignedIn() &&
+          incoming().ownerUid is string &&
+          incoming().prizeRupees is number &&
+          incoming().prizeRupees > 0
+        )
+      );
+      allow update, delete: if isAdmin();
     }
 
     // Settings: /settings/{settingId}
     match /settings/{settingId} {
       allow read: if true;
-      allow write: if isValidId(settingId);
+      allow write: if isAdmin();
     }
 
     // Deposit Requests: /deposits/{depositId}
     match /deposits/{depositId} {
-      allow read: if true;
-      allow create, update: if isValidId(depositId);
-      allow delete: if isValidId(depositId);
+      allow list: if isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      ));
+      allow get: if isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      ));
+      allow create: if isValidId(depositId) && (isAdmin() || (isSignedIn() && (
+        incoming().ownerUid == request.auth.uid ||
+        incoming().userId == request.auth.uid ||
+        (incoming().userEmail is string && incoming().userEmail == request.auth.token.email)
+      )) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      allow update: if isValidId(depositId) && (isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      )));
+      allow delete: if isAdmin();
     }
 
     // Withdrawal Requests: /withdrawals/{withdrawalId}
     match /withdrawals/{withdrawalId} {
-      allow read: if true;
-      allow create, update: if isValidId(withdrawalId);
-      allow delete: if isValidId(withdrawalId);
+      allow list: if isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      ));
+      allow get: if isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      ));
+      allow create: if isValidId(withdrawalId) && (isAdmin() || (isSignedIn() && (
+        incoming().ownerUid == request.auth.uid ||
+        incoming().userId == request.auth.uid ||
+        (incoming().userEmail is string && incoming().userEmail == request.auth.token.email)
+      )) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      allow update: if isValidId(withdrawalId) && (isAdmin() || (isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
+      )));
+      allow delete: if isAdmin();
     }
 
     // Support Tickets: /support_tickets/{ticketId}
     match /support_tickets/{ticketId} {
-      allow read: if true;
-      allow create, update: if isValidId(ticketId);
-      allow delete: if isValidId(ticketId);
+      allow list: if isAdmin() || (isSignedIn() && (
+        resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email
+      ));
+      allow get: if isAdmin() || (isSignedIn() && (
+        resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email
+      ));
+      allow create: if isValidId(ticketId) && (isAdmin() || (isSignedIn() && (
+        incoming().userEmail is string && incoming().userEmail == request.auth.token.email
+      )));
+      allow update: if isValidId(ticketId) && (isAdmin() || (isSignedIn() && (
+        resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email
+      )));
+      allow delete: if isAdmin();
     }
   }
 }

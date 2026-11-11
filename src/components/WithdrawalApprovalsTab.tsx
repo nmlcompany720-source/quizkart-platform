@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Search, 
   Calendar, 
@@ -14,7 +14,9 @@ import {
   User, 
   CreditCard,
   Clock,
-  AlertCircle
+  AlertCircle,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { WithdrawalRequest } from '../types';
 import { soundFx } from '../utils/audio';
@@ -44,6 +46,11 @@ export const WithdrawalApprovalsTab: React.FC<WithdrawalApprovalsTabProps> = ({
   const [withdrawalSearch, setWithdrawalSearch] = useState('');
   const [withdrawalDateFilter, setWithdrawalDateFilter] = useState('');
   const [selectedWithdrawalIds, setSelectedWithdrawalIds] = useState<string[]>([]);
+  const [withdrawalPage, setWithdrawalPage] = useState<number>(1);
+
+  useEffect(() => {
+    setWithdrawalPage(1);
+  }, [withdrawalFilter, withdrawalSearch, withdrawalDateFilter]);
   
   // Dedicated Full-Page Request Detail View State
   const [detailWithdrawal, setDetailWithdrawal] = useState<WithdrawalRequest | null>(null);
@@ -116,6 +123,15 @@ export const WithdrawalApprovalsTab: React.FC<WithdrawalApprovalsTabProps> = ({
       return true;
     });
   }, [withdrawals, withdrawalFilter, withdrawalSearch, withdrawalDateFilter]);
+
+  const WITHDRAWAL_PAGE_SIZE = 10;
+  const totalWithdrawalPages = Math.max(1, Math.ceil(filteredWithdrawals.length / WITHDRAWAL_PAGE_SIZE));
+  const safeWithdrawalPage = Math.min(Math.max(1, withdrawalPage), totalWithdrawalPages);
+
+  const paginatedWithdrawals = useMemo(() => {
+    const startIndex = (safeWithdrawalPage - 1) * WITHDRAWAL_PAGE_SIZE;
+    return filteredWithdrawals.slice(startIndex, startIndex + WITHDRAWAL_PAGE_SIZE);
+  }, [filteredWithdrawals, safeWithdrawalPage]);
 
   const pendingCount = (withdrawals || []).filter(w => w && w.status === 'pending').length;
 
@@ -536,14 +552,15 @@ export const WithdrawalApprovalsTab: React.FC<WithdrawalApprovalsTabProps> = ({
                   </td>
                 </tr>
               ) : (
-                filteredWithdrawals.map((wth, idx) => {
-                  const displayId = formatWithdrawalId(wth.id, idx + 1);
+                paginatedWithdrawals.map((wth, pIdx) => {
+                  const globalIdx = (safeWithdrawalPage - 1) * WITHDRAWAL_PAGE_SIZE + pIdx;
+                  const displayId = formatWithdrawalId(wth.id, globalIdx + 1);
                   const isSelected = selectedWithdrawalIds.includes(wth.id);
                   const isPending = wth.status === 'pending';
 
                   return (
                     <tr 
-                      key={wth.id ? `admin-wth-${wth.id}-${idx}` : `admin-wth-${idx}`}
+                      key={wth.id ? `admin-wth-${wth.id}-${globalIdx}` : `admin-wth-${globalIdx}`}
                       className={`hover:bg-slate-50/70 transition-colors ${isSelected ? 'bg-indigo-50/40' : ''}`}
                     >
                       <td className="py-3.5 px-3 text-center">
@@ -713,6 +730,44 @@ export const WithdrawalApprovalsTab: React.FC<WithdrawalApprovalsTabProps> = ({
               )}
             </tbody>
           </table>
+        </div>
+
+        {/* Exact Unified Single-Pill Capsule Pagination: `< X / Y >` inside ONE single brand gradient container at bottom right */}
+        <div className="flex items-center justify-end pt-3 border-t border-slate-100">
+          <div 
+            className="inline-flex items-center rounded-full text-white font-bold text-xs shadow-md overflow-hidden select-none"
+            style={{ background: PRIMARY_GRADIENT }}
+          >
+            <button
+              type="button"
+              disabled={safeWithdrawalPage <= 1}
+              onClick={() => {
+                soundFx.playClick();
+                setWithdrawalPage(prev => Math.max(1, prev - 1));
+              }}
+              className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+              title="Previous Page"
+            >
+              <ChevronLeft className="w-3.5 h-3.5 text-white" />
+            </button>
+
+            <span className="px-3 py-2 text-white font-bold text-xs tracking-wider min-w-[56px] text-center">
+              {safeWithdrawalPage} / {totalWithdrawalPages}
+            </span>
+
+            <button
+              type="button"
+              disabled={safeWithdrawalPage >= totalWithdrawalPages}
+              onClick={() => {
+                soundFx.playClick();
+                setWithdrawalPage(prev => Math.min(totalWithdrawalPages, prev + 1));
+              }}
+              className="px-3.5 py-2 text-white hover:bg-black/15 active:bg-black/25 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer flex items-center justify-center"
+              title="Next Page"
+            >
+              <ChevronRight className="w-3.5 h-3.5 text-white" />
+            </button>
+          </div>
         </div>
       </div>
     </div>

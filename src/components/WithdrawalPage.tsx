@@ -13,6 +13,7 @@ import { WithdrawalRequest, UserProfile } from '../types';
 import { soundFx } from '../utils/audio';
 import { getCurrentFormattedTimestamp, getNextWithdrawalId, formatWithdrawalId, getDeletedWithdrawalIds } from '../utils/depositUtils';
 import { saveWithdrawalToFirestore } from '../firebase';
+import { contestBackend } from '../backend/contestEngine';
 
 interface WithdrawalPageProps {
   userProfile: UserProfile;
@@ -48,6 +49,18 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
   const [submittedRequest, setSubmittedRequest] = useState<WithdrawalRequest | null>(null);
 
   const walletBalance = userProfile.walletBalance || 0;
+  
+  // Authoritative Winnings-Only Withdrawable Balance
+  const withdrawableInfo = useMemo(() => {
+    return contestBackend.getWithdrawableBalance(
+      userProfile.uid || userProfile.id || '',
+      userProfile.email,
+      existingWithdrawals
+    );
+  }, [userProfile.uid, userProfile.id, userProfile.email, existingWithdrawals, refreshTrigger]);
+
+  const withdrawableBalance = withdrawableInfo.withdrawableBalance;
+  const remainingWithdrawable = Math.max(0, withdrawableBalance - (Number(amount) || 0));
   const remainingBalance = Math.max(0, walletBalance - (Number(amount) || 0));
 
   // Dynamic refresh trigger for real-time unlock synchronization
@@ -201,8 +214,27 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       return;
     }
 
+    if (amount > withdrawableBalance) {
+      setErrorMsg(`Withdrawal is permitted only from settled contest winnings. You have ₹${withdrawableBalance} in eligible winnings available. Deposited funds cannot be withdrawn directly.`);
+      soundFx.playWrong();
+      return;
+    }
+
     if (amount > walletBalance) {
       setErrorMsg(`Insufficient wallet balance. You only have ₹${walletBalance} available.`);
+      soundFx.playWrong();
+      return;
+    }
+
+    const validation = contestBackend.validateAndSubmitWithdrawal(
+      { amount: Number(amount) },
+      userProfile.uid || userProfile.id || '',
+      userProfile.email,
+      existingWithdrawals
+    );
+
+    if (!validation.success) {
+      setErrorMsg(validation.error || 'Withdrawal validation failed.');
       soundFx.playWrong();
       return;
     }
@@ -266,6 +298,9 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
 
       const newWithdrawal: WithdrawalRequest = {
         id: newWithdrawalId,
+        requestId: newWithdrawalId,
+        ownerUid: userProfile.uid || userProfile.id || '',
+        userId: userProfile.id || userProfile.uid || '',
         userName: fullName.trim(),
         userEmail: userProfile.email,
         email: userProfile.email,
@@ -444,8 +479,8 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
             style={{ backgroundColor: '#FFFFFF' }}
           >
             <div className="flex items-center justify-between">
-              <span className="font-semibold text-slate-600">Available Wallet Balance</span>
-              <span className="font-black text-base text-emerald-600" style={{ color: '#16A34A' }}>₹{walletBalance}</span>
+              <span className="font-semibold text-slate-600">Available Withdrawal Balance</span>
+              <span className="font-black text-base text-emerald-600" style={{ color: '#16A34A' }}>₹{withdrawableBalance}</span>
             </div>
 
             {amount > 0 && (
@@ -457,8 +492,14 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
 
             <div className="flex items-center justify-between pt-2 border-t border-slate-200/80">
               <span className="font-semibold text-slate-600">Net Remaining Balance</span>
-              <span className="font-black text-sm text-emerald-600" style={{ color: '#16A34A' }}>₹{remainingBalance}</span>
+              <span className="font-black text-sm text-emerald-600" style={{ color: '#16A34A' }}>₹{remainingWithdrawable}</span>
             </div>
+
+            {walletBalance > withdrawableBalance && (
+              <div className="p-2.5 rounded-xl bg-amber-50/90 border border-amber-200/70 text-[11px] text-amber-900 leading-snug">
+                <span className="font-bold">Notice:</span> Total wallet is ₹{walletBalance}. Only settled contest winnings (₹{withdrawableBalance}) can be withdrawn. Deposited funds cannot be withdrawn directly.
+              </div>
+            )}
 
             <div className="pt-2 flex items-center justify-between border-t border-slate-200/80">
               <span className="text-[11px] text-slate-500 font-medium">Transaction Limits</span>
