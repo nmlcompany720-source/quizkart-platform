@@ -12,6 +12,7 @@ import {
 import { DepositRequest, WithdrawalRequest, UserProfile } from '../types';
 import { soundFx } from '../utils/audio';
 import { formatDepositId, formatWithdrawalId, formatDepositTimestamp } from '../utils/depositUtils';
+import { fetchDepositsFromFirestore, subscribeToDepositsFromFirestore } from '../firebase';
 
 interface TransactionHistoryPageProps {
   userProfile: UserProfile;
@@ -119,6 +120,35 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
   const currentUserEmail = (userProfile.email || '').trim().toLowerCase();
   const currentUid = userProfile.uid || userProfile.id || '';
 
+  // Direct Firestore real-time synchronization for current user's deposit history
+  const [cloudUserDeposits, setCloudUserDeposits] = useState<DepositRequest[]>([]);
+
+  useEffect(() => {
+    if (!currentUserEmail && !currentUid) return;
+
+    fetchDepositsFromFirestore(currentUid, currentUserEmail)
+      .then((items) => {
+        if (items && items.length > 0) {
+          setCloudUserDeposits(items);
+        }
+      })
+      .catch(() => {});
+
+    const unsub = subscribeToDepositsFromFirestore(
+      (items) => {
+        if (items) {
+          setCloudUserDeposits(items);
+        }
+      },
+      currentUid,
+      currentUserEmail
+    );
+
+    return () => {
+      unsub();
+    };
+  }, [currentUserEmail, currentUid]);
+
   const rawUserDeposits = useMemo(() => {
     const belongsToCurrentUser = (d: DepositRequest) => {
       if (!d) return false;
@@ -146,42 +176,70 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
     // 2. Filter matching deposits from live props strictly by email or ownerUid
     const matchingFromProps = (deposits || []).filter(belongsToCurrentUser);
 
-    // 3. Merge both sets, prioritizing latest status and ensuring no user transaction is ever lost
+    // 3. Merge all sources using stable deposit requestId (zero index reliance, zero disappearing history)
     const map = new Map<string, DepositRequest>();
-    permanentList.forEach((item, idx) => {
-      if (item && item.id) {
-        map.set(formatDepositId(item.id, idx + 1), item);
+
+    // Layer 1: Local storage permanent audit cache
+    permanentList.forEach((item) => {
+      const stableId = item.id || item.requestId;
+      if (stableId) {
+        map.set(stableId, item);
       }
     });
-    matchingFromProps.forEach((item, idx) => {
-      if (item && item.id) {
-        const normId = formatDepositId(item.id, idx + 1);
-        const existing = map.get(normId);
-        // Protect resolved statuses from being reverted to pending
-        const resolvedStatus = (existing?.status && existing.status !== 'pending')
-          ? existing.status
-          : (item.status || existing?.status || 'pending');
-        map.set(normId, {
+
+    // Layer 2: Props deposits (from App.tsx Firestore listener)
+    matchingFromProps.forEach((item) => {
+      const stableId = item.id || item.requestId;
+      if (stableId) {
+        const existing = map.get(stableId);
+        map.set(stableId, {
           ...existing,
           ...item,
-          id: normId,
+          id: stableId,
+          requestId: item.requestId || stableId,
           userEmail: currentUserEmail || item.userEmail || item.email,
           email: currentUserEmail || item.userEmail || item.email,
           ownerUid: currentUid || item.ownerUid,
           userId: currentUid || item.userId,
-          status: resolvedStatus
+          status: item.status || existing?.status || 'pending'
         });
       }
     });
 
-    return Array.from(map.values()).map((d, idx) => ({
-      ...d,
-      id: formatDepositId(d.id, idx + 1),
-      userEmail: currentUserEmail || d.userEmail || d.email,
-      email: currentUserEmail || d.userEmail || d.email,
-      timestamp: formatDepositTimestamp(d.timestamp, (d as any).createdAt, (d as any).date)
-    }));
-  }, [deposits, currentUserEmail, currentUid, syncTick]);
+    // Layer 3: Authoritative Firestore user records (highest authority)
+    cloudUserDeposits.forEach((item) => {
+      const stableId = item.id || item.requestId;
+      if (stableId) {
+        const existing = map.get(stableId);
+        map.set(stableId, {
+          ...existing,
+          ...item,
+          id: stableId,
+          requestId: item.requestId || stableId,
+          userEmail: currentUserEmail || item.userEmail || item.email,
+          email: currentUserEmail || item.userEmail || item.email,
+          ownerUid: currentUid || item.ownerUid,
+          userId: currentUid || item.userId,
+          status: item.status || existing?.status || 'pending'
+        });
+      }
+    });
+
+    return Array.from(map.values())
+      .map((d) => ({
+        ...d,
+        id: d.id || d.requestId,
+        requestId: d.requestId || d.id,
+        userEmail: currentUserEmail || d.userEmail || d.email,
+        email: currentUserEmail || d.userEmail || d.email,
+        timestamp: formatDepositTimestamp(d.timestamp, (d as any).createdAt, (d as any).date)
+      }))
+      .sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+        return timeB - timeA;
+      });
+  }, [deposits, cloudUserDeposits, currentUserEmail, currentUid, syncTick]);
 
   const rawUserWithdrawals = useMemo(() => {
     const isBuggedDemoWithdrawal = (w: WithdrawalRequest) => {

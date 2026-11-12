@@ -1451,7 +1451,7 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
   if (!deposit || !deposit.id || isFirestoreQuotaExceeded()) return;
   const path = `deposits/${deposit.id}`;
   const cleanEmail = (deposit.userEmail || deposit.email || auth.currentUser?.email || '').trim().toLowerCase();
-  const resolvedOwnerUid = deposit.ownerUid || deposit.userId || auth.currentUser?.uid || '';
+  const resolvedOwnerUid = deposit.ownerUid || deposit.userId || auth.currentUser?.uid || (cleanEmail ? `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${deposit.id}`);
   const persistentRequestId = deposit.requestId || deposit.id;
 
   try {
@@ -1512,17 +1512,15 @@ export async function updateDepositStatusInFirestore(depositId: string, status: 
 }
 
 export async function fetchDepositsFromFirestore(ownerUid?: string, userEmail?: string): Promise<DepositRequest[]> {
-  const currentUser = auth.currentUser;
   if (isFirestoreQuotaExceeded()) return [];
 
-  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
   const path = 'deposits';
   try {
     const q = collection(db, path);
     const snap = await getDocs(q);
     const list: DepositRequest[] = [];
-    const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
-    const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+    const cleanTargetUid = (ownerUid || '').trim();
+    const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
 
     snap.forEach((docItem) => {
       const data = docItem.data();
@@ -1534,7 +1532,7 @@ export async function fetchDepositsFromFirestore(ownerUid?: string, userEmail?: 
           status: (data.status as any) || 'pending'
         } as DepositRequest;
 
-        if (isAdmin || !cleanTargetUid && !cleanTargetEmail) {
+        if (!cleanTargetUid && !cleanTargetEmail) {
           list.push(item);
         } else {
           const itemUid = (item.ownerUid || item.userId || '').trim();
@@ -1566,10 +1564,8 @@ export function subscribeToDepositsFromFirestore(
 ): () => void {
   if (isFirestoreQuotaExceeded()) return () => {};
   const path = 'deposits';
-  const currentUser = auth.currentUser;
-  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
-  const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
-  const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+  const cleanTargetUid = (ownerUid || '').trim();
+  const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
 
   try {
     const unsubscribe = onSnapshot(collection(db, path), (snap) => {
@@ -1584,7 +1580,7 @@ export function subscribeToDepositsFromFirestore(
             status: (data.status as any) || 'pending'
           } as DepositRequest;
 
-          if (isAdmin || (!cleanTargetUid && !cleanTargetEmail)) {
+          if (!cleanTargetUid && !cleanTargetEmail) {
             list.push(item);
           } else {
             const itemUid = (item.ownerUid || item.userId || '').trim();
@@ -1710,7 +1706,7 @@ export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<v
   if (!w || !w.id || isFirestoreQuotaExceeded()) return;
   const path = `withdrawals/${w.id}`;
   const cleanEmail = (w.userEmail || w.email || auth.currentUser?.email || '').trim().toLowerCase();
-  const resolvedOwnerUid = w.ownerUid || w.userId || auth.currentUser?.uid || '';
+  const resolvedOwnerUid = w.ownerUid || w.userId || auth.currentUser?.uid || (cleanEmail ? `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${w.id}`);
   const persistentRequestId = w.requestId || w.id;
 
   try {

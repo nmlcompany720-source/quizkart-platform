@@ -47,6 +47,7 @@ async function runTests() {
     utrNumber: '123456789012',
     app: 'PhonePe',
     status: 'pending',
+    timestamp: '2026-11-10 10:00 AM',
     date: '2026-11-10',
     createdAt: new Date().toISOString()
   };
@@ -110,8 +111,10 @@ async function runTests() {
     ownerUid: userA.uid,
     userName: userA.name,
     userEmail: userA.email,
+    phone: '9876543210',
     amount: 300,
     utrNumber: 'UTR-REJECT-99',
+    timestamp: '2026-11-10 10:05 AM',
     status: 'pending',
     createdAt: new Date().toISOString()
   };
@@ -127,8 +130,10 @@ async function runTests() {
     ownerUid: userA.uid,
     userName: userA.name,
     userEmail: userA.email,
+    phone: '9876543210',
     amount: 200,
     utrNumber: 'UTR-CANCEL-88',
+    timestamp: '2026-11-10 10:10 AM',
     status: 'pending',
     createdAt: new Date().toISOString()
   };
@@ -240,7 +245,14 @@ async function runTests() {
     requestId: 'QK-WTH-1001',
     ownerUid: userA.uid,
     userId: userA.uid,
+    userName: userA.name,
     userEmail: userA.email,
+    phone: '9876543210',
+    accountHolderName: userA.name,
+    accountNumber: '123456789012',
+    confirmAccountNumber: '123456789012',
+    ifscCode: 'SBIN0001234',
+    timestamp: '2026-11-10 10:15 AM',
     amount: 100,
     status: 'pending',
     createdAt: new Date().toISOString()

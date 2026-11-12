@@ -1614,6 +1614,71 @@ export default function App() {
     };
   }, []);
 
+  // Authoritative real-time Firestore synchronization for deposits (permanent persistence)
+  useEffect(() => {
+    // 1. Initial direct fetch from Firestore (loads on boot for all users)
+    fetchDepositsFromFirestore()
+      .then((cloudDeposits) => {
+        if (cloudDeposits && cloudDeposits.length > 0) {
+          setDeposits((prev) => {
+            const map = new Map<string, DepositRequest>();
+            cloudDeposits.forEach((d) => {
+              if (d && d.id) {
+                map.set(d.id, d);
+              }
+            });
+            prev.forEach((d) => {
+              if (d && d.id && !map.has(d.id)) {
+                map.set(d.id, d);
+              }
+            });
+            const merged = Array.from(map.values()).sort((a, b) => {
+              const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+              const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+              return timeB - timeA;
+            });
+            try {
+              localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+      })
+      .catch((err) => console.warn('Firestore initial deposits load notice:', err));
+
+    // 2. Real-time subscription to Firestore /deposits collection
+    const unsub = subscribeToDepositsFromFirestore((cloudDeposits) => {
+      if (cloudDeposits) {
+        setDeposits((prev) => {
+          const map = new Map<string, DepositRequest>();
+          cloudDeposits.forEach((d) => {
+            if (d && d.id) {
+              map.set(d.id, d);
+            }
+          });
+          prev.forEach((d) => {
+            if (d && d.id && !map.has(d.id)) {
+              map.set(d.id, d);
+            }
+          });
+          const merged = Array.from(map.values()).sort((a, b) => {
+            const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+            const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+            return timeB - timeA;
+          });
+          try {
+            localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
+          } catch {}
+          return merged;
+        });
+      }
+    });
+
+    return () => {
+      unsub();
+    };
+  }, []);
+
   // Sanitize permanent user transaction history so only records with an explicit email are retained (never match or seed by phone/name)
   useEffect(() => {
     try {
@@ -2313,40 +2378,6 @@ export default function App() {
 
       if (auth.currentUser) {
         try {
-          const cloudDeposits = await fetchDepositsFromFirestore();
-          if (cloudDeposits && cloudDeposits.length > 0) {
-            setDeposits((prev) => {
-              const map = new Map<string, DepositRequest>();
-              cloudDeposits.forEach((d, idx) => { 
-                if (d && d.id) {
-                  const normId = formatDepositId(d.id, idx + 1);
-                  map.set(normId, {
-                    ...d,
-                    id: normId,
-                    timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
-                  });
-                } 
-              });
-              prev.forEach((d, idx) => { 
-                if (d && d.id) {
-                  const normId = formatDepositId(d.id, idx + 1);
-                  if (!map.has(normId)) {
-                    map.set(normId, {
-                      ...d,
-                      id: normId,
-                      timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
-                    });
-                  }
-                } 
-              });
-              return Array.from(map.values());
-            });
-          }
-        } catch (err) {
-          console.warn('Firestore deposits load notice:', err);
-        }
-
-        try {
           const cloudWithdrawals = await fetchWithdrawalsFromFirestore();
           if (cloudWithdrawals && cloudWithdrawals.length > 0) {
             const deletedWithdrawals = getDeletedWithdrawalIds();
@@ -2582,7 +2613,9 @@ export default function App() {
       setUserQuizAttempts([]);
       setLastQuizResult(null);
       try {
-        localStorage.setItem(`quizkart_user_deposits_permanent_${cleanInputEmail}`, JSON.stringify([]));
+        if (!localStorage.getItem(`quizkart_user_deposits_permanent_${cleanInputEmail}`)) {
+          localStorage.setItem(`quizkart_user_deposits_permanent_${cleanInputEmail}`, JSON.stringify([]));
+        }
         localStorage.setItem(`quizkart_user_withdrawals_permanent_${cleanInputEmail}`, JSON.stringify([]));
         localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify([]));
         localStorage.removeItem('quizkart_last_result');

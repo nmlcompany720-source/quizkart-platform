@@ -40,7 +40,18 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
   const [accountNumber, setAccountNumber] = useState('');
   const [confirmAccountNumber, setConfirmAccountNumber] = useState('');
   const [ifscCode, setIfscCode] = useState('');
-  const [amount, setAmount] = useState<number>(100);
+  const [amount, setAmount] = useState<number>(() => {
+    const info = contestBackend.getWithdrawableBalance(
+      userProfile.uid || userProfile.id || '',
+      userProfile.email,
+      existingWithdrawals,
+      userProfile.totalWonAmount
+    );
+    if (info.withdrawableBalance > 0 && info.withdrawableBalance < 100) {
+      return info.withdrawableBalance;
+    }
+    return 100;
+  });
   const [errorMsg, setErrorMsg] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -50,21 +61,22 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
 
   const walletBalance = userProfile.walletBalance || 0;
   
+  // Dynamic refresh trigger for real-time unlock synchronization
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+
   // Authoritative Winnings-Only Withdrawable Balance
   const withdrawableInfo = useMemo(() => {
     return contestBackend.getWithdrawableBalance(
       userProfile.uid || userProfile.id || '',
       userProfile.email,
-      existingWithdrawals
+      existingWithdrawals,
+      userProfile.totalWonAmount
     );
-  }, [userProfile.uid, userProfile.id, userProfile.email, existingWithdrawals, refreshTrigger]);
+  }, [userProfile.uid, userProfile.id, userProfile.email, userProfile.totalWonAmount, existingWithdrawals, refreshTrigger]);
 
   const withdrawableBalance = withdrawableInfo.withdrawableBalance;
   const remainingWithdrawable = Math.max(0, withdrawableBalance - (Number(amount) || 0));
   const remainingBalance = Math.max(0, walletBalance - (Number(amount) || 0));
-
-  // Dynamic refresh trigger for real-time unlock synchronization
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
 
   // Real-time synchronization: listen for admin processing (approve/reject/cancel/delete) across tabs and views
   React.useEffect(() => {
@@ -201,9 +213,8 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       return;
     }
 
-    // Transaction Limits: Min ₹100 – Max ₹5000
-    if (amount < 100) {
-      setErrorMsg('Minimum withdrawal amount is ₹100.');
+    if (amount <= 0 || isNaN(amount)) {
+      setErrorMsg('Please enter a valid withdrawal amount.');
       soundFx.playWrong();
       return;
     }
@@ -230,7 +241,8 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       { amount: Number(amount) },
       userProfile.uid || userProfile.id || '',
       userProfile.email,
-      existingWithdrawals
+      existingWithdrawals,
+      userProfile.totalWonAmount
     );
 
     if (!validation.success) {
@@ -296,11 +308,13 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       const formattedTimestamp = getCurrentFormattedTimestamp();
       const newWithdrawalId = getNextWithdrawalId(existingWithdrawals);
 
+      const effectiveOwnerUid = userProfile.uid || userProfile.id || (userProfile.email ? `usr-${userProfile.email.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${newWithdrawalId}`);
+
       const newWithdrawal: WithdrawalRequest = {
         id: newWithdrawalId,
         requestId: newWithdrawalId,
-        ownerUid: userProfile.uid || userProfile.id || '',
-        userId: userProfile.id || userProfile.uid || '',
+        ownerUid: effectiveOwnerUid,
+        userId: effectiveOwnerUid,
         userName: fullName.trim(),
         userEmail: userProfile.email,
         email: userProfile.email,
@@ -495,12 +509,7 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
               <span className="font-black text-sm text-emerald-600" style={{ color: '#16A34A' }}>₹{remainingWithdrawable}</span>
             </div>
 
-            {walletBalance > withdrawableBalance && (
-              <div className="p-2.5 rounded-xl bg-amber-50/90 border border-amber-200/70 text-[11px] text-amber-900 leading-snug">
-                <span className="font-bold">Notice:</span> Total wallet is ₹{walletBalance}. Only settled contest winnings (₹{withdrawableBalance}) can be withdrawn. Deposited funds cannot be withdrawn directly.
-              </div>
-            )}
-
+            {/* Transaction Limits strictly ABOVE Notice */}
             <div className="pt-2 flex items-center justify-between border-t border-slate-200/80">
               <span className="text-[11px] text-slate-500 font-medium">Transaction Limits</span>
               <span 
@@ -509,6 +518,17 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
               >
                 Min ₹100 - Max ₹5000
               </span>
+            </div>
+
+            {/* Notice strictly directly BELOW Transaction Limits */}
+            <div
+              className="p-3 rounded-2xl text-[11px] text-white leading-relaxed shadow-xs flex items-start gap-2"
+              style={{ background: PRIMARY_GRADIENT }}
+            >
+              <div className="text-white text-[11px] leading-relaxed">
+                <span className="font-bold text-white">Notice: </span>
+                <span className="text-white font-medium">Only settled contest winnings are withdrawable. Deposited funds cannot be withdrawn.</span>
+              </div>
             </div>
           </div>
 

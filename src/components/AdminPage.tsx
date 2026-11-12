@@ -121,7 +121,9 @@ import {
   extractNumericUserNumber,
   fetchContestEntriesFromFirestore,
   subscribeToContestEntriesFromFirestore,
-  fetchAllContestEntriesFromFirestore
+  fetchAllContestEntriesFromFirestore,
+  fetchDepositsFromFirestore,
+  subscribeToDepositsFromFirestore
 } from '../firebase';
 import { contestBackend, mapEntriesToLeaderboard } from '../backend/contestEngine';
 import { 
@@ -1852,9 +1854,9 @@ RULES:
       }
     })();
     const map = new Map<string, DepositRequest>();
-    (raw || []).forEach((d, idx) => {
+    (raw || []).forEach((d) => {
       if (d && d.id) {
-        const normId = formatDepositId(d.id, idx + 1);
+        const normId = formatDepositId(d.id);
         if (!map.has(normId)) {
           map.set(normId, {
             ...d,
@@ -1870,9 +1872,9 @@ RULES:
   useEffect(() => {
     if (propDeposits) {
       const map = new Map<string, DepositRequest>();
-      propDeposits.forEach((d, idx) => {
+      propDeposits.forEach((d) => {
         if (d && d.id) {
-          const normId = formatDepositId(d.id, idx + 1);
+          const normId = formatDepositId(d.id);
           if (!map.has(normId)) {
             map.set(normId, {
               ...d,
@@ -1885,6 +1887,48 @@ RULES:
       setDeposits(Array.from(map.values()));
     }
   }, [propDeposits]);
+
+  // Authoritative real-time Firestore synchronization for Admin Ledger
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    fetchDepositsFromFirestore()
+      .then((cloudList) => {
+        if (cloudList && cloudList.length > 0) {
+          setDeposits((prev) => {
+            const map = new Map<string, DepositRequest>();
+            (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
+            cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
+            const merged = Array.from(map.values());
+            try {
+              localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+      })
+      .catch(() => {});
+
+    try {
+      unsubscribe = subscribeToDepositsFromFirestore((cloudList) => {
+        if (cloudList && cloudList.length > 0) {
+          setDeposits((prev) => {
+            const map = new Map<string, DepositRequest>();
+            (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
+            cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
+            const merged = Array.from(map.values());
+            try {
+              localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+      });
+    } catch {}
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
 
   const [selectedScreenshotModal, setSelectedScreenshotModal] = useState<string | null>(null);
   const [depositFilter, setDepositFilter] = useState<'all' | 'pending' | 'approved' | 'rejected' | 'cancelled'>('all');
@@ -1910,8 +1954,14 @@ RULES:
   const handleCancelDeposit = (id: string) => {
     const dep = (deposits || []).find(d => d && d.id === id);
     if (!dep) return;
+    if (dep.status === 'cancelled') {
+      showToast(`Deposit #${id} is already cancelled.`, 'info');
+      return;
+    }
     const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'cancelled' as const } : d);
     saveDeposits(updated);
+
+    const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
 
     // Update status in user permanent audit log (never deleted)
     try {
@@ -1929,6 +1979,24 @@ RULES:
         updatedPerm.unshift({ ...dep, status: 'cancelled' });
       }
       localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
+
+      if (targetEmail) {
+        const uKey = `quizkart_user_deposits_permanent_${targetEmail}`;
+        const uRaw = localStorage.getItem(uKey);
+        const uList = uRaw ? JSON.parse(uRaw) : [];
+        let uFound = false;
+        const uUpdated = uList.map((item: any) => {
+          if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
+            uFound = true;
+            return { ...item, status: 'cancelled' };
+          }
+          return item;
+        });
+        if (!uFound) {
+          uUpdated.unshift({ ...dep, status: 'cancelled' });
+        }
+        localStorage.setItem(uKey, JSON.stringify(uUpdated));
+      }
     } catch {}
 
     try {
@@ -1975,6 +2043,10 @@ RULES:
   const handleApproveDeposit = (id: string) => {
     const dep = (deposits || []).find(d => d && d.id === id);
     if (!dep) return;
+    if (dep.status === 'approved') {
+      showToast(`Deposit #${id} is already approved.`, 'info');
+      return;
+    }
     const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'approved' as const } : d);
     saveDeposits(updated);
 
@@ -2032,6 +2104,24 @@ RULES:
         updatedPerm.unshift({ ...dep, status: 'approved' });
       }
       localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
+
+      if (targetEmail) {
+        const uKey = `quizkart_user_deposits_permanent_${targetEmail}`;
+        const uRaw = localStorage.getItem(uKey);
+        const uList = uRaw ? JSON.parse(uRaw) : [];
+        let uFound = false;
+        const uUpdated = uList.map((item: any) => {
+          if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
+            uFound = true;
+            return { ...item, status: 'approved' };
+          }
+          return item;
+        });
+        if (!uFound) {
+          uUpdated.unshift({ ...dep, status: 'approved' });
+        }
+        localStorage.setItem(uKey, JSON.stringify(uUpdated));
+      }
     } catch {}
 
     // Clear active pending deposit lock
@@ -2051,8 +2141,15 @@ RULES:
 
   const handleRejectDeposit = (id: string) => {
     const dep = (deposits || []).find(d => d && d.id === id);
+    if (!dep) return;
+    if (dep.status === 'rejected') {
+      showToast(`Deposit #${id} is already rejected.`, 'info');
+      return;
+    }
     const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'rejected' as const } : d);
     saveDeposits(updated);
+
+    const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
 
     // Update status in user permanent audit log
     try {
@@ -2070,6 +2167,24 @@ RULES:
         updatedPerm.unshift({ ...dep, status: 'rejected' });
       }
       localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
+
+      if (targetEmail) {
+        const uKey = `quizkart_user_deposits_permanent_${targetEmail}`;
+        const uRaw = localStorage.getItem(uKey);
+        const uList = uRaw ? JSON.parse(uRaw) : [];
+        let uFound = false;
+        const uUpdated = uList.map((item: any) => {
+          if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
+            uFound = true;
+            return { ...item, status: 'rejected' };
+          }
+          return item;
+        });
+        if (!uFound) {
+          uUpdated.unshift({ ...dep, status: 'rejected' });
+        }
+        localStorage.setItem(uKey, JSON.stringify(uUpdated));
+      }
     } catch {}
 
     try {
@@ -2615,6 +2730,20 @@ RULES:
         if (poolSaved) onUpdatePoolData(JSON.parse(poolSaved));
         const depSaved = localStorage.getItem('quizkart_admin_deposits');
         if (depSaved) setDeposits(JSON.parse(depSaved));
+        fetchDepositsFromFirestore().then((cloudList) => {
+          if (cloudList && cloudList.length > 0) {
+            setDeposits((prev) => {
+              const map = new Map<string, DepositRequest>();
+              (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
+              cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
+              const merged = Array.from(map.values());
+              try {
+                localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
+              } catch {}
+              return merged;
+            });
+          }
+        }).catch(() => {});
         const timerSaved = localStorage.getItem('quizkart_global_quiz_timer');
         if (timerSaved) setContestTimerSeconds(parseInt(timerSaved, 10));
         const secSaved = localStorage.getItem('quizkart_security_logs');
@@ -2661,7 +2790,7 @@ RULES:
   );
 
   // Filtered Deposits for Tab 3
-  const filteredDeposits = (deposits || []).filter((d, idx) => {
+  const filteredDeposits = (deposits || []).filter((d) => {
     if (!d || !d.id) return false;
     if (depositFilter !== 'all' && d.status !== depositFilter) return false;
 
@@ -2670,7 +2799,7 @@ RULES:
       const name = (d.userName || '').toLowerCase();
       const phone = (d.phone || '').toLowerCase();
       const utr = (d.utrNumber || '').toLowerCase();
-      const displayId = formatDepositId(d.id, idx + 1).toLowerCase();
+      const displayId = formatDepositId(d.id).toLowerCase();
       const rawId = d.id.toLowerCase();
       if (!name.includes(q) && !phone.includes(q) && !utr.includes(q) && !displayId.includes(q) && !rawId.includes(q)) {
         return false;

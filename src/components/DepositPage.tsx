@@ -140,9 +140,21 @@ export const DepositPage: React.FC<DepositPageProps> = ({
           localStorage.removeItem('quizkart_active_pending_deposit_id');
           return null;
         }
-        // If not found for this email, clear lock
-        localStorage.removeItem('quizkart_active_pending_deposit_id');
-        return null;
+        // Also check in user's permanent cache
+        const userPerm = localStorage.getItem(`quizkart_user_deposits_permanent_${currentUserEmail}`) || localStorage.getItem('quizkart_user_deposits_permanent');
+        if (userPerm) {
+          try {
+            const list: DepositRequest[] = JSON.parse(userPerm);
+            const foundPerm = list.find((d) => d && (d.id === activeId || formatDepositId(d.id) === normActiveId));
+            if (foundPerm) {
+              if (foundPerm.status === 'pending') return activeId;
+              localStorage.removeItem('quizkart_active_pending_deposit_id');
+              return null;
+            }
+          } catch {}
+        }
+        // If deposits array has not hydrated yet, retain activeId to avoid premature card drop
+        return activeId;
       }
     } catch {}
 
@@ -376,11 +388,13 @@ export const DepositPage: React.FC<DepositPageProps> = ({
       const newId = getNextDepositId(deposits);
       const now = new Date();
 
+      const effectiveOwnerUid = userProfile.uid || userProfile.id || (userProfile.email ? `usr-${userProfile.email.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${newId}`);
+
       const newDepositItem: DepositRequest = {
         id: newId,
         requestId: newId,
-        ownerUid: userProfile.uid || userProfile.id || '',
-        userId: userProfile.id || userProfile.uid || '',
+        ownerUid: effectiveOwnerUid,
+        userId: effectiveOwnerUid,
         userName: userProfile.name,
         userEmail: userProfile.email,
         email: userProfile.email,
@@ -409,6 +423,16 @@ export const DepositPage: React.FC<DepositPageProps> = ({
         if (Array.isArray(list)) {
           const filtered = list.filter((item: any) => item && item.id !== newId);
           localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify([newDepositItem, ...filtered]));
+        }
+
+        if (currentUserEmail) {
+          const userKey = `quizkart_user_deposits_permanent_${currentUserEmail}`;
+          const savedUserPerm = localStorage.getItem(userKey);
+          const uList = savedUserPerm ? JSON.parse(savedUserPerm) : [];
+          if (Array.isArray(uList)) {
+            const uFiltered = uList.filter((item: any) => item && item.id !== newId);
+            localStorage.setItem(userKey, JSON.stringify([newDepositItem, ...uFiltered]));
+          }
         }
       } catch {}
 

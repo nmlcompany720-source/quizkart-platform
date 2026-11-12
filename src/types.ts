@@ -397,6 +397,7 @@ export interface ContestEntry {
   settlementStatus?: 'pending' | 'settled' | 'unsettled';
   settledAt?: string;
   securityBreached?: boolean;
+  isDemo?: boolean;
 }
 
 export interface ContestPoolCalculation {
@@ -435,5 +436,7 @@ export interface FinancialLedgerRecord {
   timestamp: string;
   timestampMs: number;
   notes?: string;
+  status?: string;
+  isDemo?: boolean;
 }
 

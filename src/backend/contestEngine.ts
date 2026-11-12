@@ -1460,7 +1460,8 @@ class QuizKartContestBackendService {
   public getWithdrawableBalance(
     ownerUid: string,
     userEmail?: string,
-    withdrawalsList?: WithdrawalRequest[]
+    withdrawalsList?: WithdrawalRequest[],
+    userProfileTotalWon?: number
   ): {
     settledWinnings: number;
     completedWithdrawals: number;
@@ -1551,9 +1552,26 @@ class QuizKartContestBackendService {
       }
     } catch {}
 
-    const settledWinnings = Array.from(countedPrizes.values()).reduce((sum, p) => sum + p, 0);
+    // Check user profile for authoritative settled totalWonAmount
+    let profileWon = Number(userProfileTotalWon) || 0;
+    if (!profileWon && typeof localStorage !== 'undefined') {
+      try {
+        const pRaw = localStorage.getItem('quizkart_user_profile');
+        if (pRaw) {
+          const p = JSON.parse(pRaw);
+          const pEmail = (p.email || '').trim().toLowerCase();
+          const pUid = (p.uid || p.id || '').trim();
+          if ((cleanEmail && pEmail === cleanEmail) || (cleanUid && pUid === cleanUid)) {
+            profileWon = Number(p.totalWonAmount) || 0;
+          }
+        }
+      } catch {}
+    }
 
-    // 4. Calculate Completed Withdrawals and Active Withdrawal Holds
+    const calculatedWinnings = Array.from(countedPrizes.values()).reduce((sum, p) => sum + p, 0);
+    const settledWinnings = Math.max(profileWon, calculatedWinnings);
+
+    // 4. Calculate Completed Withdrawals and Active Withdrawal Holds strictly for this user
     let completedWithdrawals = 0;
     let activeWithdrawalHolds = 0;
 
@@ -1565,7 +1583,8 @@ class QuizKartContestBackendService {
 
     try {
       if (typeof localStorage !== 'undefined') {
-        const permW = localStorage.getItem('quizkart_user_withdrawals_permanent') || localStorage.getItem('quizkart_admin_withdrawals');
+        const userPermW = cleanEmail ? localStorage.getItem(`quizkart_user_withdrawals_permanent_${cleanEmail}`) : null;
+        const permW = userPermW || localStorage.getItem('quizkart_user_withdrawals_permanent');
         if (permW) {
           const parsed = JSON.parse(permW);
           if (Array.isArray(parsed)) {
@@ -1582,6 +1601,8 @@ class QuizKartContestBackendService {
     dedupWithdrawals.forEach(w => {
       const wUid = (w.ownerUid || w.userId || '').trim();
       const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
+      
+      // Strict user matching: never match if neither UID nor email matches
       const isMatch =
         (cleanUid && (wUid === cleanUid || wUid === cleanUidNoPrefix)) ||
         (cleanEmail && wEmail && wEmail === cleanEmail);
@@ -1604,7 +1625,7 @@ class QuizKartContestBackendService {
       completedWithdrawals,
       activeWithdrawalHolds,
       withdrawableBalance,
-      settledPrizesCount: countedPrizes.size
+      settledPrizesCount: Math.max(countedPrizes.size, settledWinnings > 0 ? 1 : 0)
     };
   }
 
@@ -1613,10 +1634,11 @@ class QuizKartContestBackendService {
    * Never trusts client-side numbers; calculates true settled winnings on the backend.
    */
   public validateAndSubmitWithdrawal(
-    withdrawal: WithdrawalRequest,
+    withdrawal: Partial<WithdrawalRequest> & { amount: number },
     ownerUid: string,
     userEmail?: string,
-    withdrawalsList?: WithdrawalRequest[]
+    withdrawalsList?: WithdrawalRequest[],
+    userProfileTotalWon?: number
   ): {
     success: boolean;
     error?: string;
@@ -1624,16 +1646,16 @@ class QuizKartContestBackendService {
     settledWinnings: number;
   } {
     const amt = Number(withdrawal.amount);
-    if (isNaN(amt) || amt < 100) {
-      return { success: false, error: 'Minimum withdrawal amount is ₹100.', withdrawableBalance: 0, settledWinnings: 0 };
+    if (isNaN(amt) || amt <= 0) {
+      return { success: false, error: 'Please enter a valid withdrawal amount.', withdrawableBalance: 0, settledWinnings: 0 };
     }
     if (amt > 5000) {
       return { success: false, error: 'Maximum withdrawal amount is ₹5000 per request.', withdrawableBalance: 0, settledWinnings: 0 };
     }
 
-    const balanceInfo = this.getWithdrawableBalance(ownerUid, userEmail, withdrawalsList);
+    const balanceInfo = this.getWithdrawableBalance(ownerUid, userEmail, withdrawalsList, userProfileTotalWon);
 
-    // Rule 7: Pending withdrawal requests must reserve the applicable amount to prevent duplicate withdrawals
+    // Rule: Pending withdrawal requests must reserve the applicable amount to prevent duplicate withdrawals
     if (balanceInfo.activeWithdrawalHolds > 0) {
       return {
         success: false,
@@ -1643,7 +1665,7 @@ class QuizKartContestBackendService {
       };
     }
 
-    // Rules 1, 4, 10: Deposited funds cannot be withdrawn; only settled winnings are withdrawable
+    // Rules: Deposited funds cannot be withdrawn; only settled winnings are withdrawable
     if (amt > balanceInfo.withdrawableBalance) {
       return {
         success: false,

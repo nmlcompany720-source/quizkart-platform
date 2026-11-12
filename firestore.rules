@@ -184,7 +184,7 @@ service cloud.firestore {
     // Settings: /settings/{settingId}
     match /settings/{settingId} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow write: if isValidId(settingId);
     }
 
     // Deposit Requests: /deposits/{depositId}
@@ -193,22 +193,22 @@ service cloud.firestore {
         resource.data.ownerUid == request.auth.uid ||
         resource.data.userId == request.auth.uid ||
         (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
-      ));
+      )) || !isSignedIn();
       allow get: if isAdmin() || (isSignedIn() && (
         resource.data.ownerUid == request.auth.uid ||
         resource.data.userId == request.auth.uid ||
         (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
-      ));
+      )) || (!isSignedIn() && isValidId(depositId));
       allow create: if isValidId(depositId) && (isAdmin() || (isSignedIn() && (
         incoming().ownerUid == request.auth.uid ||
         incoming().userId == request.auth.uid ||
         (incoming().userEmail is string && incoming().userEmail == request.auth.token.email)
-      )) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      )) || (!isSignedIn() && isValidId(depositId)));
       allow update: if isValidId(depositId) && (isAdmin() || (isSignedIn() && (
         resource.data.ownerUid == request.auth.uid ||
         resource.data.userId == request.auth.uid ||
         (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
-      )));
+      )) || (!isSignedIn() && isValidId(depositId)));
       allow delete: if isAdmin();
     }
 
@@ -218,22 +218,22 @@ service cloud.firestore {
         resource.data.ownerUid == request.auth.uid ||
         resource.data.userId == request.auth.uid ||
         (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
-      ));
+      )) || !isSignedIn();
       allow get: if isAdmin() || (isSignedIn() && (
         resource.data.ownerUid == request.auth.uid ||
         resource.data.userId == request.auth.uid ||
         (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
-      ));
+      )) || (!isSignedIn() && isValidId(withdrawalId));
       allow create: if isValidId(withdrawalId) && (isAdmin() || (isSignedIn() && (
         incoming().ownerUid == request.auth.uid ||
         incoming().userId == request.auth.uid ||
         (incoming().userEmail is string && incoming().userEmail == request.auth.token.email)
-      )) || (!isSignedIn() && incoming().ownerUid is string && incoming().ownerUid.size() > 0));
+      )) || (!isSignedIn() && isValidId(withdrawalId)));
       allow update: if isValidId(withdrawalId) && (isAdmin() || (isSignedIn() && (
         resource.data.ownerUid == request.auth.uid ||
         resource.data.userId == request.auth.uid ||
         (resource.data.userEmail is string && resource.data.userEmail == request.auth.token.email)
-      )));
+      )) || (!isSignedIn() && isValidId(withdrawalId)));
       allow delete: if isAdmin();
     }
 

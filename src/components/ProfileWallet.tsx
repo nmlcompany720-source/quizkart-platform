@@ -504,17 +504,16 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
     return total;
   }, [effectiveAttempts]);
 
-  // Ensure Wallet Credits and Total Won accurately reflect settled winnings
+  // Authoritative current liquid wallet balance strictly matching Navbar header
+  const currentWalletBalance = Number(userProfile.walletBalance) || 0;
+  // Cumulative lifetime settled contest winnings
   const effectiveTotalWon = Math.max(Number(userProfile.totalWonAmount) || 0, userSettledWinnings);
-  const effectiveWalletBalance = Math.max(Number(userProfile.walletBalance) || 0, userSettledWinnings);
 
-  // Synchronize state, localStorage and Firestore if settled winnings were not yet captured in userProfile
+  // Synchronize totalWonAmount if settled winnings were not yet captured in userProfile (without double-adding to liquid walletBalance)
   useEffect(() => {
     if (userSettledWinnings > (Number(userProfile.totalWonAmount) || 0)) {
-      const prizeDiff = userSettledWinnings - (Number(userProfile.totalWonAmount) || 0);
       const updatedProfile: UserProfile = {
         ...userProfile,
-        walletBalance: (Number(userProfile.walletBalance) || 0) + prizeDiff,
         totalWonAmount: userSettledWinnings
       };
       if (onUpdateProfile) {
@@ -670,7 +669,7 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
               <span>CREDITS</span>
             </span>
             <span className="text-base sm:text-xl md:text-2xl font-black text-[#059669] mt-1">
-              ₹{effectiveWalletBalance}
+              ₹{currentWalletBalance}
             </span>
           </div>
 

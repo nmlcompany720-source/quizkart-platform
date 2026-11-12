@@ -391,7 +391,45 @@
         },
         "status": {
           "type": "string",
-          "enum": ["pending", "approved", "rejected"],
+          "enum": ["pending", "approved", "rejected", "cancelled"],
+          "description": "Verification status",
+          "maxLength": 20
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Timestamp string",
+          "maxLength": 50
+        }
+      },
+      "required": ["id", "userName", "amount", "status"]
+    },
+    "WithdrawalRequest": {
+      "title": "Withdrawal Request",
+      "description": "User bank withdrawal request record",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique withdrawal ID",
+          "maxLength": 64
+        },
+        "userName": {
+          "type": "string",
+          "description": "Full name of contestant",
+          "maxLength": 100
+        },
+        "phone": {
+          "type": "string",
+          "description": "Contact phone",
+          "maxLength": 30
+        },
+        "amount": {
+          "type": "number",
+          "description": "Withdrawal amount in Rupees"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected", "cancelled"],
           "description": "Verification status",
           "maxLength": 20
         },
@@ -562,6 +600,10 @@
     "/deposits/{depositId}": {
       "schema": { "$ref": "#/entities/DepositRequest" },
       "description": "User wallet deposit records with pending verification status"
+    },
+    "/withdrawals/{withdrawalId}": {
+      "schema": { "$ref": "#/entities/WithdrawalRequest" },
+      "description": "User bank withdrawal records with pending verification status"
     },
     "/support_tickets/{ticketId}": {
       "schema": { "$ref": "#/entities/SupportTicket" },
