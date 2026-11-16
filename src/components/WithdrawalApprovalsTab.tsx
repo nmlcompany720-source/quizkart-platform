@@ -56,6 +56,14 @@ export const WithdrawalApprovalsTab: React.FC<WithdrawalApprovalsTabProps> = ({
   const [detailWithdrawal, setDetailWithdrawal] = useState<WithdrawalRequest | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!detailWithdrawal) return;
+    const liveMatch = (withdrawals || []).find((w) => w && w.id === detailWithdrawal.id);
+    if (liveMatch && liveMatch.status !== detailWithdrawal.status) {
+      setDetailWithdrawal(liveMatch);
+    }
+  }, [withdrawals, detailWithdrawal?.id]);
+
   // Copy handler with feedback
   const handleCopy = async (text: string, fieldName: string) => {
     soundFx.playClick();
@@ -70,11 +78,10 @@ export const WithdrawalApprovalsTab: React.FC<WithdrawalApprovalsTabProps> = ({
   // Filtered withdrawals with deduplication
   const filteredWithdrawals = useMemo(() => {
     const dedupMap = new Map<string, WithdrawalRequest>();
-    (withdrawals || []).forEach((w, idx) => {
+    (withdrawals || []).forEach((w) => {
       if (!w || !w.id) return;
-      const normId = formatWithdrawalId(w.id, idx + 1);
-      if (!dedupMap.has(normId)) {
-        dedupMap.set(normId, { ...w, id: normId });
+      if (!dedupMap.has(w.id)) {
+        dedupMap.set(w.id, w);
       }
     });
 

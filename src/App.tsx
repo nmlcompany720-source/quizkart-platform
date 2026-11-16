@@ -49,11 +49,13 @@ import { BannerSlider } from './components/BannerSlider';
 import { soundFx } from './utils/audio';
 import { 
   auth,
+  AUTHORIZED_ADMIN_EMAIL,
   subscribeToAuth, 
   signInWithGoogle, 
   logOutUser, 
   syncUserProfile, 
   fetchUserProfile, 
+  subscribeToUserProfileFromFirestore,
   fetchQuestionsFromFirestore, 
   fetchLeaderboardFromFirestore, 
   recordQuizAttemptInFirestore,
@@ -65,6 +67,7 @@ import {
   subscribeToDepositsFromFirestore,
   fetchWithdrawalsFromFirestore,
   saveWithdrawalToFirestore,
+  submitWithdrawalTransaction,
   subscribeToWithdrawalsFromFirestore,
   fetchDepositQrFromFirestore,
   subscribeToUserQuizAttempts,
@@ -114,6 +117,13 @@ import { parseTargetTimestamp, getCountdown } from './utils/timerUtils';
 import { calculateDynamicPool } from './utils/poolUtils';
 import { sanitizeContestSynchronous } from './utils/imageCompressor';
 import { getActiveDepositQr, setActiveDepositQr } from './utils/qrConfig';
+import {
+  compactBannerSlidesForLocalCache,
+  compactContestsForLocalCache,
+  compactDepositsForLocalCache,
+  compactRegisteredUsersForLocalCache,
+  safeSetLocalStorageJson
+} from './utils/storageHygiene';
 import { 
   questionPoolManager, 
   getAssignedQuestionsForUser, 
@@ -177,7 +187,16 @@ export default function App() {
   const [isPracticeMode, setIsPracticeMode] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [isAdminAuthModalOpen, setIsAdminAuthModalOpen] = useState<boolean>(false);
-  const [isAdminPageActive, setIsAdminPageActive] = useState<boolean>(false);
+  const [isAdminPageActive, setIsAdminPageActive] = useState<boolean>(() => {
+    try {
+      return (
+        sessionStorage.getItem('quizkart_admin_authenticated') === 'true' ||
+        localStorage.getItem('quizkart_admin_authenticated') === 'true'
+      );
+    } catch {
+      return false;
+    }
+  });
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [toastNotice, setToastNotice] = useState<string | null>(null);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(() => !checkIsUserAuthenticated());
@@ -669,9 +688,7 @@ export default function App() {
           }
           return c;
         }).map(sanitizeContestSynchronous);
-        try {
-          localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
-        } catch {}
+        safeSetLocalStorageJson('quizkart_active_contests', compactContestsForLocalCache(updated));
         return updated;
       });
     } else {
@@ -682,12 +699,10 @@ export default function App() {
     }
   };
 
-  // Sync contests to localStorage safely
+  // Sync contests to localStorage safely (compacting oversized Base64 images already in Firestore)
   useEffect(() => {
-    try {
-      const safe = contests.map(sanitizeContestSynchronous);
-      localStorage.setItem('quizkart_active_contests', JSON.stringify(safe));
-    } catch {}
+    const safe = contests.map(sanitizeContestSynchronous);
+    safeSetLocalStorageJson('quizkart_active_contests', compactContestsForLocalCache(safe));
   }, [contests]);
 
   // Load contests from Firestore on mount & merge
@@ -730,9 +745,7 @@ export default function App() {
                 if (!map.has(c.id) && !deletedList.includes(c.id)) map.set(c.id, c);
               });
               const merged = Array.from(map.values());
-              try {
-                localStorage.setItem('quizkart_active_contests', JSON.stringify(merged));
-              } catch {}
+              safeSetLocalStorageJson('quizkart_active_contests', compactContestsForLocalCache(merged));
               return merged;
             });
 
@@ -747,7 +760,6 @@ export default function App() {
               if (active) {
                 try {
                   localStorage.setItem('quizkart_active_contest_id', active.id);
-                  localStorage.setItem('quizkart_current_active_contest', JSON.stringify(active));
                 } catch {}
                 return active.id;
               }
@@ -1070,9 +1082,7 @@ export default function App() {
   const handleUpdateBannerSlides = (slides: BannerSlide[]) => {
     const validated = ensureTenSlides(slides);
     setBannerSlides(validated);
-    try {
-      localStorage.setItem('quizkart_banner_slides', JSON.stringify(validated));
-    } catch {}
+    safeSetLocalStorageJson('quizkart_banner_slides', compactBannerSlidesForLocalCache(validated));
     saveBannerSlidesToFirestore(validated).catch(() => {});
   };
 
@@ -1089,9 +1099,7 @@ export default function App() {
               const img = local?.imageUrl && local.imageUrl.startsWith('data:image/') ? local.imageUrl : b.imageUrl;
               return { ...b, imageUrl: img };
             });
-            try {
-              localStorage.setItem('quizkart_banner_slides', JSON.stringify(merged));
-            } catch {}
+            safeSetLocalStorageJson('quizkart_banner_slides', compactBannerSlidesForLocalCache(merged));
             return merged;
           });
         }
@@ -1527,18 +1535,18 @@ export default function App() {
         if (Array.isArray(parsed)) {
           return parsed
             .filter((w: WithdrawalRequest) => w && w.id && !isBuggedSeedWth(w) && !deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(formatWithdrawalId(w.id)))
-            .map((w: WithdrawalRequest, idx: number) => ({
+            .map((w: WithdrawalRequest) => ({
               ...w,
-              id: formatWithdrawalId(w.id, idx + 1),
+              id: formatWithdrawalId(w.id),
               timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
             }));
         }
       }
       return DEFAULT_WITHDRAWAL_REQUESTS
         .filter((w) => w && w.id && !isBuggedSeedWth(w) && !deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(formatWithdrawalId(w.id)))
-        .map((w, idx) => ({
+        .map((w) => ({
           ...w,
-          id: formatWithdrawalId(w.id, idx + 1)
+          id: formatWithdrawalId(w.id)
         }));
     } catch {
       return DEFAULT_WITHDRAWAL_REQUESTS;
@@ -1546,9 +1554,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    try {
-      localStorage.setItem('quizkart_admin_deposits', JSON.stringify(deposits));
-    } catch {}
+    safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(deposits));
   }, [deposits]);
 
   useEffect(() => {
@@ -1637,9 +1643,7 @@ export default function App() {
               const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
               return timeB - timeA;
             });
-            try {
-              localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
-            } catch {}
+            safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
             return merged;
           });
         }
@@ -1666,9 +1670,7 @@ export default function App() {
             const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
             return timeB - timeA;
           });
-          try {
-            localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
-          } catch {}
+          safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
           return merged;
         });
       }
@@ -1678,6 +1680,192 @@ export default function App() {
       unsub();
     };
   }, []);
+
+  // Authoritative real-time Firestore synchronization for withdrawals (all auth types: Google + Email/Phone + Admin Panel)
+  useEffect(() => {
+    const targetUid = currentUser?.uid || userProfile?.uid || '';
+    const targetEmail = (currentUser?.email || userProfile?.email || '').trim().toLowerCase();
+    const isAdmin = targetEmail === 'nmlcompany720@gmail.com' || isAdminPageActive;
+
+    let hasCloudSnapshot = false;
+
+    const mergeCloudWithdrawals = (cloudWithdrawals: WithdrawalRequest[], isAuthoritativeSnapshot = true) => {
+      if (!cloudWithdrawals) return;
+      if (isAuthoritativeSnapshot) {
+        hasCloudSnapshot = true;
+      }
+      const deletedWithdrawals = getDeletedWithdrawalIds();
+      setWithdrawals((prev) => {
+        const map = new Map<string, WithdrawalRequest>();
+        const prevStatusById = new Map<string, string>();
+        prev.forEach((p) => {
+          if (p && p.id) {
+            prevStatusById.set(p.id, String(p.status || 'pending').toLowerCase());
+            prevStatusById.set(formatWithdrawalId(p.id), String(p.status || 'pending').toLowerCase());
+          }
+        });
+
+        let statusChangedDetail: { id: string; status: string } | null = null;
+
+        cloudWithdrawals.forEach((w) => {
+          if (w && w.id) {
+            const normId = formatWithdrawalId(w.id);
+            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+            if (!(isAdmin && isDeletedResolved)) {
+              const normalizedStatus = String(w.status || 'pending').toLowerCase() as WithdrawalRequest['status'];
+              const prevSt = prevStatusById.get(w.id) || prevStatusById.get(normId);
+              if (prevSt === 'pending' && normalizedStatus !== 'pending') {
+                statusChangedDetail = { id: w.id, status: normalizedStatus };
+              }
+              map.set(w.id, {
+                ...w,
+                id: w.id,
+                status: normalizedStatus,
+                timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+              });
+            }
+          }
+        });
+
+        prev.forEach((w) => {
+          if (w && w.id) {
+            const normId = formatWithdrawalId(w.id);
+            const prevEmail = (w.userEmail || w.email || '').trim().toLowerCase();
+            // Strict cross-user isolation: non-admin sessions must never retain another user's cached withdrawals
+            if (!isAdmin && targetEmail && prevEmail && prevEmail !== targetEmail) return;
+            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+            const isInFlightSubmit = processedWithdrawalTxIdsRef.current.has(w.id) || processedWithdrawalTxIdsRef.current.has(normId);
+            // Once authoritative Firestore snapshot arrives, prune stale unpersisted local pending caches
+            if (hasCloudSnapshot && w.status === 'pending' && !isInFlightSubmit && !map.has(w.id) && !map.has(normId)) {
+              return;
+            }
+            if (!(isAdmin && isDeletedResolved) && !map.has(w.id) && !map.has(normId)) {
+              map.set(w.id, {
+                ...w,
+                id: w.id,
+                timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+              });
+            }
+          }
+        });
+
+        const merged = Array.from(map.values()).sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+          const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+          return timeB - timeA;
+        });
+
+        try {
+          localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(merged));
+          if (targetEmail && !isAdmin) {
+            const emailKey = `quizkart_user_withdrawals_permanent_${targetEmail}`;
+            const userScoped = merged.filter((item) => {
+              const e = (item.userEmail || item.email || '').trim().toLowerCase();
+              return e === targetEmail || (targetUid && (item.ownerUid === targetUid || item.userId === targetUid));
+            });
+            if (userScoped.length > 0 || hasCloudSnapshot) {
+              localStorage.setItem(emailKey, JSON.stringify(userScoped));
+            }
+          }
+          const activePendingId = localStorage.getItem('quizkart_active_pending_withdrawal_id');
+          if (activePendingId) {
+            const matched = merged.find((item) => item.id === activePendingId || formatWithdrawalId(item.id) === formatWithdrawalId(activePendingId));
+            if ((matched && matched.status !== 'pending') || (hasCloudSnapshot && !matched && !processedWithdrawalTxIdsRef.current.has(activePendingId))) {
+              localStorage.removeItem('quizkart_active_pending_withdrawal_id');
+              window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id: matched?.id || activePendingId, status: matched?.status || 'resolved' } }));
+            }
+          }
+          if (statusChangedDetail) {
+            window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: statusChangedDetail }));
+          }
+        } catch {}
+        return merged;
+      });
+    };
+
+    fetchWithdrawalsFromFirestore(isAdmin ? undefined : targetUid, isAdmin ? undefined : targetEmail)
+      .then((cloudWithdrawals) => {
+        if (cloudWithdrawals) {
+          mergeCloudWithdrawals(cloudWithdrawals);
+        }
+      })
+      .catch((err) => console.warn('Firestore initial withdrawals load notice:', err));
+
+    const unsubWithdrawals = subscribeToWithdrawalsFromFirestore(
+      (cloudWithdrawals) => {
+        mergeCloudWithdrawals(cloudWithdrawals);
+      },
+      isAdmin ? undefined : targetUid,
+      isAdmin ? undefined : targetEmail
+    );
+
+    return () => {
+      unsubWithdrawals();
+    };
+  }, [currentUser?.uid, currentUser?.email, userProfile?.uid, userProfile?.email, isAdminPageActive]);
+
+  // Boot-time + real-time Firestore profile sync for authenticated email/phone users (ensures Wallet & Total Won stay synchronized on reload and after atomic withdrawal/refund transactions)
+  useEffect(() => {
+    if (!isUserAuthenticated || !userProfile?.email || isDemoSeedUser(userProfile)) return;
+    const cleanEmail = userProfile.email.trim().toLowerCase();
+    const targetUid = userProfile.uid || currentUser?.uid || '';
+
+    const applyRemoteProfile = (remoteProfile: Partial<UserProfile> | null) => {
+      if (withdrawalTxInFlightRef.current > 0) return;
+      if (!remoteProfile || (remoteProfile as any).isDeleted) return;
+      const remoteEmail = (remoteProfile.email || '').trim().toLowerCase();
+      if (remoteEmail && remoteEmail !== cleanEmail) return;
+
+      setUserProfile((prev) => {
+        const prevEmail = (prev.email || '').trim().toLowerCase();
+        if (prevEmail !== cleanEmail) return prev;
+        const toValidMs = (v: any) => {
+          const t = new Date(v || 0).getTime();
+          return Number.isFinite(t) ? t : 0;
+        };
+        const remoteUpdatedMs = toValidMs((remoteProfile as any).updatedAt);
+        const localUpdatedMs = toValidMs((prev as any).updatedAt);
+        const nextWallet = remoteProfile.walletBalance !== undefined && (remoteUpdatedMs >= localUpdatedMs || prev.walletBalance === undefined)
+          ? Math.max(0, Number(remoteProfile.walletBalance))
+          : Math.max(0, Number(prev.walletBalance || 0));
+        const nextTotalWon = Math.max(Number(remoteProfile.totalWonAmount || 0), Number(prev.totalWonAmount || 0));
+        const nextBlocked = remoteProfile.isBlocked !== undefined ? Boolean(remoteProfile.isBlocked) : Boolean(prev.isBlocked);
+
+        if (
+          nextWallet === Number(prev.walletBalance || 0) &&
+          nextTotalWon === Number(prev.totalWonAmount || 0) &&
+          nextBlocked === Boolean(prev.isBlocked) &&
+          (!remoteProfile.customUserId || remoteProfile.customUserId === prev.customUserId)
+        ) {
+          return prev;
+        }
+
+        const merged: UserProfile = {
+          ...prev,
+          ...remoteProfile,
+          id: remoteProfile.customUserId || remoteProfile.id || prev.id,
+          customUserId: remoteProfile.customUserId || prev.customUserId || prev.id,
+          walletBalance: nextWallet,
+          totalWonAmount: nextTotalWon,
+          isBlocked: nextBlocked,
+          updatedAt: (remoteProfile as any).updatedAt || prev.updatedAt || new Date().toISOString()
+        };
+        try {
+          localStorage.setItem('quizkart_user_profile', JSON.stringify(merged));
+        } catch {}
+        return merged;
+      });
+    };
+
+    fetchUserProfile(targetUid, cleanEmail)
+      .then(applyRemoteProfile)
+      .catch(() => {});
+
+    const unsubProfile = subscribeToUserProfileFromFirestore(targetUid, cleanEmail, applyRemoteProfile);
+    return () => {
+      unsubProfile();
+    };
+  }, [isUserAuthenticated, userProfile?.email, currentUser?.uid]);
 
   // Sanitize permanent user transaction history so only records with an explicit email are retained (never match or seed by phone/name)
   useEffect(() => {
@@ -1741,45 +1929,223 @@ export default function App() {
     });
   }, [userProfile]);
 
+  const processedWithdrawalTxIdsRef = useRef<Set<string>>(new Set());
+  const withdrawalTxInFlightRef = useRef<number>(0);
+  const userProfileRef = useRef<UserProfile>(userProfile);
+  userProfileRef.current = userProfile;
+  const userQuizAttemptsRef = useRef<QuizAttemptResult[]>([]);
+
   const handleAddWithdrawal = useCallback((newWithdrawal: Partial<WithdrawalRequest> & { amount: number }) => {
-    setWithdrawals((prev) => {
-      const resolvedEmail = (newWithdrawal.userEmail || newWithdrawal.email || userProfile.email || '').trim();
-      const wthId = newWithdrawal.id ? formatWithdrawalId(newWithdrawal.id) : getNextWithdrawalId(prev);
-      const fullWithdrawal: WithdrawalRequest = {
-        ...newWithdrawal,
-        id: wthId,
-        requestId: newWithdrawal.requestId || wthId,
-        ownerUid: newWithdrawal.ownerUid || userProfile.uid || userProfile.id || '',
-        userId: newWithdrawal.userId || userProfile.id || userProfile.uid || '',
-        userName: newWithdrawal.userName || userProfile.name,
-        userEmail: resolvedEmail,
-        email: resolvedEmail,
-        phone: newWithdrawal.phone || userProfile.mobile,
-        accountHolderName: newWithdrawal.accountHolderName || userProfile.name,
-        accountNumber: newWithdrawal.accountNumber || '',
-        confirmAccountNumber: newWithdrawal.confirmAccountNumber || newWithdrawal.accountNumber || '',
-        ifscCode: newWithdrawal.ifscCode || '',
-        amount: newWithdrawal.amount,
-        timestamp: newWithdrawal.timestamp || getCurrentFormattedTimestamp(),
-        date: newWithdrawal.date || new Date().toISOString().split('T')[0],
-        createdAt: newWithdrawal.createdAt || new Date().toISOString(),
-        status: newWithdrawal.status || 'pending'
-      };
+    if (withdrawalTxInFlightRef.current > 0) return;
+    const reqAmt = Number(newWithdrawal.amount);
+    if (isNaN(reqAmt) || reqAmt < 10 || reqAmt > 5000) return;
 
-      // Ensure persistence in permanent user log (zero-deletion policy)
-      try {
-        const savedPerm = localStorage.getItem('quizkart_user_withdrawals_permanent');
-        const list = savedPerm ? JSON.parse(savedPerm) : [];
-        if (Array.isArray(list)) {
-          const filtered = list.filter((item: any) => item && item.id !== fullWithdrawal.id);
-          localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify([fullWithdrawal, ...filtered]));
-        }
-      } catch {}
+    const currentSnap = userProfileRef.current;
+    const preTxBalance = Math.max(0, Number(currentSnap.walletBalance) || 0);
+    if (reqAmt > preTxBalance) return;
 
-      saveWithdrawalToFirestore(fullWithdrawal).catch(err => console.warn('Firestore withdrawal sync notice:', err));
-      return [fullWithdrawal, ...prev];
+    const resolvedEmail = (newWithdrawal.userEmail || newWithdrawal.email || currentSnap.email || '').trim();
+    const resolvedEmailLower = resolvedEmail.toLowerCase();
+    const eligibilityCheck = contestBackend.validateAndSubmitWithdrawal(
+      { ...newWithdrawal, amount: reqAmt },
+      currentSnap.uid || currentSnap.id || '',
+      resolvedEmailLower,
+      withdrawals,
+      currentSnap.totalWonAmount,
+      preTxBalance,
+      userQuizAttemptsRef.current
+    );
+    if (!eligibilityCheck.success) return;
+
+    const wthId = newWithdrawal.id ? formatWithdrawalId(newWithdrawal.id) : getNextWithdrawalId(withdrawals);
+
+    // Strict idempotency guard: prevent duplicate submission/deduction for the same request ID or active pending withdrawal
+    if (processedWithdrawalTxIdsRef.current.has(wthId)) return;
+    const existingAlreadyRecorded = (withdrawals || []).some((w) => {
+      if (!w) return false;
+      const existingId = formatWithdrawalId(w.id);
+      if (existingId === wthId && (w.walletDeducted || w.status !== 'pending')) return true;
+      const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
+      return Boolean(resolvedEmailLower && wEmail === resolvedEmailLower && w.status === 'pending');
     });
-  }, [userProfile]);
+    if (existingAlreadyRecorded) return;
+    processedWithdrawalTxIdsRef.current.add(wthId);
+    withdrawalTxInFlightRef.current += 1;
+
+    const nowIso = new Date().toISOString();
+    const fullWithdrawal: WithdrawalRequest = {
+      ...newWithdrawal,
+      id: wthId,
+      requestId: newWithdrawal.requestId || wthId,
+      ownerUid: newWithdrawal.ownerUid || currentSnap.uid || currentSnap.id || '',
+      userId: newWithdrawal.userId || currentSnap.id || currentSnap.uid || '',
+      userName: newWithdrawal.userName || currentSnap.name,
+      userEmail: resolvedEmail,
+      email: resolvedEmail,
+      phone: newWithdrawal.phone || currentSnap.mobile,
+      accountHolderName: newWithdrawal.accountHolderName || currentSnap.name,
+      accountNumber: newWithdrawal.accountNumber || '',
+      confirmAccountNumber: newWithdrawal.confirmAccountNumber || newWithdrawal.accountNumber || '',
+      ifscCode: newWithdrawal.ifscCode || '',
+      amount: reqAmt,
+      timestamp: newWithdrawal.timestamp || getCurrentFormattedTimestamp(),
+      date: newWithdrawal.date || nowIso.split('T')[0],
+      createdAt: newWithdrawal.createdAt || nowIso,
+      updatedAt: nowIso,
+      status: newWithdrawal.status || 'pending',
+      walletDeducted: true,
+      walletDeductedAmount: reqAmt,
+      walletRefunded: false
+    };
+
+    // 1. Instant local wallet deduction across Header, Profile Wallet & Withdrawal screen (without competing syncUserProfile)
+    const optimisticBalance = Math.max(0, preTxBalance - reqAmt);
+    const updatedProfileLocal: UserProfile = {
+      ...currentSnap,
+      walletBalance: optimisticBalance,
+      updatedAt: nowIso
+    };
+    setUserProfile(updatedProfileLocal);
+    try {
+      localStorage.setItem('quizkart_user_profile', JSON.stringify(updatedProfileLocal));
+      const cleanEmailLower = resolvedEmail.toLowerCase();
+      const existingUsers: UserProfile[] = JSON.parse(localStorage.getItem('quizkart_registered_users') || '[]');
+      if (Array.isArray(existingUsers)) {
+        const idx = existingUsers.findIndex(
+          (u) =>
+            (u.email && cleanEmailLower && u.email.toLowerCase() === cleanEmailLower) ||
+            (u.id && currentSnap.id && u.id === currentSnap.id)
+        );
+        if (idx >= 0) {
+          existingUsers[idx] = { ...existingUsers[idx], walletBalance: optimisticBalance, updatedAt: nowIso };
+          localStorage.setItem('quizkart_registered_users', JSON.stringify(existingUsers));
+        }
+      }
+    } catch {}
+
+    // 2. Persist deduplicated withdrawal record in state & permanent user logs
+    setWithdrawals((prev) => {
+      const exists = prev.some((w) => w && formatWithdrawalId(w.id) === wthId);
+      const nextList = exists
+        ? prev.map((w) => (w && formatWithdrawalId(w.id) === wthId ? fullWithdrawal : w))
+        : [fullWithdrawal, ...prev];
+      try {
+        localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(nextList));
+      } catch {}
+      return nextList;
+    });
+
+    try {
+      const cleanEmail = resolvedEmail.toLowerCase();
+      if (cleanEmail) {
+        const emailKey = `quizkart_user_withdrawals_permanent_${cleanEmail}`;
+        const savedEmailPerm = localStorage.getItem(emailKey);
+        const emailList = savedEmailPerm ? JSON.parse(savedEmailPerm) : [];
+        if (Array.isArray(emailList)) {
+          const filteredEmail = emailList.filter((item: any) => item && formatWithdrawalId(item.id) !== wthId);
+          localStorage.setItem(emailKey, JSON.stringify([fullWithdrawal, ...filteredEmail]));
+        }
+      }
+      const savedPerm = localStorage.getItem('quizkart_user_withdrawals_permanent');
+      const list = savedPerm ? JSON.parse(savedPerm) : [];
+      if (Array.isArray(list)) {
+        const filtered = list.filter((item: any) => item && formatWithdrawalId(item.id) !== wthId);
+        localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify([fullWithdrawal, ...filtered]));
+      }
+    } catch {}
+
+    // 3. Execute atomic Firestore transaction for withdrawal creation + single idempotent wallet deduction
+    submitWithdrawalTransaction(fullWithdrawal, currentSnap)
+      .then((txRes) => {
+        if (!txRes.success) {
+          // Roll back optimistic deduction if backend rejected (e.g. insufficient authoritative funds)
+          processedWithdrawalTxIdsRef.current.delete(wthId);
+          const rollbackIso = new Date().toISOString();
+          const rolledBackProfile: UserProfile = {
+            ...userProfileRef.current,
+            walletBalance: preTxBalance,
+            updatedAt: rollbackIso
+          };
+          setUserProfile(rolledBackProfile);
+          try {
+            localStorage.setItem('quizkart_user_profile', JSON.stringify(rolledBackProfile));
+            localStorage.removeItem('quizkart_active_pending_withdrawal_id');
+            const cleanEmail = resolvedEmail.toLowerCase();
+            if (cleanEmail) {
+              const emailKey = `quizkart_user_withdrawals_permanent_${cleanEmail}`;
+              const emailList = JSON.parse(localStorage.getItem(emailKey) || '[]');
+              if (Array.isArray(emailList)) {
+                localStorage.setItem(emailKey, JSON.stringify(emailList.filter((item: any) => item && formatWithdrawalId(item.id) !== wthId)));
+              }
+            }
+            const permList = JSON.parse(localStorage.getItem('quizkart_user_withdrawals_permanent') || '[]');
+            if (Array.isArray(permList)) {
+              localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify(permList.filter((item: any) => item && formatWithdrawalId(item.id) !== wthId)));
+            }
+          } catch {}
+          setWithdrawals((prev) => {
+            const rolledBackList = prev.filter((w) => w && formatWithdrawalId(w.id) !== wthId);
+            try {
+              localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(rolledBackList));
+            } catch {}
+            return rolledBackList;
+          });
+          if (txRes.error) {
+            showTunedToast(txRes.error);
+          }
+          return;
+        }
+
+        if (txRes.withdrawal?.id && txRes.withdrawal.id !== wthId) {
+          const finalWth = { ...fullWithdrawal, ...txRes.withdrawal, id: txRes.withdrawal.id, requestId: txRes.withdrawal.requestId || txRes.withdrawal.id };
+          processedWithdrawalTxIdsRef.current.add(finalWth.id);
+          setWithdrawals((prev) => {
+            const nextList = [finalWth, ...prev.filter((w) => w && formatWithdrawalId(w.id) !== wthId && w.id !== finalWth.id)];
+            try {
+              localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(nextList));
+            } catch {}
+            return nextList;
+          });
+          try {
+            localStorage.setItem('quizkart_active_pending_withdrawal_id', finalWth.id);
+            const cleanEmail = resolvedEmail.toLowerCase();
+            if (cleanEmail) {
+              const emailKey = `quizkart_user_withdrawals_permanent_${cleanEmail}`;
+              const emailList = JSON.parse(localStorage.getItem(emailKey) || '[]');
+              if (Array.isArray(emailList)) {
+                const updatedEmailList = [finalWth, ...emailList.filter((item: any) => item && formatWithdrawalId(item.id) !== wthId && item.id !== finalWth.id)];
+                localStorage.setItem(emailKey, JSON.stringify(updatedEmailList));
+              }
+            }
+            const permList = JSON.parse(localStorage.getItem('quizkart_user_withdrawals_permanent') || '[]');
+            if (Array.isArray(permList)) {
+              const updatedPerm = [finalWth, ...permList.filter((item: any) => item && formatWithdrawalId(item.id) !== wthId && item.id !== finalWth.id)];
+              localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify(updatedPerm));
+            }
+          } catch {}
+        }
+
+        if (txRes.newWalletBalance !== undefined) {
+          const authoritativeBal = Math.max(0, Number(txRes.newWalletBalance));
+          const syncIso = new Date().toISOString();
+          setUserProfile((prev) => {
+            if (Number(prev.walletBalance) === authoritativeBal) return prev;
+            const synced = { ...prev, walletBalance: authoritativeBal, updatedAt: syncIso };
+            try {
+              localStorage.setItem('quizkart_user_profile', JSON.stringify(synced));
+            } catch {}
+            return synced;
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn('Firestore atomic withdrawal transaction notice:', err);
+        saveWithdrawalToFirestore(fullWithdrawal).catch(() => {});
+      })
+      .finally(() => {
+        withdrawalTxInFlightRef.current = Math.max(0, withdrawalTxInFlightRef.current - 1);
+      });
+  }, [withdrawals, showTunedToast]);
 
   // Dynamic Active Deposit QR state synced with Firestore & LocalStorage
   const [activeDepositQr, setActiveDepositQrState] = useState<string>(() => {
@@ -1847,6 +2213,7 @@ export default function App() {
     } catch {}
     return [];
   });
+  userQuizAttemptsRef.current = userQuizAttempts;
 
   // Subscribe to real-time user quiz attempts from Firestore permanently
   useEffect(() => {
@@ -1863,17 +2230,21 @@ export default function App() {
 
     // 1. Initial fetch from Firestore
     fetchUserQuizAttemptsFromFirestore(identifier).then(cloudAttempts => {
-      if (cloudAttempts && cloudAttempts.length > 0) {
+      if (cloudAttempts) {
         setUserQuizAttempts(prev => {
           const map = new Map<string, QuizAttemptResult>();
-          prev.forEach(a => { 
+          prev.forEach(a => {
             if (a && a.attemptId) {
-              map.set(a.attemptId, a); 
+              const aEmail = (a.userEmail || '').trim().toLowerCase();
+              if (activeTargetEmail && aEmail && aEmail !== activeTargetEmail) return;
+              map.set(a.attemptId, a);
             }
           });
-          cloudAttempts.forEach(a => { 
+          cloudAttempts.forEach(a => {
             if (a && a.attemptId) {
-              map.set(a.attemptId, a); 
+              const aEmail = (a.userEmail || '').trim().toLowerCase();
+              if (activeTargetEmail && aEmail && aEmail !== activeTargetEmail) return;
+              map.set(a.attemptId, a);
             }
           });
           const merged = Array.from(map.values()).sort((a, b) => {
@@ -1894,17 +2265,21 @@ export default function App() {
 
     // 2. Real-time updates subscription
     const unsubscribe = subscribeToUserQuizAttempts(identifier, (cloudAttempts) => {
-      if (cloudAttempts && cloudAttempts.length > 0) {
+      if (cloudAttempts) {
         setUserQuizAttempts(prev => {
           const map = new Map<string, QuizAttemptResult>();
-          prev.forEach(a => { 
+          prev.forEach(a => {
             if (a && a.attemptId) {
-              map.set(a.attemptId, a); 
+              const aEmail = (a.userEmail || '').trim().toLowerCase();
+              if (activeTargetEmail && aEmail && aEmail !== activeTargetEmail) return;
+              map.set(a.attemptId, a);
             }
           });
-          cloudAttempts.forEach(a => { 
+          cloudAttempts.forEach(a => {
             if (a && a.attemptId) {
-              map.set(a.attemptId, a); 
+              const aEmail = (a.userEmail || '').trim().toLowerCase();
+              if (activeTargetEmail && aEmail && aEmail !== activeTargetEmail) return;
+              map.set(a.attemptId, a);
             }
           });
           const merged = Array.from(map.values()).sort((a, b) => {
@@ -2057,16 +2432,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    questionPoolManager.saveAllQuestions(quizQuestions);
-    try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(quizQuestions.slice(0, 1000)));
-      localStorage.setItem('quizkart_questions_initialized', 'true');
-    } catch {}
+    questionPoolManager.saveAllQuestions(quizQuestions).catch(() => {});
   }, [quizQuestions]);
 
   useEffect(() => {
     try {
-      localStorage.setItem('quizkart_user_profile', JSON.stringify(userProfile));
+      safeSetLocalStorageJson('quizkart_user_profile', userProfile);
       if (userProfile && userProfile.email && !isDemoSeedUser(userProfile)) {
         const rawUsers = localStorage.getItem('quizkart_registered_users');
         const parsedList: UserProfile[] = rawUsers ? JSON.parse(rawUsers) : [];
@@ -2109,7 +2480,7 @@ export default function App() {
             customUserId: resolvedId
           });
         }
-        localStorage.setItem('quizkart_registered_users', JSON.stringify(list));
+        safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(list));
         window.dispatchEvent(new Event('quizkart_users_updated'));
       }
     } catch {}
@@ -2172,6 +2543,20 @@ export default function App() {
     const unsubscribe = subscribeToAuth(async (user) => {
       setCurrentUser(user);
       if (user) {
+        const isAdminAuthSession = (() => {
+          try {
+            return (
+              (user.email || '').trim().toLowerCase() === AUTHORIZED_ADMIN_EMAIL &&
+              (sessionStorage.getItem('quizkart_admin_authenticated') === 'true' ||
+                localStorage.getItem('quizkart_admin_authenticated') === 'true')
+            );
+          } catch {
+            return false;
+          }
+        })();
+        if (isAdminAuthSession) {
+          return;
+        }
         try {
           let localSaved: Partial<UserProfile> = {};
           try {
@@ -2189,20 +2574,37 @@ export default function App() {
 
             setUserProfile(prev => {
               const resolvedEmail = (remoteProfile.email || user.email || localSaved.email || prev.email || '').trim().toLowerCase();
+              const sameLocalUser = Boolean(localSaved.email && localSaved.email.trim().toLowerCase() === resolvedEmail);
+              const toValidMs = (v: any) => {
+                const t = new Date(v || 0).getTime();
+                return Number.isFinite(t) ? t : 0;
+              };
+              const remoteUpdatedMs = toValidMs((remoteProfile as any).updatedAt);
+              const localUpdatedMs = toValidMs((localSaved as any).updatedAt);
+              const resolvedWalletBalance =
+                remoteProfile.walletBalance !== undefined && (!sameLocalUser || remoteUpdatedMs >= localUpdatedMs)
+                  ? Math.max(0, Number(remoteProfile.walletBalance))
+                  : (sameLocalUser && localSaved.walletBalance !== undefined ? Math.max(0, Number(localSaved.walletBalance)) : Math.max(0, Number(remoteProfile.walletBalance ?? prev.walletBalance ?? 0)));
+              const resolvedTotalWon = Math.max(
+                Number(remoteProfile.totalWonAmount) || 0,
+                sameLocalUser ? (Number(localSaved.totalWonAmount) || 0) : 0
+              );
+
               const merged: UserProfile = {
                 ...prev,
-                ...localSaved,
+                ...(sameLocalUser ? localSaved : {}),
                 ...remoteProfile,
                 id: normalizedId,
                 customUserId: normalizedId,
                 userNumber: userNum < 999999 ? userNum : (normalizedId.match(/(\d+)/) ? parseInt(normalizedId.match(/(\d+)/)![1], 10) : undefined),
                 uid: user.uid,
-                name: localSaved.name || remoteProfile.name || user.displayName || prev.name,
+                name: (sameLocalUser ? localSaved.name : '') || remoteProfile.name || user.displayName || prev.name,
                 email: resolvedEmail,
-                avatarUrl: localSaved.avatarUrl || remoteProfile.avatarUrl || user.photoURL || prev.avatarUrl,
-                mobile: localSaved.mobile || remoteProfile.mobile || prev.mobile,
-                countryCode: localSaved.countryCode || remoteProfile.countryCode || prev.countryCode || '+91',
-                walletBalance: (localSaved.walletBalance !== undefined && localSaved.walletBalance > 0) ? localSaved.walletBalance : (remoteProfile.walletBalance ?? prev.walletBalance),
+                avatarUrl: (sameLocalUser ? localSaved.avatarUrl : '') || remoteProfile.avatarUrl || user.photoURL || prev.avatarUrl,
+                mobile: (sameLocalUser ? localSaved.mobile : '') || remoteProfile.mobile || prev.mobile,
+                countryCode: (sameLocalUser ? localSaved.countryCode : '') || remoteProfile.countryCode || prev.countryCode || '+91',
+                walletBalance: resolvedWalletBalance,
+                totalWonAmount: resolvedTotalWon,
                 isRegistered: true
               };
               try {
@@ -2229,6 +2631,7 @@ export default function App() {
               userNum = assigned.userNumber;
             }
 
+            const nowIso = new Date().toISOString();
             const initialSync: UserProfile = {
               ...userProfile,
               ...localSaved,
@@ -2240,7 +2643,11 @@ export default function App() {
               email: resolvedEmail,
               avatarUrl: localSaved.avatarUrl || user.photoURL || userProfile.avatarUrl,
               countryCode: localSaved.countryCode || userProfile.countryCode || '+91',
-              isRegistered: true
+              createdAt: localSaved.createdAt || nowIso,
+              registrationDate: (localSaved.registrationDate || nowIso.split('T')[0]).split('|')[0].trim(),
+              status: 'active',
+              isRegistered: true,
+              updatedAt: nowIso
             };
             setUserProfile(initialSync);
             try {
@@ -2300,11 +2707,7 @@ export default function App() {
           }
 
           if (merged.length > 0) {
-            questionPoolManager.saveAllQuestions(merged);
-            try {
-              localStorage.setItem('quizkart_questions', JSON.stringify(merged.slice(0, 1000)));
-              localStorage.setItem('quizkart_questions_initialized', 'true');
-            } catch {}
+            questionPoolManager.saveAllQuestions(merged).catch(() => {});
             return merged;
           }
           return cleanLocal;
@@ -2374,46 +2777,6 @@ export default function App() {
       } catch (err) {
         console.warn('Firestore contest entries load notice:', err);
       }
-
-
-      if (auth.currentUser) {
-        try {
-          const cloudWithdrawals = await fetchWithdrawalsFromFirestore();
-          if (cloudWithdrawals && cloudWithdrawals.length > 0) {
-            const deletedWithdrawals = getDeletedWithdrawalIds();
-            setWithdrawals((prev) => {
-              const map = new Map<string, WithdrawalRequest>();
-              cloudWithdrawals.forEach((w, idx) => { 
-                if (w && w.id) {
-                  const normId = formatWithdrawalId(w.id, idx + 1);
-                  if (!deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(normId)) {
-                    map.set(normId, {
-                      ...w,
-                      id: normId,
-                      timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-                    });
-                  }
-                } 
-              });
-              prev.forEach((w, idx) => { 
-                if (w && w.id) {
-                  const normId = formatWithdrawalId(w.id, idx + 1);
-                  if (!deletedWithdrawals.includes(w.id) && !deletedWithdrawals.includes(normId) && !map.has(normId)) {
-                    map.set(normId, {
-                      ...w,
-                      id: normId,
-                      timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-                    });
-                  }
-                } 
-              });
-              return Array.from(map.values());
-            });
-          }
-        } catch (err) {
-          console.warn('Firestore withdrawals load notice:', err);
-        }
-      }
     }
 
     loadCloudData();
@@ -2429,7 +2792,8 @@ export default function App() {
     avatarUrl?: string;
     isExistingLogin?: boolean;
   }) => {
-    const todayDateOnly = new Date().toISOString().split('T')[0];
+    const nowIso = new Date().toISOString();
+    const todayDateOnly = nowIso.split('T')[0];
     let existingUsers: UserProfile[] = [];
     try {
       const raw = localStorage.getItem('quizkart_registered_users');
@@ -2468,60 +2832,112 @@ export default function App() {
 
     const cleanInputEmail = userData.email.trim().toLowerCase();
     const cleanInputMobile = userData.mobile.replace(/\D/g, '');
+    const isCurrentUserMatching = Boolean(
+      currentUser &&
+      (!currentUser.email || currentUser.email.trim().toLowerCase() === cleanInputEmail)
+    );
+    const matchedFirebaseUid = isCurrentUserMatching && currentUser?.uid ? currentUser.uid : '';
 
-    // Match returning real user by email
+    // Match returning real user by email from local registry and live Firestore
     const existingMatch = existingUsers.find((u) => {
       if (!u) return false;
       const uEmail = (u.email || '').trim().toLowerCase();
       return uEmail === cleanInputEmail;
     });
 
+    let remoteUser: Partial<UserProfile> | null = null;
+    try {
+      const fetched = await fetchUserProfile(matchedFirebaseUid || existingMatch?.uid || '', cleanInputEmail);
+      if (fetched && !(fetched as any).isDeleted && (fetched as any).status !== 'deleted') {
+        remoteUser = fetched;
+      }
+    } catch {}
+
     const plainPassword =
       userData.password && userData.password.trim()
         ? userData.password.trim()
-        : existingMatch?.passwordStatus &&
-          !existingMatch.passwordStatus.includes('••••') &&
-          !existingMatch.passwordStatus.includes('Secured')
-        ? existingMatch.passwordStatus
-        : 'player@123';
+        : (remoteUser?.passwordStatus &&
+          !remoteUser.passwordStatus.includes('••••') &&
+          !remoteUser.passwordStatus.includes('Secured')
+          ? remoteUser.passwordStatus
+          : existingMatch?.passwordStatus &&
+            !existingMatch.passwordStatus.includes('••••') &&
+            !existingMatch.passwordStatus.includes('Secured')
+          ? existingMatch.passwordStatus
+          : 'player@123');
 
     let updatedProfile: UserProfile;
+    const baseMatch = (existingMatch || remoteUser)
+      ? ({ ...(existingMatch || {}), ...(remoteUser || {}) } as Partial<UserProfile>)
+      : null;
 
-    if (existingMatch) {
-      const existingId = existingMatch.customUserId || existingMatch.id || '';
-      const userNum = existingMatch.userNumber || extractNumericUserNumber(existingMatch);
+    if (baseMatch) {
+      const existingId = baseMatch.customUserId || baseMatch.id || '';
+      const userNum = baseMatch.userNumber || extractNumericUserNumber(baseMatch);
       let canonicalId = (existingId && /^(?:QK-)?USR-\d+$/i.test(existingId))
         ? (existingId.startsWith('QK-') ? existingId : `QK-${existingId}`)
         : (userNum < 999999 ? `QK-USR-${userNum}` : '');
       let finalUserNumber = userNum < 999999 ? userNum : (canonicalId.match(/(\d+)/) ? parseInt(canonicalId.match(/(\d+)/)![1], 10) : 0);
 
+      const resolvedExistingUid = matchedFirebaseUid ||
+        (baseMatch.uid && !baseMatch.uid.startsWith('QK-USR-') ? baseMatch.uid : '') ||
+        `usr_${cleanInputEmail.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
       if (!canonicalId) {
         const assigned = await assignSequentialUserIdViaTransaction(
-          currentUser?.uid || existingMatch.uid || '',
+          resolvedExistingUid,
           cleanInputEmail
         );
         canonicalId = assigned.customUserId;
         finalUserNumber = assigned.userNumber;
       }
+
+      const remoteUpdatedMs = new Date((remoteUser as any)?.updatedAt || 0).getTime();
+      const localUpdatedMs = new Date((existingMatch as any)?.updatedAt || 0).getTime();
+      const resolvedWalletBalance =
+        remoteUser?.walletBalance !== undefined && (!existingMatch || remoteUpdatedMs >= localUpdatedMs)
+          ? Number(remoteUser.walletBalance)
+          : (existingMatch?.walletBalance ?? remoteUser?.walletBalance ?? 0);
+      const resolvedTotalWon = Math.max(
+        Number(remoteUser?.totalWonAmount) || 0,
+        Number(existingMatch?.totalWonAmount) || 0
+      );
+      const resolvedCreatedAt =
+        baseMatch.createdAt ||
+        (baseMatch.registrationDate && baseMatch.registrationDate.includes('T') ? baseMatch.registrationDate : undefined) ||
+        nowIso;
+
       // RETURNING LOGGED-IN USER: Persist and load their actual real-time database state without resetting
       updatedProfile = {
-        ...existingMatch,
+        ...baseMatch,
         id: canonicalId,
         customUserId: canonicalId,
         userNumber: finalUserNumber,
-        uid: currentUser?.uid || existingMatch.uid || canonicalId,
-        name: existingMatch.name || userData.name.trim(),
-        mobile: existingMatch.mobile || cleanInputMobile,
-        countryCode: existingMatch.countryCode || userData.countryCode || '+91',
-        email: userData.email.trim() || existingMatch.email,
-        avatarUrl: existingMatch.avatarUrl || userData.avatarUrl,
-        walletBalance: existingMatch.walletBalance ?? 0,
-        totalWonAmount: existingMatch.totalWonAmount ?? 0,
-        quizzesPlayed: existingMatch.quizzesPlayed ?? 0,
-        productsWonCount: existingMatch.productsWonCount ?? 0,
+        uid: resolvedExistingUid,
+        name: baseMatch.name || userData.name.trim(),
+        mobile: baseMatch.mobile || cleanInputMobile,
+        countryCode: baseMatch.countryCode || userData.countryCode || '+91',
+        email: userData.email.trim() || baseMatch.email || cleanInputEmail,
+        avatarUrl: baseMatch.avatarUrl || userData.avatarUrl,
+        address: baseMatch.address || {
+          fullName: baseMatch.name || userData.name.trim(),
+          phoneNumber: baseMatch.mobile || cleanInputMobile,
+          streetAddress: '',
+          city: 'Bengaluru',
+          state: 'Karnataka',
+          pincode: '560001'
+        },
+        upiId: baseMatch.upiId || '',
+        walletBalance: resolvedWalletBalance,
+        totalWonAmount: resolvedTotalWon,
+        quizzesPlayed: Math.max(Number(remoteUser?.quizzesPlayed) || 0, Number(existingMatch?.quizzesPlayed) || 0),
+        productsWonCount: Math.max(Number(remoteUser?.productsWonCount) || 0, Number(existingMatch?.productsWonCount) || 0),
         isRegistered: true,
-        isBlocked: existingMatch.isBlocked ?? false,
-        registrationDate: (existingMatch.registrationDate || todayDateOnly).split('|')[0].trim(),
+        isBlocked: baseMatch.isBlocked ?? false,
+        status: baseMatch.isBlocked ? 'blocked' : (baseMatch.status || 'active'),
+        registrationDate: (baseMatch.registrationDate || todayDateOnly).split('|')[0].trim().split('T')[0].trim(),
+        createdAt: resolvedCreatedAt,
+        updatedAt: nowIso,
         passwordStatus: plainPassword,
         hasPassword: true
       };
@@ -2572,9 +2988,14 @@ export default function App() {
         }
       }).catch(() => {});
     } else {
-      // NEW USER REGISTRATION: Permanent sequential ID allocated via Firestore runTransaction()
+      // NEW USER REGISTRATION: Permanent owner UID + atomic sequential ID allocated via Firestore runTransaction()
+      const generatedUid = matchedFirebaseUid || (
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? `usr_${crypto.randomUUID()}`
+          : `usr_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+      );
       const assigned = await assignSequentialUserIdViaTransaction(
-        currentUser?.uid || '',
+        generatedUid,
         cleanInputEmail
       );
       const sequentialId = assigned.customUserId;
@@ -2583,11 +3004,11 @@ export default function App() {
         id: sequentialId,
         customUserId: sequentialId,
         userNumber: nextSeqNum,
-        uid: currentUser?.uid || sequentialId,
+        uid: generatedUid,
         name: userData.name.trim(),
         mobile: cleanInputMobile,
         countryCode: userData.countryCode || '+91',
-        email: userData.email.trim(),
+        email: cleanInputEmail,
         avatarUrl: userData.avatarUrl || DEFAULT_USER_PROFILE.avatarUrl,
         address: {
           fullName: userData.name.trim(),
@@ -2604,7 +3025,10 @@ export default function App() {
         productsWonCount: 0,
         isRegistered: true,
         isBlocked: false,
+        status: 'active',
         registrationDate: todayDateOnly,
+        createdAt: nowIso,
+        updatedAt: nowIso,
         passwordStatus: plainPassword,
         hasPassword: true
       };
@@ -2616,12 +3040,17 @@ export default function App() {
         if (!localStorage.getItem(`quizkart_user_deposits_permanent_${cleanInputEmail}`)) {
           localStorage.setItem(`quizkart_user_deposits_permanent_${cleanInputEmail}`, JSON.stringify([]));
         }
-        localStorage.setItem(`quizkart_user_withdrawals_permanent_${cleanInputEmail}`, JSON.stringify([]));
+        if (!localStorage.getItem(`quizkart_user_withdrawals_permanent_${cleanInputEmail}`)) {
+          localStorage.setItem(`quizkart_user_withdrawals_permanent_${cleanInputEmail}`, JSON.stringify([]));
+        }
         localStorage.setItem('quizkart_user_quiz_attempts', JSON.stringify([]));
         localStorage.removeItem('quizkart_last_result');
         localStorage.removeItem('quizkart_active_pending_withdrawal_id');
       } catch {}
     }
+
+    // Persist complete registration/login record in Firestore BEFORE marking registration complete in UI
+    await syncUserProfile(updatedProfile, { throwOnError: true });
 
     setUserProfile(updatedProfile);
     setIsUserAuthenticated(true);
@@ -2642,14 +3071,10 @@ export default function App() {
       } else {
         existingUsers.push(updatedProfile);
       }
-      localStorage.setItem('quizkart_registered_users', JSON.stringify(existingUsers));
+      safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(existingUsers));
     } catch {}
 
-    // Question blocks are strictly assigned ON-DEMAND upon clicking 'Join Now' or 'Re-join'
-    // No automatic pre-filling on user registration
-
     setCurrentTab('home');
-    await syncUserProfile(updatedProfile);
     handleShowNotice(`Welcome ${updatedProfile.name}!`);
   }, [userProfile, currentUser, handleShowNotice, userQuizAttempts, quizQuestions]);
 
@@ -2693,7 +3118,11 @@ export default function App() {
   }, [userProfile, handleShowNotice]);
 
   // Dedicated profile update handler with synchronous localStorage & cloud persistence
-  const handleUpdateProfile = useCallback((updated: UserProfile) => {
+  const handleUpdateProfile = useCallback((updatedRaw: UserProfile) => {
+    const updated: UserProfile = {
+      ...updatedRaw,
+      updatedAt: updatedRaw.updatedAt || new Date().toISOString()
+    };
     setUserProfile(updated);
     const ownerUid = auth.currentUser?.uid || updated.uid || updated.id;
     if (ownerUid) {
@@ -2795,10 +3224,12 @@ export default function App() {
         } else {
           existingUsers.push(updated);
         }
-        localStorage.setItem('quizkart_registered_users', JSON.stringify(existingUsers));
+        safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(existingUsers));
       }
     } catch {}
-    syncUserProfile(updated).catch(err => console.warn('Sync profile error:', err));
+    if (withdrawalTxInFlightRef.current === 0) {
+      syncUserProfile(updated).catch(err => console.warn('Sync profile error:', err));
+    }
   }, [activeContestId, activeContest?.type, todayPrize?.brand, todayPrize?.retailValue]);
 
   const lastFirestorePresencePingRef = useRef<number>(0);
@@ -2909,6 +3340,7 @@ export default function App() {
 
   // Sync user profile updates to centralized Firebase Firestore collection globally
   useEffect(() => {
+    if (withdrawalTxInFlightRef.current > 0) return;
     if (!isFirestoreQuotaExceeded() && userProfile?.isRegistered && !userProfile?.isDeleted && userProfile?.email) {
       syncUserProfile(userProfile).catch(() => {});
     }
@@ -3455,6 +3887,10 @@ export default function App() {
     return (
       <AdminPage
         onExitAdmin={() => {
+          try {
+            localStorage.removeItem('quizkart_admin_authenticated');
+            sessionStorage.removeItem('quizkart_admin_authenticated');
+          } catch {}
           setIsAdminPageActive(false);
           clearAdminHash();
         }}
@@ -3536,6 +3972,10 @@ export default function App() {
             clearAdminHash();
           }}
           onSuccess={() => {
+            try {
+              localStorage.setItem('quizkart_admin_authenticated', 'true');
+              sessionStorage.setItem('quizkart_admin_authenticated', 'true');
+            } catch {}
             setIsAdminAuthModalOpen(false);
             setIsAdminPageActive(true);
           }}
@@ -3837,8 +4277,10 @@ export default function App() {
                 localStorage.removeItem('quizkart_is_authenticated');
                 localStorage.removeItem('quizkart_profile_manually_saved');
                 localStorage.removeItem('quizkart_user_quiz_attempts');
+                localStorage.removeItem('quizkart_active_pending_withdrawal_id');
                 localStorage.setItem('quizkart_current_tab', 'home');
               } catch {}
+              processedWithdrawalTxIdsRef.current.clear();
               setUserQuizAttempts([]);
               setIsUserAuthenticated(false);
               setCurrentTab('home');
@@ -3964,6 +4406,7 @@ export default function App() {
             onUpdateProfile={handleUpdateProfile}
             onSubmitWithdrawal={handleAddWithdrawal}
             existingWithdrawals={withdrawals}
+            quizAttempts={userQuizAttempts}
             onBackToProfile={() => {
               setCurrentTab('profile');
               window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -4048,6 +4491,10 @@ export default function App() {
           clearAdminHash();
         }}
         onSuccess={() => {
+          try {
+            localStorage.setItem('quizkart_admin_authenticated', 'true');
+            sessionStorage.setItem('quizkart_admin_authenticated', 'true');
+          } catch {}
           setIsAdminAuthModalOpen(false);
           setIsAdminPageActive(true);
         }}

@@ -79,7 +79,8 @@ import {
   DEFAULT_ANNOUNCEMENT_SETTINGS,
   DEFAULT_DEPOSIT_REQUESTS,
   DEFAULT_WITHDRAWAL_REQUESTS,
-  isDemoSeedUser
+  isDemoSeedUser,
+  isConfirmedFakeDisplayUser
 } from '../data/quizData';
 import { AnnouncementBar } from './AnnouncementBar';
 import { BannerSlider } from './BannerSlider';
@@ -100,17 +101,30 @@ import { questionPoolManager, getBlockAssignedUserId, createInitialUserBlocksFro
 import { ContestManagerTab } from './ContestManagerTab';
 import { safeCopyToClipboard } from '../utils/clipboard';
 import { compressImage, normalizeImageUrl, isGifImage } from '../utils/imageCompressor';
+import {
+  compactBannerSlidesForLocalCache,
+  compactDepositsForLocalCache,
+  compactRegisteredUsersForLocalCache,
+  safeSetLocalStorageJson
+} from '../utils/storageHygiene';
 import { 
+  auth,
+  AUTHORIZED_ADMIN_EMAIL,
+  getAuthPersistenceStatus,
+  signInAdminWithGoogle,
+  verifyAdminSessionAndLoadUsers,
   updateDepositStatusInFirestore, 
   syncUserProfile, 
   updateUserBlockStatusInFirestore,
-  fetchAllUsersFromFirestore,
   subscribeToAllUsersFromFirestore,
   subscribeToUserPresenceFromFirestore,
+  assignSequentialUserIdViaTransaction,
+  syncUserCounterMinimum,
   deleteDepositFromFirestore, 
   saveDepositQrToFirestore,
   saveQuizTimerToFirestore,
   updateWithdrawalStatusInFirestore,
+  processWithdrawalStatusTransaction,
   deleteWithdrawalFromFirestore,
   deleteSupportTicketFromFirestore,
   fetchSupportTicketsFromFirestore,
@@ -123,7 +137,9 @@ import {
   subscribeToContestEntriesFromFirestore,
   fetchAllContestEntriesFromFirestore,
   fetchDepositsFromFirestore,
-  subscribeToDepositsFromFirestore
+  subscribeToDepositsFromFirestore,
+  fetchWithdrawalsFromFirestore,
+  fetchUserProfile
 } from '../firebase';
 import { contestBackend, mapEntriesToLeaderboard } from '../backend/contestEngine';
 import { 
@@ -135,6 +151,7 @@ import {
   getCurrentFormattedTimestamp,
   addDeletedDepositId,
   addDeletedWithdrawalId,
+  getDeletedWithdrawalIds,
   isTicketDeleted,
   addDeletedTicketId
 } from '../utils/depositUtils';
@@ -458,7 +475,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
           }
         }
         const rawReg = localStorage.getItem('quizkart_registered_users');
-        if (rawReg) {
+        if (rawReg && !hasCloudUsersSnapshotRef.current) {
           const parsedReg = JSON.parse(rawReg);
           if (Array.isArray(parsedReg)) {
             setRegisteredUsersList(deduplicateRegisteredUsers(parsedReg));
@@ -507,6 +524,30 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     return new Date().toISOString().split('T')[0];
   };
 
+  // Helper to format Registration Time from ISO createdAt or legacy timestamp string
+  const formatRegistrationTime = (rawCreatedAt?: string, rawRegDate?: string): string => {
+    const candidates = [rawCreatedAt, rawRegDate].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+    for (const val of candidates) {
+      if (val.includes('|')) {
+        const parts = val.split('|');
+        const timePart = parts[1]?.trim();
+        if (timePart) return timePart;
+      }
+      if (val.includes('T')) {
+        const parsed = new Date(val);
+        if (!isNaN(parsed.getTime())) {
+          return parsed.toLocaleTimeString('en-IN', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true
+          });
+        }
+      }
+    }
+    return '—';
+  };
+
   // Helper to strictly deduplicate real registered users (purging all demo/dummy seed users) and assign sequential QK-USR-1001+ IDs
   // Helper to check if a user account is deleted
   const isDeletedAccountRecord = (u: any): boolean => {
@@ -536,23 +577,25 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     const result: UserProfile[] = [];
 
     users.forEach((u) => {
-      if (!u || (!u.email && !u.name && !u.id)) return;
-      if (isDemoSeedUser(u) || isDeletedAccountRecord(u)) return;
+      if (!u || (!u.email && !u.name && !u.id && !u.uid)) return;
+      if (isDemoSeedUser(u) || isConfirmedFakeDisplayUser(u) || isDeletedAccountRecord(u)) return;
 
       const normEmail = (u.email || '').trim().toLowerCase();
       const rawId = (u.customUserId || u.id || '').trim().toUpperCase();
       const validUsrId = /^(?:QK-)?USR-\d+$/i.test(rawId) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
-      const uNumber = typeof u.userNumber === 'number' && u.userNumber >= 1000 
-        ? u.userNumber 
+      const uNumber = typeof u.userNumber === 'number' && u.userNumber >= 1000
+        ? u.userNumber
         : extractNumericUserNumber(u);
+      const cleanUid = (u.uid || '').trim();
+      const hasRealUid = Boolean(cleanUid && !cleanUid.startsWith('QK-USR-'));
 
-      // Priority 1: Match by UID if present (not fallback string)
+      // Priority 1: Match by Firebase/Permanent UID
       let existingIdx = -1;
-      if (u.uid && !u.uid.startsWith('QK-USR-')) {
-        existingIdx = result.findIndex((item) => item.uid === u.uid);
+      if (hasRealUid) {
+        existingIdx = result.findIndex((item) => item.uid === cleanUid);
       }
 
-      // Priority 2: Match by email
+      // Priority 2: Match by email alias
       if (existingIdx === -1 && normEmail) {
         existingIdx = result.findIndex((item) => (item.email || '').trim().toLowerCase() === normEmail);
       }
@@ -565,64 +608,76 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         });
       }
 
+      const preservedCreatedAt =
+        u.createdAt ||
+        (u.registrationDate && String(u.registrationDate).includes('T') ? u.registrationDate : undefined);
+
       const normalizedUser: UserProfile = {
         ...u,
-        id: validUsrId || u.id,
-        customUserId: validUsrId || u.customUserId || u.id,
+        email: normEmail || u.email || '',
+        id: validUsrId || u.id || cleanUid,
+        customUserId: validUsrId || u.customUserId || undefined,
         userNumber: uNumber < 999999 ? uNumber : undefined,
-        registrationDate: normalizeRegistrationTimestamp(u.registrationDate),
+        createdAt: preservedCreatedAt,
+        registrationDate: normalizeRegistrationTimestamp(u.registrationDate || preservedCreatedAt),
         passwordStatus: normalizePlainPassword(u.passwordStatus)
       };
 
       if (existingIdx >= 0) {
         const existing = result[existingIdx];
-        // Ensure active sequential ID from incoming user takes precedence over stale cached IDs (e.g., QK-USR-1011 over QK-USR-1009)
-        const incomingId = validUsrId;
         const existingRaw = (existing.customUserId || existing.id || '').trim();
-        const existingUsrId = /^(?:QK-)?USR-\d+$/i.test(existingRaw) 
-          ? (existingRaw.startsWith('QK-') ? existingRaw : `QK-${existingRaw}`) 
+        const existingUsrId = /^(?:QK-)?USR-\d+$/i.test(existingRaw)
+          ? (existingRaw.startsWith('QK-') ? existingRaw : `QK-${existingRaw}`)
           : '';
         const incomingNum = extractNumericUserNumber(normalizedUser);
         const existingNum = extractNumericUserNumber(existing);
 
-        let preservedId = incomingId;
-        if (!preservedId) {
-          preservedId = existingUsrId || existing.id || incomingId;
-        } else if (existingUsrId && existingNum > incomingNum && existingNum < 999999) {
+        let preservedId = validUsrId || existingUsrId || existing.id || normalizedUser.id || '';
+        if (existingUsrId && validUsrId && existingNum < 999999 && existingNum > incomingNum) {
           preservedId = existingUsrId;
         }
 
         const preservedNum = (incomingNum >= 1001 && incomingNum < 999999 && incomingNum >= existingNum)
           ? incomingNum
-          : (existingNum >= 1001 && existingNum < 999999 ? existingNum : normalizedUser.userNumber || existing.userNumber || 1001);
+          : (existingNum >= 1001 && existingNum < 999999 ? existingNum : normalizedUser.userNumber || existing.userNumber);
+
+        const earlierCreatedAt = (() => {
+          const tA = new Date(existing.createdAt || existing.registrationDate || 0).getTime();
+          const tB = new Date(normalizedUser.createdAt || normalizedUser.registrationDate || 0).getTime();
+          if (Number.isFinite(tA) && tA > 0 && Number.isFinite(tB) && tB > 0) {
+            return tA <= tB ? (existing.createdAt || existing.registrationDate) : (normalizedUser.createdAt || normalizedUser.registrationDate);
+          }
+          return existing.createdAt || normalizedUser.createdAt;
+        })();
+
+        const canonicalUid =
+          (existing.uid && !existing.uid.startsWith('QK-USR-') && !existing.uid.includes('_'))
+            ? existing.uid
+            : ((normalizedUser.uid && !normalizedUser.uid.startsWith('QK-USR-') && !normalizedUser.uid.includes('_'))
+                ? normalizedUser.uid
+                : (normalizedUser.uid && !normalizedUser.uid.startsWith('QK-USR-')
+                    ? normalizedUser.uid
+                    : (existing.uid || normalizedUser.uid || preservedId)));
 
         result[existingIdx] = {
           ...existing,
           ...normalizedUser,
           id: preservedId,
-          customUserId: preservedId,
-          userNumber: preservedNum < 999999 ? preservedNum : undefined,
-          uid: (normalizedUser.uid && !normalizedUser.uid.startsWith('QK-USR-')) 
-            ? normalizedUser.uid 
-            : ((existing.uid && !existing.uid.startsWith('QK-USR-')) ? existing.uid : (existing.uid || normalizedUser.uid || preservedId))
+          customUserId: validUsrId || existingUsrId || existing.customUserId || normalizedUser.customUserId,
+          userNumber: preservedNum && preservedNum < 999999 ? preservedNum : undefined,
+          uid: canonicalUid,
+          createdAt: earlierCreatedAt,
+          registrationDate: normalizeRegistrationTimestamp(existing.registrationDate || normalizedUser.registrationDate || earlierCreatedAt)
         };
       } else {
         result.push(normalizedUser);
       }
     });
 
-    // Collect all existing assigned numbers so we never reassign an ID to another user
-    const usedNums = new Set<number>();
-    result.forEach((u) => {
-      const n = extractNumericUserNumber(u);
-      if (n >= 1001 && n < 999999) usedNums.add(n);
-    });
-
-    // Strictly ensure every user gets a unique customUserId (no duplicate QK-USR-1001)
     const finalUsers = result.map((u) => {
       const rawId = (u.customUserId || u.id || '').trim().toUpperCase();
       const validUsrId = /^(?:QK-)?USR-\d+$/i.test(rawId) ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`) : '';
-      
+
       if (validUsrId) {
         const num = u.userNumber || extractNumericUserNumber(u);
         return {
@@ -634,44 +689,111 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         };
       }
 
-      // Preserve existing user identifiers without fabricating new sequential IDs on display
       return {
         ...u,
         id: u.id || u.uid || '',
-        customUserId: u.customUserId || u.id || '',
+        customUserId: u.customUserId || '',
         uid: u.uid || u.id || ''
       };
     });
 
-    // Strictly sort registered users in ascending numeric userNumber order (1001, 1002, 1003...) with timestamp tie-breaker
+    // Strictly sort registered users by numeric sequential ID (1001, 1002, ...) then registration timestamp
     finalUsers.sort((a, b) => {
       const numA = extractNumericUserNumber(a);
       const numB = extractNumericUserNumber(b);
+      if (numA < 999999 && numB < 999999 && numA !== numB) return numA - numB;
+      const timeA = new Date(a.createdAt || a.registrationDate || 0).getTime();
+      const timeB = new Date(b.createdAt || b.registrationDate || 0).getTime();
+      if (Number.isFinite(timeA) && Number.isFinite(timeB) && timeA > 0 && timeB > 0 && timeA !== timeB) {
+        return timeA - timeB;
+      }
       if (numA !== numB) return numA - numB;
-      const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
-      const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
-      if (timeA !== timeB) return timeA - timeB;
       return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
     });
     return finalUsers;
   };
 
-  // Registered Users State (Real-Time Data Only - Zero Hardcoded/Dummy/Demo Users)
+  // Registered Users State (Authoritative Central Firestore Sync - Zero Dummy Users)
   const [registeredUsersList, setRegisteredUsersList] = useState<UserProfile[]>(() => {
     try {
       const raw =
         propRegisteredUsers && propRegisteredUsers.length > 0
           ? propRegisteredUsers
           : JSON.parse(localStorage.getItem('quizkart_registered_users') || '[]');
-      const cleaned = Array.isArray(raw) ? deduplicateRegisteredUsers(raw) : [];
-      localStorage.setItem('quizkart_registered_users', JSON.stringify(cleaned));
-      return cleaned;
+      return Array.isArray(raw) ? deduplicateRegisteredUsers(raw) : [];
     } catch {
       return [];
     }
   });
+  const [isUsersCloudAuthRequired, setIsUsersCloudAuthRequired] = useState<boolean>(false);
+  const [adminCloudAuthStatus, setAdminCloudAuthStatus] = useState<
+    'checking' | 'authorized' | 'unauthenticated' | 'unauthorized_account' | 'unverified_email' | 'permission_denied' | 'cancelled' | 'error'
+  >('checking');
+  const [adminCloudAuthError, setAdminCloudAuthError] = useState<string | null>(null);
+  const [isAuthorizingAdminGoogle, setIsAuthorizingAdminGoogle] = useState<boolean>(false);
+  const hasCloudUsersSnapshotRef = useRef<boolean>(false);
+  const attemptedBackfillUidsRef = useRef<Set<string>>(new Set());
 
-  // Automatically sync current active real userProfile and cloud users into registeredUsersList in real time
+  const ensureBackfillIdsAndCounter = async (cloudUsers: UserProfile[]) => {
+    if (!cloudUsers || cloudUsers.length === 0) return;
+
+    // 1. Keep settings/user_counter at least as high as the highest existing sequential QK-USR-XXXX ID
+    let maxExistingNum = 1000;
+    cloudUsers.forEach((u) => {
+      const n = extractNumericUserNumber(u);
+      if (n >= 1001 && n < 999999 && n > maxExistingNum) {
+        maxExistingNum = n;
+      }
+    });
+    if (maxExistingNum >= 1001) {
+      syncUserCounterMinimum(maxExistingNum).catch(() => {});
+    }
+
+    // 2. Backfill any existing registered user missing a valid sequential QK-USR-XXXX ID
+    const missingIdUsers = cloudUsers.filter((u) => {
+      if (!u || u.isDeleted || u.status === 'deleted') return false;
+      const rawId = (u.customUserId || u.id || '').trim();
+      const hasValidSeqId = /^(?:QK-)?USR-\d+$/i.test(rawId);
+      if (hasValidSeqId) return false;
+      const backfillKey = (u.uid || u.email || u.id || '').trim().toLowerCase();
+      return Boolean(backfillKey) && !attemptedBackfillUidsRef.current.has(backfillKey);
+    });
+
+    if (missingIdUsers.length === 0) return;
+
+    for (const target of missingIdUsers) {
+      const backfillKey = (target.uid || target.email || target.id || '').trim().toLowerCase();
+      if (!backfillKey || attemptedBackfillUidsRef.current.has(backfillKey)) continue;
+      attemptedBackfillUidsRef.current.add(backfillKey);
+      try {
+        const assigned = await assignSequentialUserIdViaTransaction(
+          target.uid || '',
+          target.email || ''
+        );
+        setRegisteredUsersList((prev) =>
+          deduplicateRegisteredUsers(
+            prev.map((item) => {
+              const sameUid = Boolean(target.uid && item.uid && item.uid === target.uid);
+              const sameEmail = Boolean(target.email && item.email && item.email.toLowerCase() === target.email.toLowerCase());
+              if (sameUid || sameEmail) {
+                return {
+                  ...item,
+                  id: assigned.customUserId,
+                  customUserId: assigned.customUserId,
+                  userNumber: assigned.userNumber
+                };
+              }
+              return item;
+            })
+          )
+        );
+      } catch {
+        // Non-fatal: admin may not have write access or user may be updated on next sync
+      }
+    }
+  };
+
+  // Reflect currently signed-in real userProfile safely without overriding authoritative Firestore IDs/timestamps
   useEffect(() => {
     if (!userProfile || userProfile.isDeleted || !userProfile.isRegistered || !userProfile.email || isDemoSeedUser(userProfile) || isDeletedAccountRecord(userProfile)) {
       if (userProfile?.isDeleted || isDeletedAccountRecord(userProfile)) {
@@ -682,13 +804,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     setRegisteredUsersList((prev) => {
       const list = [...prev];
       const targetEmail = (userProfile.email || '').trim().toLowerCase();
+      const targetUid = (userProfile.uid || '').trim();
 
-      const idx = targetEmail
-        ? list.findIndex((u) => (u?.email || '').trim().toLowerCase() === targetEmail)
-        : -1;
+      const idx = list.findIndex((u) =>
+        (targetUid && !targetUid.startsWith('QK-USR-') && u?.uid === targetUid) ||
+        (targetEmail && (u?.email || '').trim().toLowerCase() === targetEmail)
+      );
 
-      // Synchronize User ID with the user's active frontend website profile view
-      // If userProfile has an active sequential ID (e.g., QK-USR-1011), prioritize it over outdated cached list ID (e.g. QK-USR-1009)
       const activeProfileId = (userProfile.customUserId || userProfile.id || '').trim();
       const validProfileId = /^(?:QK-)?USR-\d+$/i.test(activeProfileId)
         ? (activeProfileId.startsWith('QK-') ? activeProfileId : `QK-${activeProfileId}`)
@@ -700,16 +822,23 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         ? (cachedListId.startsWith('QK-') ? cachedListId : `QK-${cachedListId}`)
         : '';
 
-      const canonicalId = validProfileId || validCachedId || userProfile.customUserId || userProfile.id || '';
+      const canonicalId = validCachedId || validProfileId || userProfile.customUserId || userProfile.id || '';
+      const resolvedCreatedAt =
+        (idx >= 0 ? list[idx].createdAt : undefined) ||
+        userProfile.createdAt ||
+        (userProfile.registrationDate && String(userProfile.registrationDate).includes('T') ? userProfile.registrationDate : undefined);
 
       const syncedActiveUser: UserProfile = {
         ...(idx >= 0 ? list[idx] : {}),
         ...userProfile,
         id: canonicalId || userProfile.id,
-        customUserId: canonicalId || userProfile.customUserId,
-        uid: userProfile.uid || (idx >= 0 ? list[idx].uid : (canonicalId || userProfile.id)),
+        customUserId: validCachedId || validProfileId || userProfile.customUserId,
+        uid: (idx >= 0 && list[idx].uid && !list[idx].uid!.startsWith('QK-USR-'))
+          ? list[idx].uid
+          : (userProfile.uid || canonicalId || userProfile.id),
+        createdAt: resolvedCreatedAt,
         registrationDate: normalizeRegistrationTimestamp(
-          userProfile.registrationDate || (idx >= 0 ? list[idx].registrationDate : undefined)
+          (idx >= 0 ? list[idx].registrationDate : undefined) || userProfile.registrationDate || resolvedCreatedAt
         ),
         passwordStatus: normalizePlainPassword(
           userProfile.passwordStatus || (idx >= 0 ? list[idx].passwordStatus : undefined)
@@ -723,17 +852,18 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       }
       const deduped = deduplicateRegisteredUsers(list);
       try {
-        localStorage.setItem('quizkart_registered_users', JSON.stringify(deduped));
+        if (!hasCloudUsersSnapshotRef.current) {
+          safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(deduped));
+        }
         const matchedFinal = deduped.find((u) => (u.email || '').trim().toLowerCase() === targetEmail);
-        // Only update if userProfile lacked a valid sequential ID and matchedFinal has one
         if (
-          matchedFinal && 
-          matchedFinal.id && 
-          userProfile.id !== matchedFinal.id && 
+          matchedFinal &&
+          matchedFinal.id &&
+          userProfile.id !== matchedFinal.id &&
           /^(?:QK-)?USR-\d+$/i.test(matchedFinal.id) &&
           !/^(?:QK-)?USR-\d+$/i.test(userProfile.id || '')
         ) {
-          localStorage.setItem('quizkart_user_profile', JSON.stringify({ ...userProfile, id: matchedFinal.id, customUserId: matchedFinal.id }));
+          safeSetLocalStorageJson('quizkart_user_profile', { ...userProfile, id: matchedFinal.id, customUserId: matchedFinal.id });
           onUpdateProfile?.({ ...userProfile, id: matchedFinal.id, customUserId: matchedFinal.id });
         }
       } catch {}
@@ -741,49 +871,121 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     });
   }, [userProfile]);
 
-  useEffect(() => {
-    // 1. Initial fetch from centralized Firebase Firestore collection
-    fetchAllUsersFromFirestore().then((cloudUsers) => {
-      if (cloudUsers && cloudUsers.length > 0) {
-        setRegisteredUsersList((prev) => {
-          const merged = deduplicateRegisteredUsers([...cloudUsers, ...prev]);
-          try {
-            localStorage.setItem('quizkart_registered_users', JSON.stringify(merged));
-          } catch {}
-          return merged;
-        });
-      }
-    }).catch(() => {});
-
-    // 2. Real-time Firebase Firestore listener for users registered across all devices/apps
-    const unsubscribeUsers = subscribeToAllUsersFromFirestore((cloudUsers) => {
-      if (cloudUsers && cloudUsers.length > 0) {
-        setRegisteredUsersList((prev) => {
-          const merged = deduplicateRegisteredUsers([...cloudUsers, ...prev]);
-          try {
-            localStorage.setItem('quizkart_registered_users', JSON.stringify(merged));
-          } catch {}
-          return merged;
-        });
-      }
-    });
-
-    // 3. Automatically sync any local registered users to Firestore if not yet uploaded
+  const handleAuthorizeAdminGoogleSync = async () => {
+    if (isAuthorizingAdminGoogle) return;
+    soundFx.playClick();
+    setIsAuthorizingAdminGoogle(true);
+    setAdminCloudAuthError(null);
     try {
-      const raw = localStorage.getItem('quizkart_registered_users');
-      if (raw) {
-        const localUsers: UserProfile[] = JSON.parse(raw);
-        if (Array.isArray(localUsers)) {
-          localUsers.forEach((lu) => {
-            if (lu && lu.email && lu.isRegistered && !isDemoSeedUser(lu)) {
-              syncUserProfile(lu).catch(() => {});
+      const result = await signInAdminWithGoogle();
+      if (result.status === 'authorized') {
+        hasCloudUsersSnapshotRef.current = true;
+        setAdminCloudAuthStatus('authorized');
+        const persistenceInfo = getAuthPersistenceStatus();
+        setAdminCloudAuthError(persistenceInfo.warning || null);
+        setIsUsersCloudAuthRequired(false);
+        const deduped = deduplicateRegisteredUsers(result.users || []);
+        setRegisteredUsersList(deduped);
+        safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(deduped));
+        ensureBackfillIdsAndCounter(deduped).catch(() => {});
+        setStatusMessage({
+          text: persistenceInfo.warning
+            ? `Admin Google Sync authorized (${result.user?.email || AUTHORIZED_ADMIN_EMAIL}). Note: ${persistenceInfo.warning}`
+            : `Admin Google Sync authorized (${result.user?.email || AUTHORIZED_ADMIN_EMAIL}).`,
+          type: persistenceInfo.warning ? 'info' : 'success'
+        });
+      } else {
+        setAdminCloudAuthStatus(result.status);
+        setAdminCloudAuthError(result.errorMessage || 'Google Admin authorization was not completed.');
+        setIsUsersCloudAuthRequired(true);
+      }
+    } catch (err: any) {
+      setAdminCloudAuthStatus('error');
+      setAdminCloudAuthError(err?.message || 'Unexpected error during Admin Google authorization.');
+      setIsUsersCloudAuthRequired(true);
+    } finally {
+      setIsAuthorizingAdminGoogle(false);
+    }
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    // 1. Wait for Firebase Auth IndexedDB/Session persistence + redirect recovery BEFORE querying Firestore users
+    verifyAdminSessionAndLoadUsers()
+      .then((result) => {
+        if (!isMounted) return;
+        if (result.status === 'authorized') {
+          hasCloudUsersSnapshotRef.current = true;
+          setAdminCloudAuthStatus('authorized');
+          const persistenceInfo = getAuthPersistenceStatus();
+          setAdminCloudAuthError(persistenceInfo.warning || null);
+          setIsUsersCloudAuthRequired(false);
+          const deduped = deduplicateRegisteredUsers(result.users || []);
+          setRegisteredUsersList(deduped);
+          safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(deduped));
+          ensureBackfillIdsAndCounter(deduped).catch(() => {});
+        } else {
+          setAdminCloudAuthStatus(result.status);
+          setAdminCloudAuthError(result.errorMessage || null);
+          setIsUsersCloudAuthRequired(true);
+          if (!hasCloudUsersSnapshotRef.current) {
+            setRegisteredUsersList([]);
+          }
+        }
+      })
+      .catch((err: any) => {
+        if (!isMounted) return;
+        setAdminCloudAuthStatus('error');
+        setAdminCloudAuthError(err?.message || 'Unable to verify Admin session with Firestore.');
+        setIsUsersCloudAuthRequired(true);
+      });
+
+    // 2. Real-time Firebase Firestore listener (auto-attaches strictly AFTER persistence + authStateReady)
+    const unsubscribeUsers = subscribeToAllUsersFromFirestore(
+      (cloudUsers) => {
+        if (!isMounted) return;
+        hasCloudUsersSnapshotRef.current = true;
+        setAdminCloudAuthStatus('authorized');
+        setAdminCloudAuthError(getAuthPersistenceStatus().warning || null);
+        setIsUsersCloudAuthRequired(false);
+        const deduped = deduplicateRegisteredUsers(cloudUsers || []);
+        setRegisteredUsersList(deduped);
+        safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(deduped));
+        ensureBackfillIdsAndCounter(deduped).catch(() => {});
+      },
+      (err) => {
+        if (!isMounted) return;
+        if (err.code === 'permission-denied') {
+          const currEmail = auth.currentUser?.email;
+          if (currEmail && currEmail.trim().toLowerCase() !== AUTHORIZED_ADMIN_EMAIL) {
+            setAdminCloudAuthStatus('unauthorized_account');
+            setAdminCloudAuthError(
+              `Signed in as ${currEmail}. Only ${AUTHORIZED_ADMIN_EMAIL} is authorized to view the central Registered Users list.`
+            );
+          } else if (currEmail && auth.currentUser && !auth.currentUser.emailVerified) {
+            setAdminCloudAuthStatus('unverified_email');
+            setAdminCloudAuthError(`Email ${currEmail} must be verified to sync central users.`);
+          } else {
+            setAdminCloudAuthStatus(currEmail ? 'permission_denied' : 'unauthenticated');
+            if (currEmail) {
+              setAdminCloudAuthError('Firestore security rules denied access for this session.');
             }
-          });
+          }
+          setIsUsersCloudAuthRequired(true);
+          if (!hasCloudUsersSnapshotRef.current) {
+            setRegisteredUsersList([]);
+          }
+        } else {
+          setAdminCloudAuthStatus('error');
+          setAdminCloudAuthError(err.message || 'Unable to connect to Google Sign-In. Please check your connection and try again.');
+          setIsUsersCloudAuthRequired(true);
         }
       }
-    } catch {}
+    );
 
     return () => {
+      isMounted = false;
       unsubscribeUsers();
     };
   }, []);
@@ -819,9 +1021,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     if (onUpdateRegisteredUsers) {
       onUpdateRegisteredUsers(updatedList);
     }
-    try {
-      localStorage.setItem('quizkart_registered_users', JSON.stringify(updatedList));
-    } catch {}
+    safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(updatedList));
 
     // 2. ONLY update active userProfile if the currently logged-in user matches the exact target UID or email
     const activeUid = userProfile?.uid || userProfile?.id;
@@ -1093,8 +1293,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     if (onUpdateBannerSlides) {
       onUpdateBannerSlides(validated);
     }
+    safeSetLocalStorageJson('quizkart_banner_slides', compactBannerSlidesForLocalCache(validated));
     try {
-      localStorage.setItem('quizkart_banner_slides', JSON.stringify(validated));
       window.dispatchEvent(new Event('storage'));
     } catch {}
     saveBannerSlidesToFirestore(validated).catch(() => {});
@@ -1116,8 +1316,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     if (onUpdateBannerSlides) {
       onUpdateBannerSlides(validated);
     }
+    safeSetLocalStorageJson('quizkart_banner_slides', compactBannerSlidesForLocalCache(validated));
     try {
-      localStorage.setItem('quizkart_banner_slides', JSON.stringify(validated));
       window.dispatchEvent(new Event('storage'));
     } catch {}
 
@@ -1142,8 +1342,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     if (onUpdateBannerSlides) {
       onUpdateBannerSlides(updated);
     }
+    safeSetLocalStorageJson('quizkart_banner_slides', compactBannerSlidesForLocalCache(updated));
     try {
-      localStorage.setItem('quizkart_banner_slides', JSON.stringify(updated));
       window.dispatchEvent(new Event('storage'));
     } catch {}
   };
@@ -1320,9 +1520,6 @@ RULES:
 
         await questionPoolManager.saveAllQuestions(updated);
         onUpdateQuestions(updated);
-        try {
-          localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
-        } catch {}
 
         const editedQ = updated.find(q => q && q.id === editingId);
         if (editedQ) {
@@ -1367,10 +1564,6 @@ RULES:
         const updated = [...validQuestions, newQ];
         await questionPoolManager.saveAllQuestions(updated);
         onUpdateQuestions(updated);
-        try {
-          localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
-          localStorage.setItem('quizkart_questions_initialized', 'true');
-        } catch {}
 
         saveQuestionToFirestore(newQ).catch(e => console.warn('Firestore question save error:', e));
 
@@ -1470,9 +1663,6 @@ RULES:
       const updated = (questions || []).filter(q => q && Number(q.id) !== numericId);
       onUpdateQuestions(updated);
       await questionPoolManager.saveAllQuestions(updated);
-      try {
-        localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
-      } catch {}
 
       // Permanently purge from Firestore so it NEVER reappears (Requirement 4)
       removeQuestionFromFirestore(numericId).catch(e => console.warn('Firestore question delete error:', e));
@@ -1520,9 +1710,6 @@ RULES:
       const updated = (questions || []).filter(q => q && !idsToDelete.includes(Number(q.id)));
       onUpdateQuestions(updated);
       await questionPoolManager.saveAllQuestions(updated);
-      try {
-        localStorage.setItem('quizkart_questions', JSON.stringify(updated.slice(0, 1000)));
-      } catch {}
 
       if (editingId !== null && idsToDelete.includes(editingId)) {
         handleCancelEdit();
@@ -1592,10 +1779,6 @@ RULES:
     const finalPool = allBlockQuestions;
     onUpdateQuestions(finalPool);
     await questionPoolManager.saveAllQuestions(finalPool);
-    try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(finalPool.slice(0, 1000)));
-      localStorage.setItem('quizkart_questions_initialized', 'true');
-    } catch {}
 
     // Guarantee Firestore permanence for all validated block questions
     try {
@@ -1700,10 +1883,6 @@ RULES:
     const finalPool = mode === 'replace' ? allBlockQuestions : [...validPool, ...allBlockQuestions];
     onUpdateQuestions(finalPool);
     await questionPoolManager.saveAllQuestions(finalPool);
-    try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(finalPool.slice(0, 1000)));
-      localStorage.setItem('quizkart_questions_initialized', 'true');
-    } catch {}
 
     soundFx.playCelebration();
     showToast(
@@ -1899,9 +2078,7 @@ RULES:
             (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
             cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
             const merged = Array.from(map.values());
-            try {
-              localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
-            } catch {}
+            safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
             return merged;
           });
         }
@@ -1916,9 +2093,7 @@ RULES:
             (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
             cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
             const merged = Array.from(map.values());
-            try {
-              localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
-            } catch {}
+            safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
             return merged;
           });
         }
@@ -1946,9 +2121,7 @@ RULES:
     if (onUpdateDeposits) {
       onUpdateDeposits(newDeposits);
     }
-    try {
-      localStorage.setItem('quizkart_admin_deposits', JSON.stringify(newDeposits));
-    } catch {}
+    safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(newDeposits));
   };
 
   const handleCancelDeposit = (id: string) => {
@@ -2063,7 +2236,7 @@ RULES:
             }
             return u;
           });
-          localStorage.setItem('quizkart_registered_users', JSON.stringify(updatedUsers));
+          safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(updatedUsers));
         }
       }
     } catch {}
@@ -2213,39 +2386,110 @@ RULES:
       }
     })();
     const map = new Map<string, WithdrawalRequest>();
-    (raw || []).forEach((w, idx) => {
+    (raw || []).forEach((w) => {
       if (w && w.id) {
-        const normId = formatWithdrawalId(w.id, idx + 1);
-        if (!map.has(normId)) {
-          map.set(normId, {
+        if (!map.has(w.id)) {
+          map.set(w.id, {
             ...w,
-            id: normId,
+            id: w.id,
             timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
           });
         }
       }
     });
-    return Array.from(map.values());
+    return Array.from(map.values()).sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
   });
 
   useEffect(() => {
-    if (propWithdrawals) {
+    if (!propWithdrawals) return;
+    const deletedWithdrawals = getDeletedWithdrawalIds();
+    setWithdrawalsList((prev) => {
       const map = new Map<string, WithdrawalRequest>();
-      propWithdrawals.forEach((w, idx) => {
-        if (w && w.id) {
-          const normId = formatWithdrawalId(w.id, idx + 1);
-          if (!map.has(normId)) {
-            map.set(normId, {
-              ...w,
-              id: normId,
-              timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-            });
-          }
+      const mergeIntoMap = (w: WithdrawalRequest, preferNew: boolean) => {
+        if (!w || !w.id) return;
+        const normId = formatWithdrawalId(w.id);
+        const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+        if (isDeletedResolved) return;
+        const existing = map.get(w.id);
+        const normalizedItem: WithdrawalRequest = {
+          ...w,
+          id: w.id,
+          timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+        };
+        if (!existing) {
+          map.set(w.id, normalizedItem);
+          return;
         }
+        if (preferNew) {
+          const resolvedStatus = (existing.status && existing.status !== 'pending' && normalizedItem.status === 'pending')
+            ? existing.status
+            : (normalizedItem.status || existing.status || 'pending');
+          map.set(w.id, { ...existing, ...normalizedItem, status: resolvedStatus });
+        }
+      };
+      (prev || []).forEach((w) => mergeIntoMap(w, false));
+      propWithdrawals.forEach((w) => mergeIntoMap(w, true));
+      return Array.from(map.values()).sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+        return timeB - timeA;
       });
-      setWithdrawalsList(Array.from(map.values()));
-    }
+    });
   }, [propWithdrawals]);
+
+  useEffect(() => {
+    const mergeCloudWithdrawals = (cloudWithdrawals: WithdrawalRequest[]) => {
+      if (!cloudWithdrawals || cloudWithdrawals.length === 0) return;
+      const deletedWithdrawals = getDeletedWithdrawalIds();
+      setWithdrawalsList((prev) => {
+        const map = new Map<string, WithdrawalRequest>();
+        cloudWithdrawals.forEach((w) => {
+          if (w && w.id) {
+            const normId = formatWithdrawalId(w.id);
+            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+            if (!isDeletedResolved) {
+              map.set(w.id, {
+                ...w,
+                id: w.id,
+                timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+              });
+            }
+          }
+        });
+        prev.forEach((w) => {
+          if (w && w.id) {
+            const normId = formatWithdrawalId(w.id);
+            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+            if (!isDeletedResolved && !map.has(w.id)) {
+              map.set(w.id, {
+                ...w,
+                id: w.id,
+                timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+              });
+            }
+          }
+        });
+        const merged = Array.from(map.values()).sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+          const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+          return timeB - timeA;
+        });
+        try {
+          localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(merged));
+        } catch {}
+        return merged;
+      });
+    };
+
+    // Single authoritative mount refresh; real-time updates flow via App.tsx's single listener
+    fetchWithdrawalsFromFirestore().then(mergeCloudWithdrawals).catch(() => {});
+  }, []);
+
+  const processingWithdrawalIdsRef = useRef<Set<string>>(new Set());
 
   const saveWithdrawals = (newWithdrawals: WithdrawalRequest[]) => {
     setWithdrawalsList(newWithdrawals);
@@ -2257,132 +2501,253 @@ RULES:
     } catch {}
   };
 
-  const handleApproveWithdrawal = (id: string) => {
-    const wth = (withdrawalsList || []).find(w => w && w.id === id);
-    if (!wth) return;
-    const updated = (withdrawalsList || []).map(w => w && w.id === id ? { ...w, status: 'approved' as const } : w);
-    saveWithdrawals(updated);
-
-    // Update status in user permanent audit log
-    try {
-      const permWithdrawals = localStorage.getItem('quizkart_user_withdrawals_permanent');
-      const list: WithdrawalRequest[] = permWithdrawals ? JSON.parse(permWithdrawals) : [];
-      let found = false;
-      const updatedPerm = list.map((item: any) => {
-        if (item && (item.id === id || formatWithdrawalId(item.id) === formatWithdrawalId(id))) {
-          found = true;
-          return { ...item, status: 'approved' };
+  const syncUserWithdrawalPermanentLogs = (
+    targetEmail: string,
+    id: string,
+    normTargetId: string,
+    wth: WithdrawalRequest,
+    patch: Partial<WithdrawalRequest>
+  ) => {
+    const syncPermLog = (storageKey: string) => {
+      try {
+        const permWithdrawals = localStorage.getItem(storageKey);
+        const list: WithdrawalRequest[] = permWithdrawals ? JSON.parse(permWithdrawals) : [];
+        let found = false;
+        const updatedPerm = (Array.isArray(list) ? list : []).map((item: any) => {
+          if (item && (item.id === id || item.id === wth.id || formatWithdrawalId(item.id) === normTargetId)) {
+            found = true;
+            return { ...item, ...patch };
+          }
+          return item;
+        });
+        if (!found && wth) {
+          updatedPerm.unshift({ ...wth, ...patch });
         }
-        return item;
-      });
-      if (!found && wth) {
-        updatedPerm.unshift({ ...wth, status: 'approved' });
-      }
-      localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify(updatedPerm));
-    } catch {}
-
-    // Lift user pending screen lock
-    try {
-      const activePending = localStorage.getItem('quizkart_active_pending_withdrawal_id');
-      if (activePending && (activePending === id || formatWithdrawalId(activePending) === formatWithdrawalId(id))) {
-        localStorage.removeItem('quizkart_active_pending_withdrawal_id');
-      }
-    } catch {}
-
-    // Instantly notify front-end views to unlock
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id, status: 'approved' } }));
-    }
-
-    updateWithdrawalStatusInFirestore(id, 'approved').catch(() => {});
-    soundFx.playSuccess();
-    showToast(`Withdrawal #${formatWithdrawalId(id)} approved! Payout of ₹${wth.amount} marked as transferred.`);
+        localStorage.setItem(storageKey, JSON.stringify(updatedPerm));
+      } catch {}
+    };
+    syncPermLog('quizkart_user_withdrawals_permanent');
+    if (targetEmail) syncPermLog(`quizkart_user_withdrawals_permanent_${targetEmail}`);
   };
 
-  const handleRejectWithdrawal = (id: string, reason: 'rejected' | 'cancelled' = 'rejected') => {
-    const wth = (withdrawalsList || []).find(w => w && w.id === id);
+  const handleApproveWithdrawal = async (id: string) => {
+    const normTargetId = formatWithdrawalId(id);
+    const lockKey = id || normTargetId;
+    if (processingWithdrawalIdsRef.current.has(lockKey) || processingWithdrawalIdsRef.current.has(normTargetId)) return;
+    const wth = (withdrawalsList || []).find(w => w && (w.id === id || formatWithdrawalId(w.id) === normTargetId));
     if (!wth) return;
-    const updated = (withdrawalsList || []).map(w => w && w.id === id ? { ...w, status: reason } : w);
+
+    // Strict Idempotency Guard: prevent duplicate approval or altering already completed withdrawals
+    if (wth.status === 'approved' || wth.status === 'rejected' || wth.status === 'cancelled') {
+      soundFx.playWrong();
+      showToast(`Withdrawal #${normTargetId} is already ${wth.status}.`, 'info');
+      return;
+    }
+
+    processingWithdrawalIdsRef.current.add(lockKey);
+    processingWithdrawalIdsRef.current.add(normTargetId);
+
+    const nowIso = new Date().toISOString();
+    const targetEmail = (wth.userEmail || wth.email || '').trim().toLowerCase();
+
+    // Optimistic UI update while authoritative Firestore transaction executes
+    const updated = (withdrawalsList || []).map(w =>
+      w && (w.id === id || w.id === wth.id) ? { ...w, status: 'approved' as const, updatedAt: nowIso } : w
+    );
     saveWithdrawals(updated);
 
-    // CRITICAL AUTOMATIC REFUND SYSTEM:
-    // If Admin clicks Reject or Cancel, the full withdrawal amount MUST be automatically credited back strictly to the matching user's wallet balance by Email
-    const targetEmail = (wth.userEmail || wth.email || '').trim().toLowerCase();
-    const refundAmt = Number(wth.amount) || 0;
     try {
-      const rawUsers = localStorage.getItem('quizkart_registered_users');
-      if (rawUsers && targetEmail && refundAmt > 0) {
-        const parsedUsers: UserProfile[] = JSON.parse(rawUsers);
-        if (Array.isArray(parsedUsers)) {
-          const updatedUsers = parsedUsers.map((u) => {
-            if (u && (u.email || '').trim().toLowerCase() === targetEmail) {
-              return { ...u, walletBalance: (Number(u.walletBalance) || 0) + refundAmt };
-            }
-            return u;
-          });
-          localStorage.setItem('quizkart_registered_users', JSON.stringify(updatedUsers));
-        }
-      }
-    } catch {}
-
-    let targetProfile = userProfile;
-    try {
-      const savedProfileStr = localStorage.getItem('quizkart_user_profile');
-      if (savedProfileStr) {
-        targetProfile = JSON.parse(savedProfileStr);
-      }
-    } catch {}
-
-    const activeProfileEmail = (targetProfile?.email || '').trim().toLowerCase();
-    if (refundAmt > 0 && targetProfile && targetEmail && activeProfileEmail === targetEmail) {
-      const refundedBalance = (Number(targetProfile.walletBalance) || 0) + refundAmt;
-      const updatedProfile: UserProfile = {
-        ...targetProfile,
-        walletBalance: refundedBalance
-      };
-      if (onUpdateProfile) {
-        onUpdateProfile(updatedProfile);
-      }
-      try {
-        localStorage.setItem('quizkart_user_profile', JSON.stringify(updatedProfile));
-      } catch {}
-      syncUserProfile(updatedProfile).catch(() => {});
-    }
-
-    // Also update status in user permanent audit log (never deleted)
-    try {
-      const permWithdrawals = localStorage.getItem('quizkart_user_withdrawals_permanent');
-      const list: WithdrawalRequest[] = permWithdrawals ? JSON.parse(permWithdrawals) : [];
-      let found = false;
-      const updatedPerm = list.map((item: any) => {
-        if (item && (item.id === id || formatWithdrawalId(item.id) === formatWithdrawalId(id))) {
-          found = true;
-          return { ...item, status: reason };
-        }
-        return item;
+      const txRes = await processWithdrawalStatusTransaction(wth.id || id, 'approved', {
+        ownerUid: wth.ownerUid || wth.userId,
+        userEmail: targetEmail,
+        amount: wth.amount,
+        firestoreDocId: wth.firestoreDocId
       });
-      if (!found && wth) {
-        updatedPerm.unshift({ ...wth, status: reason });
-      }
-      localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify(updatedPerm));
-    } catch {}
 
-    // Lift user pending screen lock
-    try {
-      const activePending = localStorage.getItem('quizkart_active_pending_withdrawal_id');
-      if (activePending && (activePending === id || formatWithdrawalId(activePending) === formatWithdrawalId(id))) {
-        localStorage.removeItem('quizkart_active_pending_withdrawal_id');
+      if (!txRes.success) {
+        // Revert optimistic update cleanly if Firestore update failed
+        const reverted = (withdrawalsList || []).map(w =>
+          w && (w.id === id || w.id === wth.id) ? { ...w, status: wth.status } : w
+        );
+        saveWithdrawals(reverted);
+        soundFx.playWrong();
+        showToast(txRes.error || `Failed to approve withdrawal #${normTargetId} in Firestore. Please retry.`, 'info');
+        return;
       }
-    } catch {}
 
-    // Instantly notify front-end views to unlock
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id, status: reason } }));
+      const finalStatus = (txRes.resolvedStatus || 'approved') as WithdrawalRequest['status'];
+      const syncedList = (withdrawalsList || []).map(w =>
+        w && (w.id === id || w.id === wth.id) ? { ...w, status: finalStatus, updatedAt: nowIso } : w
+      );
+      saveWithdrawals(syncedList);
+      syncUserWithdrawalPermanentLogs(targetEmail, id, normTargetId, wth, { status: finalStatus, updatedAt: nowIso });
+
+      if (txRes.alreadyResolved) {
+        soundFx.playWrong();
+        showToast(`Withdrawal #${normTargetId} was already ${finalStatus} in Firestore.`, 'info');
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+        }
+        return;
+      }
+
+      // Lift user pending screen lock
+      try {
+        const activePending = localStorage.getItem('quizkart_active_pending_withdrawal_id');
+        if (activePending && (activePending === id || activePending === wth.id || formatWithdrawalId(activePending) === normTargetId)) {
+          localStorage.removeItem('quizkart_active_pending_withdrawal_id');
+        }
+      } catch {}
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id: normTargetId, status: 'approved' } }));
+      }
+
+      soundFx.playSuccess();
+      showToast(`Withdrawal #${normTargetId} approved! Payout of ₹${wth.amount} marked as transferred.`);
+    } finally {
+      processingWithdrawalIdsRef.current.delete(lockKey);
+      processingWithdrawalIdsRef.current.delete(normTargetId);
+    }
+  };
+
+  const handleRejectWithdrawal = async (id: string, reason: 'rejected' | 'cancelled' = 'rejected') => {
+    const normTargetId = formatWithdrawalId(id);
+    const lockKey = id || normTargetId;
+    if (processingWithdrawalIdsRef.current.has(lockKey) || processingWithdrawalIdsRef.current.has(normTargetId)) return;
+    const wth = (withdrawalsList || []).find(w => w && (w.id === id || formatWithdrawalId(w.id) === normTargetId));
+    if (!wth) return;
+
+    // Strict Idempotency Guard: prevent duplicate rejection/cancellation refunds or altering terminal status
+    if (wth.status === 'rejected' || wth.status === 'cancelled' || wth.status === 'approved' || wth.walletRefunded) {
+      soundFx.playWrong();
+      showToast(`Withdrawal #${normTargetId} is already ${wth.status}.`, 'info');
+      return;
     }
 
-    updateWithdrawalStatusInFirestore(id, reason).catch(() => {});
-    soundFx.playWrong();
-    showToast(`Withdrawal #${formatWithdrawalId(id)} ${reason === 'cancelled' ? 'cancelled' : 'rejected'} and ₹${wth.amount} refunded to wallet.`, 'info');
+    processingWithdrawalIdsRef.current.add(lockKey);
+    processingWithdrawalIdsRef.current.add(normTargetId);
+
+    const nowIso = new Date().toISOString();
+    const targetEmail = (wth.userEmail || wth.email || '').trim().toLowerCase();
+    const refundAmt = wth.walletDeducted !== false ? (Number(wth.walletDeductedAmount ?? wth.amount) || 0) : 0;
+
+    // Optimistic UI status update (balance cache updates ONLY after Firestore confirms!)
+    const updated = (withdrawalsList || []).map(w =>
+      w && (w.id === id || w.id === wth.id)
+        ? { ...w, status: reason, updatedAt: nowIso }
+        : w
+    );
+    saveWithdrawals(updated);
+
+    try {
+      // Authoritative atomic Firestore transaction (updates status + refunds matching user wallet exactly once)
+      const txRes = await processWithdrawalStatusTransaction(wth.id || id, reason, {
+        ownerUid: wth.ownerUid || wth.userId,
+        userEmail: targetEmail,
+        amount: refundAmt,
+        firestoreDocId: wth.firestoreDocId
+      });
+
+      if (!txRes.success) {
+        // Revert optimistic status cleanly if Firestore transaction failed
+        const reverted = (withdrawalsList || []).map(w =>
+          w && (w.id === id || w.id === wth.id) ? { ...w, status: wth.status } : w
+        );
+        saveWithdrawals(reverted);
+        soundFx.playWrong();
+        showToast(txRes.error || `Failed to ${reason} withdrawal #${normTargetId} in Firestore. Please retry.`, 'info');
+        return;
+      }
+
+      const finalStatus = (txRes.resolvedStatus || reason) as WithdrawalRequest['status'];
+      const confirmedList = (withdrawalsList || []).map(w =>
+        w && (w.id === id || w.id === wth.id)
+          ? {
+              ...w,
+              status: finalStatus,
+              walletRefunded: txRes.refunded || finalStatus === 'rejected' || finalStatus === 'cancelled' ? true : w.walletRefunded,
+              updatedAt: nowIso
+            }
+          : w
+      );
+      saveWithdrawals(confirmedList);
+      syncUserWithdrawalPermanentLogs(targetEmail, id, normTargetId, wth, {
+        status: finalStatus,
+        walletRefunded: finalStatus === 'rejected' || finalStatus === 'cancelled',
+        updatedAt: nowIso
+      });
+
+      if (txRes.alreadyResolved) {
+        soundFx.playWrong();
+        showToast(`Withdrawal #${normTargetId} was already ${finalStatus} in Firestore.`, 'info');
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+        }
+        return;
+      }
+
+      // Sync single refund into local user profile / registered users caches ONLY when Firestore refunded once
+      if (txRes.refunded && targetEmail) {
+        const syncedIso = new Date().toISOString();
+        let targetProfile = userProfile;
+        try {
+          const savedProfileStr = localStorage.getItem('quizkart_user_profile');
+          if (savedProfileStr) {
+            targetProfile = JSON.parse(savedProfileStr);
+          }
+        } catch {}
+        const activeProfileEmail = (targetProfile?.email || '').trim().toLowerCase();
+
+        try {
+          const rawUsers = localStorage.getItem('quizkart_registered_users');
+          if (rawUsers) {
+            const parsedUsers: UserProfile[] = JSON.parse(rawUsers);
+            if (Array.isArray(parsedUsers)) {
+              const updatedUsers = parsedUsers.map((u) => {
+                if (u && (u.email || '').trim().toLowerCase() === targetEmail) {
+                  const nextBal = txRes.newWalletBalance !== undefined
+                    ? txRes.newWalletBalance
+                    : (Number(u.walletBalance) || 0) + refundAmt;
+                  return { ...u, walletBalance: nextBal, updatedAt: syncedIso };
+                }
+                return u;
+              });
+              safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(updatedUsers));
+            }
+          }
+
+          if (activeProfileEmail === targetEmail && targetProfile) {
+            const nextBal = txRes.newWalletBalance !== undefined
+              ? txRes.newWalletBalance
+              : (Number(targetProfile.walletBalance) || 0) + refundAmt;
+            const synced = { ...targetProfile, walletBalance: nextBal, updatedAt: syncedIso };
+            localStorage.setItem('quizkart_user_profile', JSON.stringify(synced));
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('quizkart_profile_updated', { detail: synced }));
+            }
+          }
+        } catch {}
+      }
+
+      // Lift user pending screen lock
+      try {
+        const activePending = localStorage.getItem('quizkart_active_pending_withdrawal_id');
+        if (activePending && (activePending === id || activePending === wth.id || formatWithdrawalId(activePending) === normTargetId)) {
+          localStorage.removeItem('quizkart_active_pending_withdrawal_id');
+        }
+      } catch {}
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+      }
+
+      soundFx.playWrong();
+      showToast(`Withdrawal #${normTargetId} ${reason === 'cancelled' ? 'cancelled' : 'rejected'} and ₹${wth.amount} refunded to wallet.`, 'info');
+    } finally {
+      processingWithdrawalIdsRef.current.delete(lockKey);
+      processingWithdrawalIdsRef.current.delete(normTargetId);
+    }
   };
 
   const handleDeleteWithdrawal = (id: string) => {
@@ -2415,7 +2780,7 @@ RULES:
       window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id, action: 'deleted' } }));
     }
 
-    deleteWithdrawalFromFirestore(id).catch(() => {});
+    deleteWithdrawalFromFirestore(target?.firestoreDocId || id).catch(() => {});
     soundFx.playClick();
     showToast('Withdrawal record cleared from Admin ledger.');
   };
@@ -2459,7 +2824,8 @@ RULES:
     }
 
     allowedIds.forEach(id => {
-      deleteWithdrawalFromFirestore(id).catch(() => {});
+      const target = (withdrawalsList || []).find(w => w && w.id === id);
+      deleteWithdrawalFromFirestore(target?.firestoreDocId || id).catch(() => {});
     });
     soundFx.playClick();
     showToast(`Removed ${count} withdrawal record${count > 1 ? 's' : ''} from Admin ledger.`);
@@ -2720,8 +3086,11 @@ RULES:
     soundFx.playClick();
     setTimeout(() => {
       try {
-        const qSaved = localStorage.getItem('quizkart_questions');
-        if (qSaved) onUpdateQuestions(JSON.parse(qSaved));
+        questionPoolManager.loadAllQuestions([]).then((loaded) => {
+          if (Array.isArray(loaded) && loaded.length > 0) {
+            onUpdateQuestions(loaded);
+          }
+        }).catch(() => {});
         const pSaved = localStorage.getItem('quizkart_today_prize');
         if (pSaved) onUpdatePrize(JSON.parse(pSaved));
         const lSaved = localStorage.getItem('quizkart_leaderboard');
@@ -2737,9 +3106,7 @@ RULES:
               (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
               cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
               const merged = Array.from(map.values());
-              try {
-                localStorage.setItem('quizkart_admin_deposits', JSON.stringify(merged));
-              } catch {}
+              safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
               return merged;
             });
           }
@@ -3418,7 +3785,7 @@ RULES:
               const maxTodayStr = todayLocalStr > todayIsoStr ? todayLocalStr : todayIsoStr;
 
               const filteredRealUsers = registeredUsersList.filter((u, idx) => {
-                if (!u || u.isDeleted || isDemoSeedUser(u) || isDeletedAccountRecord(u)) return false;
+                if (!u || u.isDeleted || isDemoSeedUser(u) || isConfirmedFakeDisplayUser(u) || isDeletedAccountRecord(u)) return false;
                 const regDateOnly = normalizeRegistrationTimestamp(u.registrationDate);
 
                 if (userDatePreset === 'today') {
@@ -3459,10 +3826,13 @@ RULES:
               }).sort((a, b) => {
                 const numA = extractNumericUserNumber(a);
                 const numB = extractNumericUserNumber(b);
+                if (numA < 999999 && numB < 999999 && numA !== numB) return numA - numB;
+                const timeA = new Date(a.createdAt || a.registrationDate || 0).getTime();
+                const timeB = new Date(b.createdAt || b.registrationDate || 0).getTime();
+                if (Number.isFinite(timeA) && Number.isFinite(timeB) && timeA > 0 && timeB > 0 && timeA !== timeB) {
+                  return timeA - timeB;
+                }
                 if (numA !== numB) return numA - numB;
-                const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
-                const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
-                if (timeA !== timeB) return timeA - timeB;
                 return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
               });
 
@@ -3477,6 +3847,69 @@ RULES:
 
               return (
                 <>
+                  {isUsersCloudAuthRequired && adminCloudAuthStatus !== 'checking' && (
+                    <div
+                      id="admin-users-cloud-auth-banner"
+                      className={`rounded-2xl border p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                        adminCloudAuthError
+                          ? 'border-rose-200 bg-rose-50/70'
+                          : 'border-indigo-200 bg-indigo-50/70'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <div
+                          className="w-9 h-9 rounded-xl text-white flex items-center justify-center shrink-0"
+                          style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                        >
+                          <ShieldCheck className="w-4 h-4" />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs font-black text-slate-900">
+                            {adminCloudAuthStatus === 'unauthorized_account'
+                              ? 'Unauthorized Google Account Signed In'
+                              : adminCloudAuthStatus === 'permission_denied'
+                              ? 'Firestore Permission Check Failed'
+                              : adminCloudAuthStatus === 'error'
+                              ? 'Admin Sign-In Error'
+                              : 'Admin Verification Required'}
+                          </div>
+                          {adminCloudAuthError || adminCloudAuthStatus === 'error' ? (
+                            <p className="text-[11px] font-semibold text-rose-700">
+                              {adminCloudAuthError || 'Unable to connect to Google Sign-In. Please check your connection and try again.'}
+                            </p>
+                          ) : (
+                            <p className="text-[11px] font-medium text-slate-600">
+                              Sign in with your authorized Google account to securely access live registered users.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isAuthorizingAdminGoogle}
+                        onClick={handleAuthorizeAdminGoogleSync}
+                        className="px-4 py-2 rounded-xl text-xs font-bold text-white shadow-sm hover:opacity-95 cursor-pointer shrink-0 inline-flex items-center gap-1.5 disabled:opacity-60"
+                        style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                      >
+                        {isAuthorizingAdminGoogle && (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        )}
+                        <span>
+                          {adminCloudAuthStatus === 'unauthorized_account'
+                            ? 'Switch to Admin Account'
+                            : 'Authorize Google Sync'}
+                        </span>
+                      </button>
+                    </div>
+                  )}
+
+                  {!isUsersCloudAuthRequired && adminCloudAuthStatus === 'authorized' && adminCloudAuthError && (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50/70 px-3.5 py-2.5 text-[11px] font-semibold text-amber-800 flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                      <span>{adminCloudAuthError}</span>
+                    </div>
+                  )}
+
                   <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
                     <table className="w-full text-left text-xs border-collapse bg-white" style={{ backgroundColor: '#FFFFFF' }}>
                       <thead className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
@@ -3494,17 +3927,19 @@ RULES:
                         {filteredRealUsers.length === 0 ? (
                           <tr className="bg-white" style={{ backgroundColor: '#FFFFFF' }}>
                             <td colSpan={7} className="py-6 px-4 text-center text-xs font-medium text-slate-400 bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                              No registered users found.
+                              {isUsersCloudAuthRequired
+                                ? 'Authorize Admin Google Sync above to view central Firestore users.'
+                                : 'No registered users found.'}
                             </td>
                           </tr>
                         ) : (
                           paginatedRealUsers.map((u, pIdx) => {
-                            const globalIdx = (safeUserPage - 1) * USER_PAGE_SIZE + pIdx;
                             const isActiveCurrentUser = isUserSessionActive(u);
                             const cleanPasswordText = normalizePlainPassword(u.passwordStatus);
-                            const dateOnlyRegTimestamp = normalizeRegistrationTimestamp(u.registrationDate);
+                            const dateOnlyRegTimestamp = normalizeRegistrationTimestamp(u.createdAt || u.registrationDate);
+                            const regTimeText = formatRegistrationTime(u.createdAt, u.registrationDate);
                             const userNum = extractNumericUserNumber(u);
-                            const sequentialRegId = u.customUserId || u.id || (userNum < 999999 ? `QK-USR-${userNum}` : (u.uid ? `USR-${u.uid.slice(0, 8)}` : ''));
+                            const sequentialRegId = u.customUserId || (userNum < 999999 ? `QK-USR-${userNum}` : (u.id || (u.uid ? `USR-${u.uid.slice(0, 8)}` : '—')));
                             const primaryKey = (u.uid && u.uid.trim()) ? u.uid.trim() : (u.customUserId || u.id || `usr-${userNum}`);
                             const stableRowKey = usedRowKeys.has(primaryKey) ? `${primaryKey}-${pIdx}` : primaryKey;
                             usedRowKeys.add(stableRowKey);
@@ -3530,7 +3965,7 @@ RULES:
                                     </div>
                                     <div className="leading-tight">
                                       <div className="font-semibold text-slate-900 text-xs flex items-center gap-1.5">
-                                        <span>{u.name}</span>
+                                        <span>{u.name || '—'}</span>
                                         {isActiveCurrentUser && !u.isBlocked && (
                                           <span
                                             className="px-1.5 py-0.5 rounded text-white text-[9px] font-black uppercase tracking-wide inline-flex items-center gap-1"
@@ -3553,14 +3988,14 @@ RULES:
                                   </div>
                                 </td>
 
-                                {/* Mobile Number (Sleek & Concise) */}
+                                {/* Mobile Number (Real Firestore Data Only) */}
                                 <td className="py-2.5 px-3.5 font-mono text-xs font-medium text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                                  {u.countryCode || '+91'} {u.mobile || '9876543210'}
+                                  {u.mobile && u.mobile.trim() ? `${u.countryCode || '+91'} ${u.mobile.trim()}` : '—'}
                                 </td>
 
-                                {/* Email Address */}
+                                {/* Email Address (Real Firestore Data Only) */}
                                 <td className="py-2.5 px-3.5 text-xs font-normal text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                                  {u.email || 'player@quizkart.in'}
+                                  {u.email && u.email.trim() ? u.email.trim() : '—'}
                                 </td>
 
                                 {/* Password Status */}
@@ -3568,9 +4003,10 @@ RULES:
                                   {cleanPasswordText}
                                 </td>
 
-                                {/* Registration Date */}
+                                {/* Registration Date & Time */}
                                 <td className="py-2.5 px-3.5 font-mono text-xs text-slate-700 whitespace-nowrap bg-white" style={{ backgroundColor: '#FFFFFF' }}>
-                                  {dateOnlyRegTimestamp}
+                                  <div>{dateOnlyRegTimestamp}</div>
+                                  <div className="text-[10px] text-slate-400">{regTimeText}</div>
                                 </td>
 
                                 {/* Wallet Balance */}

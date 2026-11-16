@@ -328,6 +328,11 @@ export interface WithdrawalRequest {
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   referenceId?: string;
   updatedAt?: string;
+  walletDeducted?: boolean;
+  walletDeductedAmount?: number;
+  walletRefunded?: boolean;
+  firestoreDocId?: string;
+  adminHidden?: boolean;
 }
 
 export interface ChatMessage {

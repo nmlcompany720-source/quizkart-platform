@@ -50,6 +50,7 @@ import { saveContestToFirestore, removeContestFromFirestore } from '../firebase'
 import { getCountdown, parseTargetTimestamp, formatCountdown } from '../utils/timerUtils';
 import { compressImage, sanitizeContestSynchronous, isGifImage } from '../utils/imageCompressor';
 import { calculateDynamicWinnerSlots } from '../utils/poolUtils';
+import { questionPoolManager } from '../utils/questionPoolManager';
 
 // Real-time Ticking Timer sub-component for Active & Scheduled Contest Cards
 const ContestCardTimers: React.FC<{ scheduledTime?: string; endTime?: string }> = ({ scheduledTime, endTime }) => {
@@ -607,9 +608,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const remainingQuestions = questions.filter(q => q && q.id != null && !selectedIdsSet.has(q.id));
 
     onUpdateQuestions?.(remainingQuestions);
-    try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(remainingQuestions));
-    } catch {}
+    questionPoolManager.saveAllQuestions(remainingQuestions).catch(() => {});
 
     // Instant UI Update: Create and push a new active contest into the live contest state / LocalStorage
     const newContestId = `CNT-LIVE-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;

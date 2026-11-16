@@ -1,18 +1,18 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import { 
   ArrowLeft, 
   Landmark, 
   Clock, 
   AlertCircle, 
+  AlertTriangle,
   CheckCircle2, 
   Loader2,
   Eye,
   EyeOff
 } from 'lucide-react';
-import { WithdrawalRequest, UserProfile } from '../types';
+import { WithdrawalRequest, UserProfile, QuizAttemptResult } from '../types';
 import { soundFx } from '../utils/audio';
 import { getCurrentFormattedTimestamp, getNextWithdrawalId, formatWithdrawalId, getDeletedWithdrawalIds } from '../utils/depositUtils';
-import { saveWithdrawalToFirestore } from '../firebase';
 import { contestBackend } from '../backend/contestEngine';
 
 interface WithdrawalPageProps {
@@ -20,6 +20,7 @@ interface WithdrawalPageProps {
   onUpdateProfile: (profile: UserProfile) => void;
   onSubmitWithdrawal: (withdrawal: WithdrawalRequest) => void;
   existingWithdrawals?: WithdrawalRequest[];
+  quizAttempts?: QuizAttemptResult[];
   onBackToProfile: () => void;
   onOpenHistory: () => void;
 }
@@ -31,6 +32,7 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
   onUpdateProfile,
   onSubmitWithdrawal,
   existingWithdrawals = [],
+  quizAttempts = [],
   onBackToProfile,
   onOpenHistory
 }) => {
@@ -45,15 +47,21 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       userProfile.uid || userProfile.id || '',
       userProfile.email,
       existingWithdrawals,
-      userProfile.totalWonAmount
+      userProfile.totalWonAmount,
+      userProfile.walletBalance,
+      quizAttempts
     );
-    if (info.withdrawableBalance > 0 && info.withdrawableBalance < 100) {
+    if (info.withdrawableBalance >= 10 && info.withdrawableBalance < 100) {
       return info.withdrawableBalance;
+    }
+    if (info.withdrawableBalance > 0 && info.withdrawableBalance < 10) {
+      return 10;
     }
     return 100;
   });
   const [errorMsg, setErrorMsg] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [showAccountNumber, setShowAccountNumber] = useState(false);
   const [showConfirmAccountNumber, setShowConfirmAccountNumber] = useState(false);
@@ -70,13 +78,20 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       userProfile.uid || userProfile.id || '',
       userProfile.email,
       existingWithdrawals,
-      userProfile.totalWonAmount
+      userProfile.totalWonAmount,
+      walletBalance,
+      quizAttempts
     );
-  }, [userProfile.uid, userProfile.id, userProfile.email, userProfile.totalWonAmount, existingWithdrawals, refreshTrigger]);
+  }, [userProfile.uid, userProfile.id, userProfile.email, userProfile.totalWonAmount, walletBalance, existingWithdrawals, quizAttempts, refreshTrigger]);
 
   const withdrawableBalance = withdrawableInfo.withdrawableBalance;
   const remainingWithdrawable = Math.max(0, withdrawableBalance - (Number(amount) || 0));
-  const remainingBalance = Math.max(0, walletBalance - (Number(amount) || 0));
+
+  React.useEffect(() => {
+    if (withdrawableBalance >= 10 && withdrawableBalance < 100 && amount === 100) {
+      setAmount(withdrawableBalance);
+    }
+  }, [withdrawableBalance]);
 
   // Real-time synchronization: listen for admin processing (approve/reject/cancel/delete) across tabs and views
   React.useEffect(() => {
@@ -205,6 +220,7 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting || submittingRef.current || isScreenLocked) return;
     setErrorMsg('');
 
     if (userProfile.isBlocked) {
@@ -215,6 +231,12 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
 
     if (amount <= 0 || isNaN(amount)) {
       setErrorMsg('Please enter a valid withdrawal amount.');
+      soundFx.playWrong();
+      return;
+    }
+
+    if (amount < 10) {
+      setErrorMsg('Minimum withdrawal amount is ₹10.');
       soundFx.playWrong();
       return;
     }
@@ -242,7 +264,9 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       userProfile.uid || userProfile.id || '',
       userProfile.email,
       existingWithdrawals,
-      userProfile.totalWonAmount
+      userProfile.totalWonAmount,
+      walletBalance,
+      quizAttempts
     );
 
     if (!validation.success) {
@@ -290,70 +314,60 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
       return;
     }
 
-    // 1-second visual execution feedback
+    // 1-second visual execution feedback with idempotent double-submit guard
+    submittingRef.current = true;
     setIsSubmitting(true);
     soundFx.playClick();
 
     setTimeout(() => {
-      // 1. Instantly deduct requested amount from user's Available Wallet Balance
-      const nextBalance = Math.max(0, walletBalance - Number(amount));
-      const updatedProfile: UserProfile = {
-        ...userProfile,
-        walletBalance: nextBalance
-      };
-      onUpdateProfile(updatedProfile);
-
-      // 2. Log payout request marked as 'Pending' with fixed real-time Date & Time stamp
-      const now = new Date();
-      const formattedTimestamp = getCurrentFormattedTimestamp();
-      const newWithdrawalId = getNextWithdrawalId(existingWithdrawals);
-
-      const effectiveOwnerUid = userProfile.uid || userProfile.id || (userProfile.email ? `usr-${userProfile.email.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${newWithdrawalId}`);
-
-      const newWithdrawal: WithdrawalRequest = {
-        id: newWithdrawalId,
-        requestId: newWithdrawalId,
-        ownerUid: effectiveOwnerUid,
-        userId: effectiveOwnerUid,
-        userName: fullName.trim(),
-        userEmail: userProfile.email,
-        email: userProfile.email,
-        phone: cleanMobile,
-        accountHolderName: accountHolderName.trim(),
-        accountNumber: cleanAcc,
-        confirmAccountNumber: confirmAccountNumber.trim(),
-        ifscCode: cleanIfsc,
-        amount: Number(amount),
-        timestamp: formattedTimestamp,
-        date: now.toISOString().split('T')[0],
-        createdAt: now.toISOString(),
-        status: 'pending'
-      };
-
-      onSubmitWithdrawal(newWithdrawal);
-
-      // Store persistent screen lock
       try {
-        localStorage.setItem('quizkart_active_pending_withdrawal_id', newWithdrawalId);
-      } catch {}
+        // Delegate the single atomic wallet deduction, withdrawal log persistence, and Firestore transaction to App.tsx handleAddWithdrawal
+        const now = new Date();
+        const nowIso = now.toISOString();
+        const reqAmt = Number(amount);
 
-      // Store into user permanent audit log (never deleted by admin actions)
-      try {
-        const savedPerm = localStorage.getItem('quizkart_user_withdrawals_permanent');
-        const list = savedPerm ? JSON.parse(savedPerm) : [];
-        if (Array.isArray(list)) {
-          const filtered = list.filter((item: any) => item && item.id !== newWithdrawalId);
-          localStorage.setItem('quizkart_user_withdrawals_permanent', JSON.stringify([newWithdrawal, ...filtered]));
-        }
-      } catch {}
+        // Log payout request marked as 'Pending' with fixed real-time Date & Time stamp
+        const formattedTimestamp = getCurrentFormattedTimestamp();
+        const newWithdrawalId = getNextWithdrawalId(existingWithdrawals);
 
-      saveWithdrawalToFirestore(newWithdrawal).catch(err => {
-        console.warn('Firestore withdrawal sync notice:', err);
-      });
+        const effectiveOwnerUid = userProfile.uid || userProfile.id || (userProfile.email ? `usr-${userProfile.email.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${newWithdrawalId}`);
 
-      setSubmittedRequest(newWithdrawal);
-      setIsSubmitting(false);
-      soundFx.playSuccess();
+        const newWithdrawal: WithdrawalRequest = {
+          id: newWithdrawalId,
+          requestId: newWithdrawalId,
+          ownerUid: effectiveOwnerUid,
+          userId: effectiveOwnerUid,
+          userName: fullName.trim(),
+          userEmail: userProfile.email,
+          email: userProfile.email,
+          phone: cleanMobile,
+          accountHolderName: accountHolderName.trim(),
+          accountNumber: cleanAcc,
+          confirmAccountNumber: confirmAccountNumber.trim(),
+          ifscCode: cleanIfsc,
+          amount: reqAmt,
+          timestamp: formattedTimestamp,
+          date: nowIso.split('T')[0],
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          status: 'pending',
+          walletDeducted: false,
+          walletRefunded: false
+        };
+
+        onSubmitWithdrawal(newWithdrawal);
+
+        // Store persistent screen lock
+        try {
+          localStorage.setItem('quizkart_active_pending_withdrawal_id', newWithdrawalId);
+        } catch {}
+
+        setSubmittedRequest(newWithdrawal);
+        soundFx.playSuccess();
+      } finally {
+        submittingRef.current = false;
+        setIsSubmitting(false);
+      }
     }, 1000);
   };
 
@@ -516,7 +530,7 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
                 className="px-2.5 py-0.5 rounded-full text-[11px] font-bold text-white shadow-2xs"
                 style={{ background: PRIMARY_GRADIENT }}
               >
-                Min ₹100 - Max ₹5000
+                Min ₹10 - Max ₹5000
               </span>
             </div>
 
@@ -532,11 +546,32 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
             </div>
           </div>
 
+          {/* Low Withdrawable Balance Warning Banner (₹10 – ₹50) */}
+          {withdrawableBalance >= 10 && withdrawableBalance <= 50 && (
+            <div
+              id="low-withdrawal-balance-warning"
+              role="alert"
+              className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-400 shadow-sm flex items-start gap-3"
+            >
+              <div className="w-8 h-8 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-xs">
+                <AlertTriangle className="w-4 h-4 text-white" />
+              </div>
+              <div className="space-y-0.5 text-xs leading-relaxed">
+                <p className="font-extrabold text-amber-950">
+                  Low Withdrawable Balance (₹{withdrawableBalance})
+                </p>
+                <p className="font-medium text-amber-900">
+                  Your available withdrawal balance is currently between ₹10 and ₹50. Participate in more contests to win and build up bigger prizes before withdrawing!
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Error Message */}
           {errorMsg && (
-            <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-semibold flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-              <span>{errorMsg}</span>
+            <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-semibold flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <span className="leading-relaxed">{errorMsg}</span>
             </div>
           )}
 
@@ -576,7 +611,7 @@ export const WithdrawalPage: React.FC<WithdrawalPageProps> = ({
                 <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-400">₹</span>
                 <input
                   type="number"
-                  min={100}
+                  min={10}
                   max={5000}
                   required
                   value={amount}

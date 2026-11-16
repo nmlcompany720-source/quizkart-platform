@@ -258,6 +258,7 @@ class QuestionPoolManager {
 
     this.rebuildIndices(cleanQuestions);
 
+    let savedToIndexedDb = false;
     const db = await this.getDb();
     if (db) {
       try {
@@ -271,15 +272,21 @@ class QuestionPoolManager {
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
         });
+        savedToIndexedDb = true;
       } catch (e) {
         console.warn('IndexedDB bulk save failed:', e);
       }
     }
 
-    // Try LocalStorage for small-to-medium subsets without blowing 5MB quota
+    // Keep LocalStorage free of heavy question dumps whenever IndexedDB has stored them
     try {
       const safeSubset = cleanQuestions.length > 1000 ? cleanQuestions.slice(0, 1000) : cleanQuestions;
-      localStorage.setItem(LOCAL_STORAGE_FALLBACK_KEY, JSON.stringify(safeSubset));
+      const serialized = JSON.stringify(safeSubset);
+      if (!savedToIndexedDb || serialized.length <= 180_000) {
+        localStorage.setItem(LOCAL_STORAGE_FALLBACK_KEY, serialized);
+      } else {
+        localStorage.removeItem(LOCAL_STORAGE_FALLBACK_KEY);
+      }
       localStorage.setItem('quizkart_questions_initialized', 'true');
     } catch (e) {
       console.warn('LocalStorage full, question pool preserved safely in IndexedDB and memory.');
@@ -298,6 +305,7 @@ class QuestionPoolManager {
     this.memoryCache = updated;
     this.rebuildIndices(updated);
 
+    let deletedFromIndexedDb = false;
     const db = await this.getDb();
     if (db) {
       try {
@@ -309,6 +317,7 @@ class QuestionPoolManager {
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
         });
+        deletedFromIndexedDb = true;
       } catch (e) {
         console.warn('IndexedDB delete failed:', e);
       }
@@ -316,8 +325,12 @@ class QuestionPoolManager {
 
     try {
       const safeSubset = updated.length > 1000 ? updated.slice(0, 1000) : updated;
-      localStorage.setItem(LOCAL_STORAGE_FALLBACK_KEY, JSON.stringify(safeSubset));
-      localStorage.setItem('quizkart_questions', JSON.stringify(safeSubset));
+      const serialized = JSON.stringify(safeSubset);
+      if (!deletedFromIndexedDb || serialized.length <= 180_000) {
+        localStorage.setItem(LOCAL_STORAGE_FALLBACK_KEY, serialized);
+      } else {
+        localStorage.removeItem(LOCAL_STORAGE_FALLBACK_KEY);
+      }
     } catch {}
 
     return updated;
@@ -1161,10 +1174,6 @@ export function createDynamicRangeBlockForUser(params: {
 
   const updatedPool = [...allQuestions, ...newQuestions];
   questionPoolManager.saveAllQuestions(updatedPool);
-  try {
-    localStorage.setItem('quizkart_questions', JSON.stringify(updatedPool.slice(0, 1000)));
-    localStorage.setItem('quizkart_questions_initialized', 'true');
-  } catch {}
 
   if (onQuestionsUpdated) onQuestionsUpdated(updatedPool);
   if (onQuestionSavedToFirestore) {
@@ -1286,9 +1295,6 @@ export function assignNextSequentialBlockOnDemand(params: {
     } catch {}
 
     questionPoolManager.saveAllQuestions(updatedQuestions);
-    try {
-      localStorage.setItem('quizkart_questions', JSON.stringify(updatedQuestions.slice(0, 1000)));
-    } catch {}
 
     if (onQuestionsUpdated) onQuestionsUpdated(updatedQuestions);
     if (onQuestionSavedToFirestore) {

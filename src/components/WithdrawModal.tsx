@@ -16,6 +16,7 @@ interface WithdrawModalProps {
   isOpen: boolean;
   onClose: () => void;
   walletBalance: number;
+  withdrawableBalance?: number;
   userName: string;
   userPhone: string;
   onSubmitWithdrawal: (withdrawal: Omit<WithdrawalRequest, 'id' | 'timestamp' | 'status'>) => void;
@@ -25,15 +26,20 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
   isOpen,
   onClose,
   walletBalance,
+  withdrawableBalance,
   userName,
   userPhone,
   onSubmitWithdrawal
 }) => {
+  const effectiveWithdrawable = withdrawableBalance !== undefined
+    ? Math.min(Math.max(0, Number(withdrawableBalance) || 0), Math.max(0, Number(walletBalance) || 0))
+    : Math.max(0, Number(walletBalance) || 0);
+
   const [accountHolderName, setAccountHolderName] = useState(userName || '');
   const [accountNumber, setAccountNumber] = useState('');
   const [confirmAccountNumber, setConfirmAccountNumber] = useState('');
   const [ifscCode, setIfscCode] = useState('');
-  const [amount, setAmount] = useState<number>(100);
+  const [amount, setAmount] = useState<number>(effectiveWithdrawable >= 10 && effectiveWithdrawable < 100 ? effectiveWithdrawable : 100);
   const [errorMsg, setErrorMsg] = useState('');
   const [showSuccessAlert, setShowSuccessAlert] = useState(false);
 
@@ -43,14 +49,19 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
     e.preventDefault();
     setErrorMsg('');
 
-    // Transaction Limits: Min ₹100 – Max ₹5000
-    if (amount < 100) {
-      setErrorMsg('Minimum withdrawal amount is ₹100.');
+    // Transaction Limits: Min ₹10 – Max ₹5000
+    if (isNaN(amount) || amount < 10) {
+      setErrorMsg('Minimum withdrawal amount is ₹10.');
       return;
     }
 
     if (amount > 5000) {
       setErrorMsg('Maximum withdrawal amount is ₹5000 per request.');
+      return;
+    }
+
+    if (amount > effectiveWithdrawable) {
+      setErrorMsg(`Withdrawal is permitted only from settled contest winnings. You have ₹${effectiveWithdrawable} in eligible winnings available. Deposited funds cannot be withdrawn directly.`);
       return;
     }
 
@@ -100,7 +111,7 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
     }, 3200);
   };
 
-  const remainingBalance = Math.max(0, walletBalance - (Number(amount) || 0));
+  const remainingBalance = Math.max(0, effectiveWithdrawable - (Number(amount) || 0));
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto animate-in fade-in duration-200">
@@ -158,8 +169,8 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
             {/* Balance Overview Card */}
             <div className="p-3.5 rounded-2xl bg-white border border-slate-200 space-y-2 text-xs" style={{ backgroundColor: '#FFFFFF' }}>
               <div className="flex items-center justify-between text-slate-600">
-                <span className="font-medium">Available Wallet Balance</span>
-                <span className="font-bold text-emerald-600" style={{ color: '#16A34A' }}>₹{walletBalance}</span>
+                <span className="font-medium">Available Withdrawal Balance</span>
+                <span className="font-bold text-emerald-600" style={{ color: '#16A34A' }}>₹{effectiveWithdrawable}</span>
               </div>
               {amount > 0 && (
                 <div className="flex items-center justify-between text-slate-600">
@@ -177,7 +188,7 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
                   className="px-2.5 py-0.5 rounded-full text-[11px] font-bold text-white shadow-2xs"
                   style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
                 >
-                  Min ₹100 - Max ₹5000
+                  Min ₹10 - Max ₹5000
                 </span>
               </div>
             </div>
@@ -222,13 +233,13 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
                 <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-400">₹</span>
                 <input
                   type="number"
-                  min={100}
+                  min={10}
                   max={Math.min(5000, walletBalance)}
                   required
                   value={amount}
                   onChange={(e) => setAmount(Number(e.target.value))}
                   className="w-full pl-8 pr-3 py-2 text-xs bg-white border border-slate-300 rounded-xl text-slate-900 font-bold outline-none focus:border-indigo-500"
-                  placeholder="Enter amount between ₹100 and ₹5000"
+                  placeholder="Enter amount between ₹10 and ₹5000"
                 />
               </div>
             </div>

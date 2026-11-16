@@ -482,7 +482,7 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
     let total = 0;
     const creditedContests = new Set<string>();
     effectiveAttempts.forEach(att => {
-      if (att && att.contestId && !creditedContests.has(att.contestId)) {
+      if (att && !(att as any).isDemo && att.rewardType !== 'product' && att.contestId && !creditedContests.has(att.contestId)) {
         if (att.settlementStatus === 'settled' && (att.finalPrizeRupees || 0) > 0) {
           total += (att.finalPrizeRupees || 0);
           creditedContests.add(att.contestId);
@@ -1029,6 +1029,14 @@ export const ProfileWallet: React.FC<ProfileWalletProps> = ({
         isOpen={isWithdrawModalOpen}
         onClose={() => setIsWithdrawModalOpen(false)}
         walletBalance={userProfile.walletBalance}
+        withdrawableBalance={contestBackend.getWithdrawableBalance(
+          currentUid || currentId,
+          currentEmail,
+          withdrawals,
+          effectiveTotalWon,
+          currentWalletBalance,
+          effectiveAttempts
+        ).withdrawableBalance}
         userName={userProfile.name}
         userPhone={userProfile.mobile}
         onSubmitWithdrawal={(wth) => {

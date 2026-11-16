@@ -1,4 +1,4 @@
-import { getCachedAccessToken, signInWithGoogle } from '../firebase';
+import { getCachedAccessToken, signInForGoogleChat } from '../firebase';
 
 export interface GoogleChatSpace {
   name: string; // e.g. "spaces/AAAAAAAAAAA"
@@ -33,7 +33,7 @@ class GoogleChatService {
     if (token) return token;
 
     // Prompt sign-in popup to acquire fresh token with Chat scopes
-    const { accessToken } = await signInWithGoogle();
+    const { accessToken } = await signInForGoogleChat();
     if (!accessToken) {
       throw new Error('Google Chat authorization is required. Please authenticate.');
     }

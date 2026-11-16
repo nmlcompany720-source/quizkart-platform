@@ -17,6 +17,7 @@ import { ALL_COUNTRY_CALLING_CODES } from '../data/countryCallingCodes';
 import { DEFAULT_REGISTERED_USERS, isDemoSeedUser } from '../data/quizData';
 import { UserProfile } from '../types';
 import { LegalPolicyPage } from './LegalPolicyPage';
+import { fetchUserProfile } from '../firebase';
 
 const IMAGE_1_GRADIENT = 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)';
 
@@ -319,8 +320,29 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       return;
     }
 
-    // Check if the entered email exists in the database
-    const existingUser = findExistingUserByEmail(trimmedEmail);
+    // Check if the entered email exists in local database or centralized Firestore
+    setIsSubmitting(true);
+    let existingUser = findExistingUserByEmail(trimmedEmail);
+    try {
+      const cloudUser = await fetchUserProfile('', trimmedEmail);
+      if (cloudUser) {
+        if ((cloudUser as any).isDeleted || cloudUser.status === 'deleted' || Boolean((cloudUser as any).deletedAt) || isAccountDeletedWithin30Days(trimmedEmail)) {
+          setIsSubmitting(false);
+          setAuthError('This account was permanently deleted. Re-registration or login using this email is restricted for 30 days.');
+          soundFx.playWrong();
+          return;
+        }
+        if (cloudUser.isRegistered !== false && (cloudUser.name || cloudUser.email || cloudUser.customUserId)) {
+          existingUser = {
+            ...(existingUser || {}),
+            ...(cloudUser as UserProfile),
+            email: (cloudUser.email || trimmedEmail).trim()
+          };
+        }
+      }
+    } catch {}
+    setIsSubmitting(false);
+
     if (existingUser) {
       // EXISTING USER SIGN-IN: Do NOT require or show Terms checkbox; redirect directly to Enter Password screen
       setIsExistingUser(true);

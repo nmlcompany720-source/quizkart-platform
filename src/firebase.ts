@@ -1,10 +1,17 @@
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, 
+  getAuth,
+  initializeAuth,
+  indexedDBLocalPersistence,
+  browserSessionPersistence,
+  inMemoryPersistence,
+  browserPopupRedirectResolver,
   GoogleAuthProvider, 
   signInWithPopup, 
   signOut, 
   onAuthStateChanged,
+  setPersistence,
+  getRedirectResult,
   User 
 } from 'firebase/auth';
 import { 
@@ -28,6 +35,8 @@ import firebaseConfig from '../firebase-applet-config.json';
 import { Question, ActiveContest, LeaderboardEntry, UserProfile, QuizAttemptResult, DepositRequest, WithdrawalRequest, SupportTicket, BannerSlide, ContestEntry, FinancialLedgerRecord } from './types';
 import { isDemoSeedUser } from './data/quizData';
 import { prepareContestForFirestore, sanitizeContestSynchronous } from './utils/imageCompressor';
+import { ensureLocalStorageHeadroomForAuth, isStorageQuotaError } from './utils/storageHygiene';
+import { contestBackend } from './backend/contestEngine';
 
 // Initialize Firebase App
 export const app = initializeApp(firebaseConfig);
@@ -40,11 +49,46 @@ try {
   setLogLevel('silent');
 } catch {}
 
-// Initialize Firebase Authentication
-export const auth = getAuth(app);
-export const googleProvider = new GoogleAuthProvider();
+// Reclaim only redundant bloated cache mirrors if localStorage is near quota (never clearing user data or IndexedDB)
+ensureLocalStorageHeadroomForAuth();
 
-// Google Chat OAuth Scopes for Workspace integration
+// Designated Admin account authorized for central Firestore Registered Users access
+export const AUTHORIZED_ADMIN_EMAIL = 'nmlcompany720@gmail.com';
+
+export type AuthPersistenceMode =
+  | 'indexedDBLocalPersistence'
+  | 'browserSessionPersistence'
+  | 'inMemoryPersistence'
+  | 'failed';
+
+export interface AuthPersistenceStatus {
+  mode: AuthPersistenceMode;
+  isPersistentAcrossRefresh: boolean;
+  warning?: string;
+  error?: string;
+}
+
+// Initialize Firebase Authentication with IndexedDB persistence FIRST (avoids 5MB localStorage quota limit)
+export const auth = (() => {
+  if (typeof window !== 'undefined') {
+    try {
+      return initializeAuth(app, {
+        persistence: [indexedDBLocalPersistence, browserSessionPersistence, inMemoryPersistence],
+        popupRedirectResolver: browserPopupRedirectResolver
+      });
+    } catch {
+      return getAuth(app);
+    }
+  }
+  return getAuth(app);
+})();
+
+// Clean Identity-only Google Auth Provider (NO restricted Workspace scopes so standard Admin & User login never triggers unverified Workspace App Verification warnings)
+export const googleProvider = new GoogleAuthProvider();
+googleProvider.addScope('email');
+googleProvider.addScope('profile');
+
+// Google Chat OAuth Scopes for Workspace integration (isolated to explicit Google Chat requests only)
 export const GOOGLE_CHAT_SCOPES = [
   'https://www.googleapis.com/auth/chat.spaces',
   'https://www.googleapis.com/auth/chat.spaces.readonly',
@@ -59,12 +103,125 @@ export const GOOGLE_CHAT_SCOPES = [
   'https://www.googleapis.com/auth/chat.messages.reactions.create',
 ];
 
+export const googleChatProvider = new GoogleAuthProvider();
 GOOGLE_CHAT_SCOPES.forEach((scope) => {
-  googleProvider.addScope(scope);
+  googleChatProvider.addScope(scope);
 });
 
 // In-memory access token cache (NOT stored in localStorage or sessionStorage per security requirements)
 let cachedAccessToken: string | null = null;
+
+let authPersistenceStatus: AuthPersistenceStatus = {
+  mode: typeof window !== 'undefined' && typeof indexedDB !== 'undefined' ? 'indexedDBLocalPersistence' : 'inMemoryPersistence',
+  isPersistentAcrossRefresh: typeof window !== 'undefined' && typeof indexedDB !== 'undefined'
+};
+
+export function getAuthPersistenceStatus(): AuthPersistenceStatus {
+  return { ...authPersistenceStatus };
+}
+
+async function ensureBestAuthPersistence(): Promise<AuthPersistenceStatus> {
+  if (typeof window === 'undefined') {
+    authPersistenceStatus = { mode: 'inMemoryPersistence', isPersistentAcrossRefresh: false };
+    return authPersistenceStatus;
+  }
+
+  let idbError: unknown = null;
+  if (typeof window.indexedDB !== 'undefined') {
+    try {
+      await setPersistence(auth, indexedDBLocalPersistence);
+      authPersistenceStatus = {
+        mode: 'indexedDBLocalPersistence',
+        isPersistentAcrossRefresh: true
+      };
+      return authPersistenceStatus;
+    } catch (err) {
+      idbError = err;
+      console.warn('IndexedDB Auth persistence unavailable, falling back to browserSessionPersistence:', err);
+    }
+  }
+
+  let sessionError: unknown = null;
+  try {
+    await setPersistence(auth, browserSessionPersistence);
+    authPersistenceStatus = {
+      mode: 'browserSessionPersistence',
+      isPersistentAcrossRefresh: true,
+      warning: idbError
+        ? 'IndexedDB storage was unavailable; Admin session is using tab sessionStorage fallback.'
+        : 'IndexedDB not supported in this browser; Admin session is using tab sessionStorage fallback.'
+    };
+    return authPersistenceStatus;
+  } catch (err) {
+    sessionError = err;
+    console.warn('browserSessionPersistence unavailable, falling back to inMemoryPersistence:', err);
+  }
+
+  try {
+    await setPersistence(auth, inMemoryPersistence);
+    authPersistenceStatus = {
+      mode: 'inMemoryPersistence',
+      isPersistentAcrossRefresh: false,
+      warning: 'Browser persistent storage (IndexedDB & sessionStorage) is restricted or full; session will stay active in memory until tab reload.'
+    };
+    return authPersistenceStatus;
+  } catch (memErr: any) {
+    const idbMsg = idbError instanceof Error ? idbError.message : String(idbError || 'unavailable');
+    const sessMsg = sessionError instanceof Error ? sessionError.message : String(sessionError || 'unavailable');
+    const memMsg = memErr instanceof Error ? memErr.message : String(memErr || 'unavailable');
+    const errorMsg = `Firebase Auth persistence failed across IndexedDB (${idbMsg}), SessionStorage (${sessMsg}), and In-Memory (${memMsg}).`;
+    console.error(errorMsg);
+    authPersistenceStatus = {
+      mode: 'failed',
+      isPersistentAcrossRefresh: false,
+      error: errorMsg
+    };
+    return authPersistenceStatus;
+  }
+}
+
+// Initialize persistence priority chain immediately before redirect recovery or Firestore listeners
+const authPersistencePromise: Promise<AuthPersistenceStatus> = ensureBestAuthPersistence();
+
+let redirectRecoveryError: { code: string; message: string } | null = null;
+const authRedirectRecoveryPromise: Promise<User | null> =
+  typeof window !== 'undefined'
+    ? authPersistencePromise
+        .then((status) => {
+          if (status.mode === 'failed') return null;
+          return getRedirectResult(auth);
+        })
+        .then((result) => {
+          if (result) {
+            const credential = GoogleAuthProvider.credentialFromResult(result);
+            if (credential?.accessToken) {
+              cachedAccessToken = credential.accessToken;
+            }
+            return result.user;
+          }
+          return null;
+        })
+        .catch((err: any) => {
+          redirectRecoveryError = {
+            code: String(err?.code || 'auth/redirect-error'),
+            message: err?.message || 'Google sign-in redirect did not complete.'
+          };
+          return null;
+        })
+    : Promise.resolve(null);
+
+export async function waitForFirebaseAuthReady(): Promise<User | null> {
+  await authPersistencePromise;
+  try {
+    await authRedirectRecoveryPromise;
+  } catch {}
+  try {
+    if (typeof (auth as any).authStateReady === 'function') {
+      await (auth as any).authStateReady();
+    }
+  } catch {}
+  return auth.currentUser;
+}
 
 export function getCachedAccessToken(): string | null {
   return cachedAccessToken;
@@ -237,48 +394,277 @@ export async function testConnection() {
 testConnection();
 
 // Authentication helpers
-let activeSignInPromise: Promise<User | null> | null = null;
+let activeSignInPromise: Promise<{ user: User | null; accessToken: string | null; errorCode?: string; errorMessage?: string }> | null = null;
 
-export async function signInWithGoogle(): Promise<{ user: User | null; accessToken: string | null }> {
-  // Prevent duplicate concurrent popup requests
+export interface AdminAuthVerificationResult {
+  status: 'authorized' | 'unauthenticated' | 'unauthorized_account' | 'unverified_email' | 'permission_denied' | 'cancelled' | 'error';
+  user: User | null;
+  users?: UserProfile[];
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+function formatGoogleAuthErrorMessage(errorCode: string, rawMessage: string): string {
+  if (errorCode === 'auth/popup-blocked') {
+    return 'Browser blocked the Google Sign-In popup. Please allow popups for this site and try again.';
+  }
+  if (errorCode === 'auth/unauthorized-domain') {
+    const host = typeof window !== 'undefined' ? window.location.hostname : 'current domain';
+    return `Domain "${host}" is not authorized in Firebase Authentication Authorized Domains.`;
+  }
+  if (errorCode === 'auth/operation-not-allowed') {
+    return 'Google Sign-In provider is not enabled in Firebase Authentication.';
+  }
+  if (errorCode === 'auth/network-request-failed') {
+    return 'Unable to connect to Google Sign-In. Please check your connection and try again.';
+  }
+  if (errorCode === 'auth/web-storage-unsupported' || rawMessage.toLowerCase().includes('exceeded the quota') || rawMessage.toLowerCase().includes('quotaexceeded')) {
+    return `Browser storage quota prevented saving the Auth session (${rawMessage}). IndexedDB or memory fallback is required.`;
+  }
+  return rawMessage || 'Google Authentication failed.';
+}
+
+export async function signInWithGoogle(options?: { selectAccount?: boolean }): Promise<{
+  user: User | null;
+  accessToken: string | null;
+  errorCode?: string;
+  errorMessage?: string;
+}> {
   if (activeSignInPromise) {
-    const user = await activeSignInPromise;
-    return { user, accessToken: cachedAccessToken };
+    return await activeSignInPromise;
+  }
+
+  const provider = new GoogleAuthProvider();
+  provider.addScope('email');
+  provider.addScope('profile');
+  if (options?.selectAccount) {
+    provider.setCustomParameters({ prompt: 'select_account' });
   }
 
   activeSignInPromise = (async () => {
     try {
-      const result = await signInWithPopup(auth, googleProvider);
-      const credential = GoogleAuthProvider.credentialFromResult(result);
-      if (credential?.accessToken) {
-        cachedAccessToken = credential.accessToken;
+      const persistenceStatus = await authPersistencePromise;
+      if (persistenceStatus.mode === 'failed') {
+        return {
+          user: null,
+          accessToken: null,
+          errorCode: 'auth/persistence-failed',
+          errorMessage: persistenceStatus.error || 'Firebase Auth storage persistence initialization failed.'
+        };
       }
-      return result.user;
+
+      const result = await signInWithPopup(auth, provider);
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      const token = credential?.accessToken || null;
+      if (token) {
+        cachedAccessToken = token;
+      }
+      redirectRecoveryError = null;
+      return { user: result.user, accessToken: token };
     } catch (error: any) {
-      const errorCode = error?.code || '';
-      // Gracefully handle expected user cancellations and duplicate requests
+      const rawMsg = error?.message || String(error || '');
+      const errorCode = String(error?.code || (isStorageQuotaError(error) ? 'auth/storage-quota-exceeded' : 'auth/unknown'));
       if (
         errorCode === 'auth/cancelled-popup-request' ||
         errorCode === 'auth/popup-closed-by-user'
       ) {
-        // Benign: User closed the window or clicked again
-        return null;
+        return {
+          user: null,
+          accessToken: null,
+          errorCode,
+          errorMessage: 'Google Sign-In window was closed before completing login.'
+        };
       }
 
-      if (errorCode === 'auth/popup-blocked') {
-        console.warn('Google Sign In popup was blocked by browser. Please allow popups.');
-        return null;
+      if (isStorageQuotaError(error) || errorCode === 'auth/web-storage-unsupported') {
+        ensureLocalStorageHeadroomForAuth();
+        try {
+          await setPersistence(auth, indexedDBLocalPersistence);
+          authPersistenceStatus = { mode: 'indexedDBLocalPersistence', isPersistentAcrossRefresh: true };
+        } catch {
+          try {
+            await setPersistence(auth, inMemoryPersistence);
+            authPersistenceStatus = {
+              mode: 'inMemoryPersistence',
+              isPersistentAcrossRefresh: false,
+              warning: 'Using in-memory Auth persistence after browser storage quota error.'
+            };
+          } catch (fallbackErr: any) {
+            const failMsg = `Auth storage quota exceeded (${rawMsg}) and fallback persistence failed (${fallbackErr?.message || fallbackErr}).`;
+            authPersistenceStatus = { mode: 'failed', isPersistentAcrossRefresh: false, error: failMsg };
+            return {
+              user: null,
+              accessToken: null,
+              errorCode: 'auth/persistence-failed',
+              errorMessage: failMsg
+            };
+          }
+        }
       }
 
-      console.warn('Google Sign In notice:', error?.message || error);
-      return null;
+      const errorMessage = formatGoogleAuthErrorMessage(errorCode, rawMsg);
+      console.warn('Google Sign In notice:', errorCode, errorMessage);
+      return {
+        user: null,
+        accessToken: null,
+        errorCode,
+        errorMessage
+      };
     } finally {
       activeSignInPromise = null;
     }
   })();
 
-  const user = await activeSignInPromise;
-  return { user, accessToken: cachedAccessToken };
+  return await activeSignInPromise;
+}
+
+export async function signInForGoogleChat(): Promise<{ user: User | null; accessToken: string | null }> {
+  try {
+    await authPersistencePromise;
+    const result = await signInWithPopup(auth, googleChatProvider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    if (credential?.accessToken) {
+      cachedAccessToken = credential.accessToken;
+    }
+    return { user: result.user, accessToken: cachedAccessToken };
+  } catch (error: any) {
+    const errorCode = error?.code || '';
+    if (
+      errorCode !== 'auth/cancelled-popup-request' &&
+      errorCode !== 'auth/popup-closed-by-user'
+    ) {
+      console.warn('Google Chat Sign In notice:', error?.message || error);
+    }
+    return { user: null, accessToken: null };
+  }
+}
+
+export async function verifyAdminSessionAndLoadUsers(): Promise<AdminAuthVerificationResult> {
+  const persistenceStatus = await authPersistencePromise;
+  if (persistenceStatus.mode === 'failed') {
+    return {
+      status: 'error',
+      user: null,
+      errorCode: 'auth/persistence-failed',
+      errorMessage: persistenceStatus.error || 'Failed to initialize Firebase Auth storage persistence.'
+    };
+  }
+
+  const user = await waitForFirebaseAuthReady();
+
+  if (!user) {
+    if (redirectRecoveryError) {
+      const err = redirectRecoveryError;
+      redirectRecoveryError = null;
+      return {
+        status: 'error',
+        user: null,
+        errorCode: err.code,
+        errorMessage: err.message
+      };
+    }
+    return {
+      status: 'unauthenticated',
+      user: null
+    };
+  }
+
+  const cleanEmail = (user.email || '').trim().toLowerCase();
+  if (cleanEmail !== AUTHORIZED_ADMIN_EMAIL) {
+    return {
+      status: 'unauthorized_account',
+      user,
+      errorCode: 'auth/unauthorized-admin-email',
+      errorMessage: `Signed in as ${user.email || user.uid}. Only the designated Admin account (${AUTHORIZED_ADMIN_EMAIL}) is authorized to sync the central Registered Users list.`
+    };
+  }
+
+  if (user.emailVerified !== true) {
+    return {
+      status: 'unverified_email',
+      user,
+      errorCode: 'auth/email-not-verified',
+      errorMessage: `Email ${user.email} is not verified in Firebase Authentication. Verify the Google account email to proceed.`
+    };
+  }
+
+  // Ensure UID is recorded in /admins/{uid} for durable rule enforcement alongside verified email
+  if (!isFirestoreQuotaExceeded() && user.uid) {
+    setDoc(
+      doc(db, 'admins', user.uid),
+      {
+        uid: user.uid,
+        email: AUTHORIZED_ADMIN_EMAIL,
+        emailVerified: true,
+        role: 'admin',
+        updatedAt: new Date().toISOString()
+      },
+      { merge: true }
+    ).catch(() => {});
+  }
+
+  const res = await fetchAllUsersWithStatusFromFirestore();
+  if (res.errorCode === 'permission-denied') {
+    return {
+      status: 'permission_denied',
+      user,
+      errorCode: res.errorCode,
+      errorMessage:
+        'Authenticated as nmlcompany720@gmail.com, but Firestore denied read access to the users collection. Verify that the deployed Firestore rules allow verified Admin access.'
+    };
+  }
+  if (res.errorCode) {
+    return {
+      status: 'error',
+      user,
+      errorCode: res.errorCode,
+      errorMessage: res.errorMessage || 'Failed to load central Registered Users from Firestore.'
+    };
+  }
+
+  return {
+    status: 'authorized',
+    user,
+    users: res.users
+  };
+}
+
+export async function signInAdminWithGoogle(): Promise<AdminAuthVerificationResult> {
+  // 1. Synchronous fast-path: if already signed in as verified Admin, verify Firestore permissions without triggering a popup loop
+  const existingUser = auth.currentUser;
+  if (
+    existingUser &&
+    (existingUser.email || '').trim().toLowerCase() === AUTHORIZED_ADMIN_EMAIL &&
+    existingUser.emailVerified === true
+  ) {
+    const existingCheck = await verifyAdminSessionAndLoadUsers();
+    if (existingCheck.status === 'authorized') {
+      return existingCheck;
+    }
+  }
+
+  // 2. Launch clean Identity-only Google Popup immediately inside user gesture (with account selector)
+  const signInRes = await signInWithGoogle({ selectAccount: true });
+  if (!signInRes.user) {
+    const code = signInRes.errorCode || 'auth/unknown';
+    if (code === 'auth/cancelled-popup-request' || code === 'auth/popup-closed-by-user') {
+      return {
+        status: 'cancelled',
+        user: auth.currentUser,
+        errorCode: code,
+        errorMessage: 'Google sign-in was cancelled. Click Authorize when ready.'
+      };
+    }
+    return {
+      status: 'error',
+      user: auth.currentUser,
+      errorCode: code,
+      errorMessage: signInRes.errorMessage || 'Google Admin authorization failed.'
+    };
+  }
+
+  // 3. Verify UID, email, emailVerified, and live Firestore permission
+  return await verifyAdminSessionAndLoadUsers();
 }
 
 export async function logOutUser(): Promise<void> {
@@ -310,6 +696,47 @@ export function extractNumericUserNumber(u?: Partial<UserProfile> | null): numbe
   return 999999;
 }
 
+function parseValidSequentialUserId(rawId?: string | null, rawNumber?: number): { customUserId: string; userNumber: number } | null {
+  if (rawId && /^(?:QK-)?USR-\d+$/i.test(String(rawId).trim())) {
+    const clean = String(rawId).trim().toUpperCase();
+    const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
+    const numMatch = idStr.match(/(\d+)/);
+    const num = typeof rawNumber === 'number' && rawNumber >= 1000 && rawNumber < 999999
+      ? rawNumber
+      : (numMatch ? parseInt(numMatch[1], 10) : 1001);
+    return { customUserId: idStr, userNumber: num };
+  }
+  if (typeof rawNumber === 'number' && rawNumber >= 1000 && rawNumber < 999999) {
+    return { customUserId: `QK-USR-${rawNumber}`, userNumber: rawNumber };
+  }
+  return null;
+}
+
+/**
+ * Ensures settings/user_counter.lastUserNumber is at least minUserNumber so future
+ * registrations never collide with any existing user ID.
+ */
+export async function syncUserCounterMinimum(minUserNumber: number): Promise<void> {
+  if (!Number.isFinite(minUserNumber) || minUserNumber < 1000 || minUserNumber >= 999999 || isFirestoreQuotaExceeded()) {
+    return;
+  }
+  try {
+    const counterRef = doc(db, 'settings', 'user_counter');
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(counterRef);
+      const existing = snap.exists() ? (Number(snap.data()?.lastUserNumber ?? snap.data()?.count) || 1000) : 1000;
+      if (existing < minUserNumber) {
+        tx.set(counterRef, {
+          lastUserNumber: minUserNumber,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      }
+    });
+  } catch (err) {
+    handlePossibleQuotaError(err);
+  }
+}
+
 /**
  * Assigns a permanent, unique sequential customUserId (QK-USR-1001, 1002, 1003...)
  * using Firestore runTransaction on 'settings/user_counter'.
@@ -321,46 +748,34 @@ export async function assignSequentialUserIdViaTransaction(
   existingAssignedId?: string
 ): Promise<{ customUserId: string; userNumber: number }> {
   // 1. Strict Immutability Guard: If existingAssignedId is already a valid sequential ID, lock and return it immediately
-  if (existingAssignedId && /^(?:QK-)?USR-\d+$/i.test(existingAssignedId.trim())) {
-    const clean = existingAssignedId.trim().toUpperCase();
-    const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
-    const numMatch = idStr.match(/(\d+)/);
-    const num = numMatch ? parseInt(numMatch[1], 10) : 1001;
-    return { customUserId: idStr, userNumber: num };
+  const preExisting = parseValidSequentialUserId(existingAssignedId);
+  if (preExisting) {
+    return preExisting;
   }
 
   const cleanEmail = (targetEmail || '').trim().toLowerCase();
   const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : null;
+  const cleanTargetUid = (targetUid || '').trim();
 
   // 2. Prevent ID Hijacking & Reassignment: Check if user already has an assigned ID in Firestore
   try {
-    if (safeEmailDocId) {
-      const snap = await getDoc(doc(db, 'users', safeEmailDocId));
+    if (cleanTargetUid) {
+      const snap = await getDoc(doc(db, 'users', cleanTargetUid));
       if (snap.exists()) {
         const d = snap.data();
-        const foundId = d?.customUserId || d?.id;
-        if (foundId && /^(?:QK-)?USR-\d+$/i.test(foundId)) {
-          const clean = String(foundId).trim().toUpperCase();
-          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
-          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
-            ? d.userNumber
-            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
-          return { customUserId: idStr, userNumber: num };
+        if (!d?.isDeleted && d?.status !== 'deleted') {
+          const parsed = parseValidSequentialUserId(d?.customUserId || d?.id, d?.userNumber);
+          if (parsed) return parsed;
         }
       }
     }
-    if (targetUid) {
-      const snap = await getDoc(doc(db, 'users', targetUid));
+    if (safeEmailDocId && safeEmailDocId !== cleanTargetUid) {
+      const snap = await getDoc(doc(db, 'users', safeEmailDocId));
       if (snap.exists()) {
         const d = snap.data();
-        const foundId = d?.customUserId || d?.id;
-        if (foundId && /^(?:QK-)?USR-\d+$/i.test(foundId)) {
-          const clean = String(foundId).trim().toUpperCase();
-          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
-          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
-            ? d.userNumber
-            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
-          return { customUserId: idStr, userNumber: num };
+        if (!d?.isDeleted && d?.status !== 'deleted') {
+          const parsed = parseValidSequentialUserId(d?.customUserId || d?.id, d?.userNumber);
+          if (parsed) return parsed;
         }
       }
     }
@@ -368,162 +783,160 @@ export async function assignSequentialUserIdViaTransaction(
     console.warn('Check existing user before transaction notice:', e);
   }
 
-  // Find maximum existing user number across local and known registered users to prevent reuse/collision
+  // Find maximum existing user number across local known users as an additional safety floor
   let maxKnownNum = 1000;
   try {
-    const raw = localStorage.getItem('quizkart_registered_users');
-    if (raw) {
-      const list = JSON.parse(raw);
-      if (Array.isArray(list)) {
-        list.forEach((u: any) => {
-          const num = extractNumericUserNumber(u);
-          if (num >= 1000 && num < 999999 && num > maxKnownNum) {
-            maxKnownNum = num;
-          }
-        });
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem('quizkart_registered_users');
+      if (raw) {
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          list.forEach((u: any) => {
+            const num = extractNumericUserNumber(u);
+            if (num >= 1000 && num < 999999 && num > maxKnownNum) {
+              maxKnownNum = num;
+            }
+          });
+        }
+      }
+      const rawDel = localStorage.getItem('quizkart_deleted_users');
+      if (rawDel) {
+        const delList = JSON.parse(rawDel);
+        if (Array.isArray(delList)) {
+          delList.forEach((u: any) => {
+            const num = extractNumericUserNumber(u);
+            if (num >= 1000 && num < 999999 && num > maxKnownNum) {
+              maxKnownNum = num;
+            }
+          });
+        }
       }
     }
   } catch {}
 
-  // Check deleted users archive in localStorage as well to ensure deleted user numbers are never recycled or collided
-  try {
-    const rawDel = localStorage.getItem('quizkart_deleted_users');
-    if (rawDel) {
-      const delList = JSON.parse(rawDel);
-      if (Array.isArray(delList)) {
-        delList.forEach((u: any) => {
-          const num = extractNumericUserNumber(u);
-          if (num >= 1000 && num < 999999 && num > maxKnownNum) {
-            maxKnownNum = num;
+  if (isFirestoreQuotaExceeded()) {
+    const nextNum = Math.max(1000, maxKnownNum) + 1;
+    return { customUserId: `QK-USR-${nextNum}`, userNumber: nextNum };
+  }
+
+  // 3. Atomic transaction on 'settings/user_counter' with retry loop for concurrent registrations
+  const counterRef = doc(db, 'settings', 'user_counter');
+  const userDocRef = safeEmailDocId ? doc(db, 'users', safeEmailDocId) : (cleanTargetUid ? doc(db, 'users', cleanTargetUid) : null);
+  const uidDocRef = (cleanTargetUid && safeEmailDocId && cleanTargetUid !== safeEmailDocId) ? doc(db, 'users', cleanTargetUid) : null;
+
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const result = await runTransaction(db, async (transaction) => {
+        // All transaction reads first
+        const counterDoc = await transaction.get(counterRef);
+        const existingUserDoc = userDocRef ? await transaction.get(userDocRef) : null;
+        const existingUidDoc = uidDocRef ? await transaction.get(uidDocRef) : null;
+
+        // Check UID doc first (highest confidence permanent binding)
+        if (existingUidDoc && existingUidDoc.exists()) {
+          const d = existingUidDoc.data();
+          if (!d?.isDeleted && d?.status !== 'deleted') {
+            const parsed = parseValidSequentialUserId(d?.customUserId || d?.id, d?.userNumber);
+            if (parsed) return parsed;
           }
-        });
-      }
-    }
-  } catch {}
-
-  // 3. Atomic transaction on 'settings/user_counter' and permanent binding to the user's Firestore document
-  try {
-    const counterRef = doc(db, 'settings', 'user_counter');
-    const userDocRef = safeEmailDocId ? doc(db, 'users', safeEmailDocId) : (targetUid ? doc(db, 'users', targetUid) : null);
-    const uidDocRef = (targetUid && safeEmailDocId && targetUid !== safeEmailDocId) ? doc(db, 'users', targetUid) : null;
-
-    const result = await runTransaction(db, async (transaction) => {
-      // All transaction reads first
-      const counterDoc = await transaction.get(counterRef);
-      const existingUserDoc = userDocRef ? await transaction.get(userDocRef) : null;
-      const existingUidDoc = uidDocRef ? await transaction.get(uidDocRef) : null;
-
-      // Check UID doc first (highest confidence permanent binding)
-      if (existingUidDoc && existingUidDoc.exists()) {
-        const d = existingUidDoc.data();
-        const foundId = d?.customUserId || d?.id;
-        if (foundId && /^(?:QK-)?USR-\d+$/i.test(foundId)) {
-          const clean = String(foundId).trim().toUpperCase();
-          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
-          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
-            ? d.userNumber
-            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
-          return { customUserId: idStr, userNumber: num };
         }
-      }
 
-      // Check email userDoc (verify account ownership before restoring)
-      if (existingUserDoc && existingUserDoc.exists()) {
-        const d = existingUserDoc.data();
-        const foundId = d?.customUserId || d?.id;
-        const isVerifiedOwner = !targetUid || !d?.uid || d.uid === targetUid;
-        if (isVerifiedOwner && foundId && /^(?:QK-)?USR-\d+$/i.test(foundId) && !d?.isDeleted) {
-          const clean = String(foundId).trim().toUpperCase();
-          const idStr = clean.startsWith('QK-') ? clean : `QK-${clean}`;
-          const num = typeof d?.userNumber === 'number' && d.userNumber >= 1000
-            ? d.userNumber
-            : (idStr.match(/(\d+)/) ? parseInt(idStr.match(/(\d+)/)![1], 10) : 1001);
-          return { customUserId: idStr, userNumber: num };
+        // Check email userDoc (verify non-deleted user doesn't already own a sequential ID)
+        if (existingUserDoc && existingUserDoc.exists()) {
+          const d = existingUserDoc.data();
+          const isSameAuthUid = !cleanTargetUid || !d?.uid || d.uid === cleanTargetUid || (cleanEmail && String(d?.email || '').trim().toLowerCase() === cleanEmail);
+          if (isSameAuthUid && !d?.isDeleted && d?.status !== 'deleted') {
+            const parsed = parseValidSequentialUserId(d?.customUserId || d?.id, d?.userNumber);
+            if (parsed) return parsed;
+          }
         }
-      }
 
-      let currentCounter = 1000;
-      if (counterDoc.exists()) {
-        const data = counterDoc.data();
-        if (typeof data?.lastUserNumber === 'number' && data.lastUserNumber >= 1000) {
-          currentCounter = data.lastUserNumber;
-        } else if (typeof data?.count === 'number' && data.count >= 1000) {
-          currentCounter = data.count;
+        let currentCounter = 1000;
+        if (counterDoc.exists()) {
+          const data = counterDoc.data();
+          if (typeof data?.lastUserNumber === 'number' && data.lastUserNumber >= 1000) {
+            currentCounter = data.lastUserNumber;
+          } else if (typeof data?.count === 'number' && data.count >= 1000) {
+            currentCounter = data.count;
+          }
         }
-      }
 
-      const baseline = Math.max(1000, currentCounter, maxKnownNum);
-      const nextUserNumber = baseline + 1;
-      const newCustomUserId = `QK-USR-${nextUserNumber}`;
+        const baseline = Math.max(1000, currentCounter, maxKnownNum);
+        const nextUserNumber = baseline + 1;
+        const newCustomUserId = `QK-USR-${nextUserNumber}`;
+        const nowIso = new Date().toISOString();
 
-      // Transaction writes:
-      // 1. Update atomic counter
-      transaction.set(counterRef, {
-        lastUserNumber: nextUserNumber,
-        lastAssignedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
-
-      // 2. Permanently bind customUserId and userNumber to user's Firestore document
-      if (uidDocRef) {
-        transaction.set(uidDocRef, {
-          customUserId: newCustomUserId,
-          id: newCustomUserId,
-          userNumber: nextUserNumber,
-          email: cleanEmail,
-          uid: targetUid,
-          updatedAt: new Date().toISOString()
+        // 1. Update atomic counter
+        transaction.set(counterRef, {
+          lastUserNumber: nextUserNumber,
+          lastAssignedAt: nowIso,
+          updatedAt: nowIso
         }, { merge: true });
-      }
 
-      if (userDocRef) {
-        const canWriteEmailDoc = !existingUserDoc?.exists() || !existingUserDoc.data()?.uid || existingUserDoc.data()?.uid === targetUid;
-        if (canWriteEmailDoc) {
-          transaction.set(userDocRef, {
+        // 2. Permanently bind customUserId and userNumber to user's Firestore document
+        const existingCreatedAt =
+          (existingUidDoc?.exists() ? existingUidDoc.data()?.createdAt : undefined) ||
+          (existingUserDoc?.exists() ? existingUserDoc.data()?.createdAt : undefined) ||
+          nowIso;
+
+        if (uidDocRef) {
+          transaction.set(uidDocRef, stripUndefinedFields({
             customUserId: newCustomUserId,
             id: newCustomUserId,
             userNumber: nextUserNumber,
             email: cleanEmail,
-            uid: targetUid || newCustomUserId,
-            updatedAt: new Date().toISOString()
-          }, { merge: true });
+            uid: cleanTargetUid,
+            createdAt: existingCreatedAt,
+            updatedAt: nowIso
+          }), { merge: true });
         }
+
+        if (userDocRef) {
+          const canWriteEmailDoc = !existingUserDoc?.exists() || !existingUserDoc.data()?.uid || existingUserDoc.data()?.uid === cleanTargetUid || !cleanTargetUid;
+          if (canWriteEmailDoc) {
+            transaction.set(userDocRef, stripUndefinedFields({
+              customUserId: newCustomUserId,
+              id: newCustomUserId,
+              userNumber: nextUserNumber,
+              email: cleanEmail,
+              uid: cleanTargetUid || existingUserDoc?.data()?.uid || safeEmailDocId || newCustomUserId,
+              createdAt: existingCreatedAt,
+              updatedAt: nowIso
+            }), { merge: true });
+          }
+        }
+
+        return { customUserId: newCustomUserId, userNumber: nextUserNumber };
+      });
+
+      return result;
+    } catch (txErr: any) {
+      lastError = txErr;
+      if (handlePossibleQuotaError(txErr)) {
+        const nextNum = Math.max(1000, maxKnownNum) + 1;
+        return { customUserId: `QK-USR-${nextNum}`, userNumber: nextNum };
       }
-
-      return { customUserId: newCustomUserId, userNumber: nextUserNumber };
-    });
-
-    return result;
-  } catch (txErr) {
-    console.warn('runTransaction user counter notice, computing next safe sequence:', txErr);
-    let maxNum = Math.max(1000, maxKnownNum);
-    const nextNum = maxNum + 1;
-    const fallbackId = `QK-USR-${nextNum}`;
-
-    // Ensure fallback is also stored if possible
-    if (targetUid) {
-      setDoc(doc(db, 'users', targetUid), {
-        customUserId: fallbackId,
-        id: fallbackId,
-        userNumber: nextNum,
-        email: cleanEmail,
-        uid: targetUid,
-        updatedAt: new Date().toISOString()
-      }, { merge: true }).catch(() => {});
+      const code = String(txErr?.code || '');
+      const msg = String(txErr?.message || '');
+      const isRetryable =
+        code === 'aborted' ||
+        code === 'failed-precondition' ||
+        code === 'unavailable' ||
+        msg.includes('aborted') ||
+        msg.includes('Too much contention');
+      if (isRetryable && attempt < 3) {
+        const delayMs = 80 + attempt * 90 + Math.floor(Math.random() * 80);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      break;
     }
-    if (safeEmailDocId && safeEmailDocId !== targetUid) {
-      setDoc(doc(db, 'users', safeEmailDocId), {
-        customUserId: fallbackId,
-        id: fallbackId,
-        userNumber: nextNum,
-        email: cleanEmail,
-        uid: targetUid || fallbackId,
-        updatedAt: new Date().toISOString()
-      }, { merge: true }).catch(() => {});
-    }
-
-    return { customUserId: fallbackId, userNumber: nextNum };
   }
+
+  throw new Error(
+    `Unable to assign unique sequential Registration ID via Firestore: ${lastError instanceof Error ? lastError.message : String(lastError || 'Transaction failed')}`
+  );
 }
 
 // Dedicated single-user block/unblock status update to ensure ONLY the selected user is affected
@@ -560,30 +973,51 @@ export async function updateUserBlockStatusInFirestore(
 }
 
 // Firestore persistence helpers for QuizKart
-export async function syncUserProfile(profile: UserProfile): Promise<void> {
-  if (!profile || isDemoSeedUser(profile) || isFirestoreQuotaExceeded()) return;
+export async function syncUserProfile(
+  profile: UserProfile,
+  options?: { throwOnError?: boolean }
+): Promise<void> {
+  if (!profile || isDemoSeedUser(profile)) return;
+  if (isFirestoreQuotaExceeded()) {
+    if (options?.throwOnError) {
+      throw new Error('Registration server quota limit reached. Please try again later.');
+    }
+    return;
+  }
   const currentUser = auth.currentUser;
   const cleanEmail = (profile.email || currentUser?.email || '').trim().toLowerCase();
   const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : null;
-  const docId = safeEmailDocId || profile.uid || profile.id || (currentUser?.uid ?? null);
+  const currentUserMatchesEmail = Boolean(
+    currentUser &&
+    (!cleanEmail || (currentUser.email || '').trim().toLowerCase() === cleanEmail)
+  );
+  const resolvedUid = (profile.uid && !profile.uid.startsWith('QK-USR-'))
+    ? profile.uid
+    : (currentUserMatchesEmail && currentUser?.uid ? currentUser.uid : (safeEmailDocId || profile.id || ''));
+  const docId = safeEmailDocId || resolvedUid || profile.id || null;
   if (!docId) return;
 
   const derivedUserNumber = extractNumericUserNumber(profile);
   const resolvedCustomId = profile.customUserId || profile.id || (derivedUserNumber < 999999 ? `QK-USR-${derivedUserNumber}` : docId);
+  const nowIso = new Date().toISOString();
+  const resolvedCreatedAt =
+    profile.createdAt ||
+    (profile.registrationDate && profile.registrationDate.includes('T') ? profile.registrationDate : undefined) ||
+    nowIso;
+  const resolvedRegDateOnly = (profile.registrationDate || resolvedCreatedAt.split('T')[0]).split('|')[0].trim().split('T')[0].trim();
 
-  const path = `users/${docId}`;
   try {
     const isUserDeleted = Boolean(profile.isDeleted) || profile.status === 'deleted' || Boolean(profile.deletedAt);
-    const userPayload: Record<string, any> = {
-      uid: profile.uid || currentUser?.uid || docId,
+    const rawPayload: Record<string, any> = {
+      uid: resolvedUid || docId,
       id: resolvedCustomId,
       customUserId: resolvedCustomId,
       userNumber: derivedUserNumber < 999999 ? derivedUserNumber : undefined,
-      name: profile.name || currentUser?.displayName || 'Player',
+      name: profile.name || (currentUserMatchesEmail ? currentUser?.displayName : undefined) || 'Player',
       email: cleanEmail,
       mobile: profile.mobile || '',
       countryCode: profile.countryCode || '+91',
-      avatarUrl: profile.avatarUrl || currentUser?.photoURL || '',
+      avatarUrl: profile.avatarUrl || (currentUserMatchesEmail ? currentUser?.photoURL : undefined) || '',
       upiId: profile.upiId || '',
       walletBalance: Number(profile.walletBalance) || 0,
       quizzesPlayed: Number(profile.quizzesPlayed) || 0,
@@ -592,30 +1026,41 @@ export async function syncUserProfile(profile: UserProfile): Promise<void> {
       isRegistered: profile.isRegistered ?? true,
       isBlocked: Boolean(profile.isBlocked),
       blockReason: profile.blockReason || '',
-      registrationDate: profile.registrationDate || new Date().toISOString().split('T')[0],
+      registrationDate: resolvedRegDateOnly,
+      createdAt: resolvedCreatedAt,
       passwordStatus: (profile.passwordStatus && !profile.passwordStatus.includes('••••') && !profile.passwordStatus.includes('Secured')) ? profile.passwordStatus : 'player@123',
       hasPassword: profile.hasPassword ?? true,
       kycStatus: profile.kycStatus || 'Unverified',
       isDeleted: isUserDeleted,
       status: isUserDeleted ? 'deleted' : (profile.status || 'active'),
-      updatedAt: new Date().toISOString()
+      updatedAt: nowIso
     };
     if (isUserDeleted) {
-      userPayload.deletedAt = profile.deletedAt || new Date().toISOString().split('T')[0];
-      userPayload.deletedTimestampMs = profile.deletedTimestampMs || Date.now();
+      rawPayload.deletedAt = profile.deletedAt || nowIso.split('T')[0];
+      rawPayload.deletedTimestampMs = profile.deletedTimestampMs || Date.now();
     }
+    const userPayload = stripUndefinedFields(rawPayload);
     await setDoc(doc(db, 'users', docId), userPayload, { merge: true });
-    // ONLY mirror to currentUser.uid if the profile being synced actually belongs to the current user
+
+    // ONLY mirror to currentUser.uid if the profile being synced actually belongs to the current Firebase Auth user
     if (
       currentUser?.uid &&
       currentUser.uid !== docId &&
-      (profile.uid === currentUser.uid || cleanEmail === (currentUser.email || '').toLowerCase())
+      (profile.uid === currentUser.uid || (cleanEmail && cleanEmail === (currentUser.email || '').toLowerCase()))
     ) {
       await setDoc(doc(db, 'users', currentUser.uid), userPayload, { merge: true });
     }
   } catch (error) {
-    if (handlePossibleQuotaError(error)) return;
+    if (handlePossibleQuotaError(error)) {
+      if (options?.throwOnError) {
+        throw new Error('Registration server quota limit reached. Please try again later.');
+      }
+      return;
+    }
     console.warn('Firestore user sync notice:', error);
+    if (options?.throwOnError) {
+      throw error instanceof Error ? error : new Error(String(error || 'Failed to persist user profile in Firestore'));
+    }
   }
 }
 
@@ -649,158 +1094,266 @@ function isAccountDeleted(u: any): boolean {
   const email = (u.email || '').trim().toLowerCase();
   const id = (u.customUserId || u.id || '').trim();
   try {
-    const raw = localStorage.getItem('quizkart_deleted_users');
-    if (raw) {
-      const list = JSON.parse(raw);
-      if (Array.isArray(list)) {
-        return list.some((d: any) => 
-          (d && d.email && (d.email || '').trim().toLowerCase() === email) ||
-          (d && d.id && (d.id || '').trim() === id)
-        );
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem('quizkart_deleted_users');
+      if (raw) {
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          return list.some((d: any) =>
+            (d && d.email && (d.email || '').trim().toLowerCase() === email) ||
+            (d && d.id && (d.id || '').trim() === id)
+          );
+        }
       }
     }
   } catch {}
   return false;
 }
 
-export async function fetchAllUsersFromFirestore(): Promise<UserProfile[]> {
-  const path = 'users';
-  try {
-    let snap;
-    try {
-      const q = query(collection(db, path), orderBy('userNumber', 'asc'));
-      snap = await getDocs(q);
-    } catch {
-      snap = await getDocs(collection(db, path));
-    }
-    const userMap = new Map<string, UserProfile>();
-    snap.forEach((docItem) => {
-      const data = docItem.data() as UserProfile;
-      if (!data || isDemoSeedUser(data)) return;
-      if (isAccountDeleted(data)) return; // Exclude deleted users
+function toTimestampMs(val?: string | number): number {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (!val || typeof val !== 'string') return 0;
+  const parsed = new Date(val).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
-      if (data.name || data.email) {
-        const uNum = extractNumericUserNumber(data);
-        const cId = data.customUserId || data.id || (uNum < 999999 ? `QK-USR-${uNum}` : docItem.id);
-        const resolvedUid = (data.uid && !data.uid.startsWith('QK-USR-')) 
-          ? data.uid 
-          : (docItem.id && !docItem.id.startsWith('QK-USR-') ? docItem.id : (data.uid || docItem.id));
-        const userObj: UserProfile = {
-          ...data,
-          id: cId,
-          customUserId: cId,
-          userNumber: uNum < 999999 ? uNum : undefined,
-          uid: resolvedUid
-        };
+/**
+ * Normalizes, deduplicates by Firebase UID (then email alias), and sorts
+ * Firestore user records in exact registration order.
+ */
+export function normalizeAndDeduplicateFirestoreUsers(
+  rawDocs: Array<{ docId: string; data: Partial<UserProfile> }>
+): UserProfile[] {
+  const byUid = new Map<string, UserProfile>();
+  const emailToUidKey = new Map<string, string>();
 
-        const cleanEmail = (data.email || '').trim().toLowerCase();
-        const primaryKey = cleanEmail || resolvedUid || cId;
+  rawDocs.forEach(({ docId, data }) => {
+    if (!data || isDemoSeedUser(data as UserProfile)) return;
+    if (isAccountDeleted(data)) return;
+    if (!data.name && !data.email && !data.customUserId) return;
 
-        if (userMap.has(primaryKey)) {
-          const existing = userMap.get(primaryKey)!;
-          userMap.set(primaryKey, {
-            ...existing,
-            ...userObj,
-            uid: (existing.uid && !existing.uid.startsWith('QK-USR-')) ? existing.uid : userObj.uid,
-            customUserId: existing.customUserId || userObj.customUserId,
-            userNumber: existing.userNumber || userObj.userNumber
-          });
-        } else {
-          userMap.set(primaryKey, userObj);
-        }
+    const uNum = extractNumericUserNumber(data);
+    const parsedId = parseValidSequentialUserId(data.customUserId || data.id, uNum < 999999 ? uNum : undefined);
+    const cId = parsedId?.customUserId || data.customUserId || data.id || '';
+    const resolvedNum = parsedId?.userNumber ?? (uNum < 999999 ? uNum : undefined);
+
+    const rawUid = (data.uid || '').trim();
+    const resolvedUid = (rawUid && !rawUid.startsWith('QK-USR-'))
+      ? rawUid
+      : (docId && !docId.startsWith('QK-USR-') ? docId : (rawUid || docId));
+    const cleanEmail = (data.email || '').trim().toLowerCase();
+
+    const userObj: UserProfile = {
+      ...(data as UserProfile),
+      id: cId || resolvedUid,
+      customUserId: cId || undefined,
+      userNumber: resolvedNum,
+      uid: resolvedUid,
+      email: cleanEmail || data.email || '',
+      createdAt: data.createdAt || (data.registrationDate && String(data.registrationDate).includes('T') ? data.registrationDate : undefined)
+    };
+
+    // Primary deduplication by Firebase UID; link email-alias docs with the same owner
+    let targetKey = resolvedUid;
+    if (!byUid.has(targetKey) && cleanEmail && emailToUidKey.has(cleanEmail)) {
+      const linkedKey = emailToUidKey.get(cleanEmail)!;
+      const linkedUser = byUid.get(linkedKey);
+      const isDocIdAlias = !rawUid || rawUid.startsWith('QK-USR-') || docId === cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') || linkedKey === cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (linkedUser && isDocIdAlias) {
+        targetKey = linkedKey;
       }
+    }
+
+    if (byUid.has(targetKey)) {
+      const existing = byUid.get(targetKey)!;
+      const existingUpdated = toTimestampMs(existing.updatedAt);
+      const incomingUpdated = toTimestampMs(userObj.updatedAt);
+      const preferIncoming = incomingUpdated >= existingUpdated;
+      const earlierCreatedAt = (() => {
+        const a = toTimestampMs(existing.createdAt || existing.registrationDate);
+        const b = toTimestampMs(userObj.createdAt || userObj.registrationDate);
+        if (a > 0 && b > 0) return a <= b ? existing.createdAt : userObj.createdAt;
+        return existing.createdAt || userObj.createdAt;
+      })();
+      const canonicalUid =
+        (existing.uid && !existing.uid.startsWith('QK-USR-') && !existing.uid.includes('_'))
+          ? existing.uid
+          : ((userObj.uid && !userObj.uid.startsWith('QK-USR-') && !userObj.uid.includes('_'))
+              ? userObj.uid
+              : (existing.uid || userObj.uid));
+
+      const merged: UserProfile = {
+        ...(preferIncoming ? existing : userObj),
+        ...(preferIncoming ? userObj : existing),
+        uid: canonicalUid,
+        id: existing.customUserId || userObj.customUserId || existing.id || userObj.id,
+        customUserId: existing.customUserId || userObj.customUserId,
+        userNumber: existing.userNumber || userObj.userNumber,
+        createdAt: earlierCreatedAt,
+        registrationDate: existing.registrationDate || userObj.registrationDate,
+        name: (preferIncoming ? userObj.name : existing.name) || existing.name || userObj.name,
+        mobile: (preferIncoming ? userObj.mobile : existing.mobile) || existing.mobile || userObj.mobile,
+        email: cleanEmail || existing.email || userObj.email,
+        avatarUrl: (preferIncoming ? userObj.avatarUrl : existing.avatarUrl) || existing.avatarUrl || userObj.avatarUrl
+      };
+      byUid.set(targetKey, merged);
+      if (cleanEmail) emailToUidKey.set(cleanEmail, targetKey);
+    } else {
+      byUid.set(targetKey, userObj);
+      if (cleanEmail && !emailToUidKey.has(cleanEmail)) {
+        emailToUidKey.set(cleanEmail, targetKey);
+      }
+    }
+  });
+
+  const list = Array.from(byUid.values());
+  list.sort((a, b) => {
+    const numA = extractNumericUserNumber(a);
+    const numB = extractNumericUserNumber(b);
+    if (numA < 999999 && numB < 999999 && numA !== numB) {
+      return numA - numB;
+    }
+    const timeA = toTimestampMs(a.createdAt || a.registrationDate);
+    const timeB = toTimestampMs(b.createdAt || b.registrationDate);
+    if (timeA > 0 && timeB > 0 && timeA !== timeB) {
+      return timeA - timeB;
+    }
+    if (numA !== numB) return numA - numB;
+    return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
+  });
+  return list;
+}
+
+export async function fetchAllUsersWithStatusFromFirestore(): Promise<{
+  users: UserProfile[];
+  errorCode?: string;
+  errorMessage?: string;
+}> {
+  const path = 'users';
+  if (isFirestoreQuotaExceeded()) {
+    return { users: [], errorCode: 'resource-exhausted', errorMessage: 'Firestore quota exceeded.' };
+  }
+  try {
+    await waitForFirebaseAuthReady();
+    // Query entire users collection without orderBy exclusion so docs missing userNumber are never hidden
+    const snap = await getDocs(collection(db, path));
+    const rawDocs: Array<{ docId: string; data: Partial<UserProfile> }> = [];
+    snap.forEach((docItem) => {
+      rawDocs.push({ docId: docItem.id, data: docItem.data() as Partial<UserProfile> });
     });
-    const list = Array.from(userMap.values());
-    // Strict ascending numeric order (1001, 1002, 1003... 1010)
-    list.sort((a, b) => {
-      const numA = extractNumericUserNumber(a);
-      const numB = extractNumericUserNumber(b);
-      if (numA !== numB) return numA - numB;
-      const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
-      const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
-      if (timeA !== timeB) return timeA - timeB;
-      return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
-    });
-    return list;
-  } catch (error) {
-    console.warn('fetchAllUsersFromFirestore error:', error);
-    return [];
+    return { users: normalizeAndDeduplicateFirestoreUsers(rawDocs) };
+  } catch (error: any) {
+    handlePossibleQuotaError(error);
+    const code = String(error?.code || '');
+    const msg = error instanceof Error ? error.message : String(error || '');
+    const isPerm = code === 'permission-denied' || msg.includes('permission-denied') || msg.includes('insufficient permissions');
+    if (!isPerm) {
+      console.warn('fetchAllUsersFromFirestore error:', error);
+    }
+    return {
+      users: [],
+      errorCode: isPerm ? 'permission-denied' : (code || 'unknown'),
+      errorMessage: msg
+    };
   }
 }
 
-export function subscribeToAllUsersFromFirestore(callback: (users: UserProfile[]) => void): () => void {
+export async function fetchAllUsersFromFirestore(): Promise<UserProfile[]> {
+  const res = await fetchAllUsersWithStatusFromFirestore();
+  return res.users;
+}
+
+export function subscribeToAllUsersFromFirestore(
+  callback: (users: UserProfile[]) => void,
+  onError?: (err: { code: string; message: string }) => void
+): () => void {
   const path = 'users';
-  try {
-    const handleSnap = (snap: any) => {
-      const userMap = new Map<string, UserProfile>();
-      snap.forEach((docItem: any) => {
-        const data = docItem.data() as UserProfile;
-        if (!data || isDemoSeedUser(data)) return;
-        if (isAccountDeleted(data)) return; // Exclude deleted users
+  if (isFirestoreQuotaExceeded()) return () => {};
 
-        if (data.name || data.email) {
-          const uNum = extractNumericUserNumber(data);
-          const cId = data.customUserId || data.id || (uNum < 999999 ? `QK-USR-${uNum}` : docItem.id);
-          const resolvedUid = (data.uid && !data.uid.startsWith('QK-USR-')) 
-            ? data.uid 
-            : (docItem.id && !docItem.id.startsWith('QK-USR-') ? docItem.id : (data.uid || docItem.id));
-          const userObj: UserProfile = {
-            ...data,
-            id: cId,
-            customUserId: cId,
-            userNumber: uNum < 999999 ? uNum : undefined,
-            uid: resolvedUid
-          };
+  let isDisposed = false;
+  let activeUnsub: (() => void) | null = null;
+  let lastBoundAuthKey = '__unset__';
 
-          const cleanEmail = (data.email || '').trim().toLowerCase();
-          const primaryKey = cleanEmail || resolvedUid || cId;
+  const cleanupListener = () => {
+    if (activeUnsub) {
+      try {
+        activeUnsub();
+      } catch {}
+      activeUnsub = null;
+    }
+  };
 
-          if (userMap.has(primaryKey)) {
-            const existing = userMap.get(primaryKey)!;
-            userMap.set(primaryKey, {
-              ...existing,
-              ...userObj,
-              uid: (existing.uid && !existing.uid.startsWith('QK-USR-')) ? existing.uid : userObj.uid,
-              customUserId: existing.customUserId || userObj.customUserId,
-              userNumber: existing.userNumber || userObj.userNumber
-            });
-          } else {
-            userMap.set(primaryKey, userObj);
-          }
-        }
+  const attachListener = () => {
+    if (isDisposed) return;
+    if (authPersistenceStatus.mode === 'failed') {
+      cleanupListener();
+      onError?.({
+        code: 'auth/persistence-failed',
+        message: authPersistenceStatus.error || 'Firebase Auth storage persistence failed.'
       });
-      const list = Array.from(userMap.values());
-      // Stable ascending numeric order (1001, 1002, 1003... 1010)
-      list.sort((a, b) => {
-        const numA = extractNumericUserNumber(a);
-        const numB = extractNumericUserNumber(b);
-        if (numA !== numB) return numA - numB;
-        const timeA = new Date(a.registrationDate || a.createdAt || 0).getTime();
-        const timeB = new Date(b.registrationDate || b.createdAt || 0).getTime();
-        if (timeA !== timeB) return timeA - timeB;
-        return (a.uid || a.id || '').localeCompare(b.uid || b.id || '');
-      });
-      callback(list);
-    };
+      return;
+    }
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      lastBoundAuthKey = 'anon';
+      cleanupListener();
+      onError?.({ code: 'permission-denied', message: 'Firebase Admin Google sign-in required.' });
+      return;
+    }
+    const nextAuthKey = `${currentUser.uid}:${(currentUser.email || '').toLowerCase()}:${String(currentUser.emailVerified)}`;
+    if (nextAuthKey === lastBoundAuthKey && activeUnsub) return;
+    lastBoundAuthKey = nextAuthKey;
+    cleanupListener();
 
     try {
-      const q = query(collection(db, path), orderBy('userNumber', 'asc'));
-      return onSnapshot(
-        q,
-        handleSnap,
-        () => {
-          // Fallback to plain collection listener if orderBy index not yet provisioned
-          return onSnapshot(collection(db, path), handleSnap, (err) => console.warn('Users subscription fallback warning:', err));
+      activeUnsub = onSnapshot(
+        collection(db, path),
+        (snap) => {
+          if (isDisposed) return;
+          const rawDocs: Array<{ docId: string; data: Partial<UserProfile> }> = [];
+          snap.forEach((docItem) => {
+            rawDocs.push({ docId: docItem.id, data: docItem.data() as Partial<UserProfile> });
+          });
+          callback(normalizeAndDeduplicateFirestoreUsers(rawDocs));
+        },
+        (error: any) => {
+          handlePossibleQuotaError(error);
+          const code = String(error?.code || '');
+          const msg = error instanceof Error ? error.message : String(error || '');
+          const isPerm = code === 'permission-denied' || msg.includes('permission-denied') || msg.includes('insufficient permissions');
+          if (onError) {
+            onError({ code: isPerm ? 'permission-denied' : (code || 'unknown'), message: msg });
+          } else if (!isPerm) {
+            console.warn('Firestore users subscription warning:', error);
+          }
         }
       );
-    } catch {
-      return onSnapshot(collection(db, path), handleSnap, (error) => {
-        console.warn('Firestore users subscription warning:', error);
-      });
+    } catch (err: any) {
+      onError?.({ code: String(err?.code || 'unknown'), message: err?.message || String(err) });
     }
-  } catch {
-    return () => {};
-  }
+  };
+
+  let unsubAuth: (() => void) | null = null;
+  // Strictly wait until Firebase Auth persistence + authStateReady completes BEFORE attaching Firestore listener
+  waitForFirebaseAuthReady().then(() => {
+    if (isDisposed) return;
+    attachListener();
+    try {
+      unsubAuth = onAuthStateChanged(auth, () => {
+        attachListener();
+      });
+    } catch {}
+  });
+
+  return () => {
+    isDisposed = true;
+    cleanupListener();
+    if (unsubAuth) {
+      try {
+        unsubAuth();
+      } catch {}
+    }
+  };
 }
 
 // Global Real-Time User Presence Management (Firebase Firestore)
@@ -886,47 +1439,131 @@ export async function fetchUserProfile(uid: string, email?: string): Promise<Par
       const snap = await getDoc(doc(db, 'users', uid));
       if (snap.exists()) {
         dataFromUid = snap.data() as Partial<UserProfile>;
-        const validId = (dataFromUid?.customUserId || dataFromUid?.id || '').trim();
-        if (validId && /^(?:QK-)?USR-\d+$/i.test(validId)) {
-          return dataFromUid;
+      }
+    }
+
+    // 2. Also check safe email doc so Admin-side updates/refunds written to users/{safeEmailDocId} are never missed
+    const targetEmail = email || (uid && uid.includes('@') ? uid : auth.currentUser?.email) || dataFromUid?.email;
+    let dataFromEmail: Partial<UserProfile> | null = null;
+    let safeEmailDocId = '';
+    if (targetEmail) {
+      const cleanEmail = targetEmail.trim().toLowerCase();
+      safeEmailDocId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (safeEmailDocId !== uid) {
+        const snapEmail = await getDoc(doc(db, 'users', safeEmailDocId));
+        if (snapEmail.exists()) {
+          dataFromEmail = snapEmail.data() as Partial<UserProfile>;
         }
       }
     }
 
-    // 2. Safe email doc lookup if email provided or if uid contains '@' or via currentUser
-    const targetEmail = email || (uid && uid.includes('@') ? uid : auth.currentUser?.email) || dataFromUid?.email;
-    if (targetEmail) {
-      const cleanEmail = targetEmail.trim().toLowerCase();
-      const safeEmailDocId = cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_');
-      if (safeEmailDocId !== uid) {
-        const snapEmail = await getDoc(doc(db, 'users', safeEmailDocId));
-        if (snapEmail.exists()) {
-          const emailData = snapEmail.data() as Partial<UserProfile>;
-          const validEmailId = (emailData?.customUserId || emailData?.id || '').trim();
-          if (validEmailId && /^(?:QK-)?USR-\d+$/i.test(validEmailId)) {
-            // Mirror to users/{uid} so users/{uid} is permanently populated
-            if (uid && uid !== safeEmailDocId) {
-              setDoc(doc(db, 'users', uid), {
-                ...emailData,
-                uid,
-                updatedAt: new Date().toISOString()
-              }, { merge: true }).catch(() => {});
-            }
-            return {
-              ...(dataFromUid || {}),
-              ...emailData,
-              uid: uid || emailData.uid || safeEmailDocId
-            };
-          }
-          return { ...(dataFromUid || {}), ...emailData };
-        }
+    if (dataFromUid && dataFromEmail) {
+      const uidUpdatedMs = new Date((dataFromUid as any).updatedAt || 0).getTime();
+      const emailUpdatedMs = new Date((dataFromEmail as any).updatedAt || 0).getTime();
+      const merged = emailUpdatedMs >= uidUpdatedMs
+        ? { ...dataFromUid, ...dataFromEmail }
+        : { ...dataFromEmail, ...dataFromUid };
+      const validId = (merged?.customUserId || merged?.id || '').trim();
+      if (validId && /^(?:QK-)?USR-\d+$/i.test(validId) && uid && uid !== safeEmailDocId && emailUpdatedMs > uidUpdatedMs) {
+        setDoc(doc(db, 'users', uid), {
+          ...merged,
+          uid,
+          updatedAt: (dataFromEmail as any).updatedAt || new Date().toISOString()
+        }, { merge: true }).catch(() => {});
       }
+      return {
+        ...merged,
+        uid: uid || merged.uid || safeEmailDocId
+      };
     }
+
+    if (dataFromEmail) {
+      const validEmailId = (dataFromEmail?.customUserId || dataFromEmail?.id || '').trim();
+      if (validEmailId && /^(?:QK-)?USR-\d+$/i.test(validEmailId) && uid && uid !== safeEmailDocId) {
+        setDoc(doc(db, 'users', uid), {
+          ...dataFromEmail,
+          uid,
+          updatedAt: (dataFromEmail as any).updatedAt || new Date().toISOString()
+        }, { merge: true }).catch(() => {});
+      }
+      return {
+        ...dataFromEmail,
+        uid: uid || dataFromEmail.uid || safeEmailDocId
+      };
+    }
+
     return dataFromUid;
   } catch (error) {
     if (handlePossibleQuotaError(error)) return null;
     return null;
   }
+}
+
+export function subscribeToUserProfileFromFirestore(
+  uid: string,
+  email: string | undefined,
+  callback: (profile: Partial<UserProfile>) => void
+): () => void {
+  if ((!uid && !email) || isFirestoreQuotaExceeded()) return () => {};
+  const cleanEmail = (email || (uid && uid.includes('@') ? uid : auth.currentUser?.email) || '').trim().toLowerCase();
+  const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+  const targetDocId = safeEmailDocId || uid;
+  const unsubs: Array<() => void> = [];
+
+  try {
+    let latestByEmail: Partial<UserProfile> | null = null;
+    let latestByUid: Partial<UserProfile> | null = null;
+
+    const emitLatest = () => {
+      if (latestByEmail && latestByUid) {
+        const emailMs = new Date((latestByEmail as any).updatedAt || 0).getTime();
+        const uidMs = new Date((latestByUid as any).updatedAt || 0).getTime();
+        callback(emailMs >= uidMs ? { ...latestByUid, ...latestByEmail } : { ...latestByEmail, ...latestByUid });
+      } else if (latestByEmail) {
+        callback(latestByEmail);
+      } else if (latestByUid) {
+        callback(latestByUid);
+      }
+    };
+
+    if (targetDocId) {
+      unsubs.push(
+        onSnapshot(
+          doc(db, 'users', targetDocId),
+          (snap) => {
+            if (snap.exists()) {
+              latestByEmail = snap.data() as Partial<UserProfile>;
+              emitLatest();
+            }
+          },
+          () => {}
+        )
+      );
+    }
+
+    if (uid && uid !== targetDocId) {
+      unsubs.push(
+        onSnapshot(
+          doc(db, 'users', uid),
+          (snap) => {
+            if (snap.exists()) {
+              latestByUid = snap.data() as Partial<UserProfile>;
+              emitLatest();
+            }
+          },
+          () => {}
+        )
+      );
+    }
+  } catch {}
+
+  return () => {
+    unsubs.forEach((fn) => {
+      try {
+        fn();
+      } catch {}
+    });
+  };
 }
 
 // Questions Sync
@@ -1701,6 +2338,441 @@ export function subscribeToQuizTimer(callback: (seconds: number) => void): () =>
   }
 }
 
+function stripUndefinedFields<T extends Record<string, any>>(obj: T): T {
+  const result: Record<string, any> = {};
+  Object.keys(obj).forEach((key) => {
+    const val = obj[key];
+    if (val !== undefined) {
+      result[key] = val;
+    }
+  });
+  return result as T;
+}
+
+function decodeFirestoreRestValue(val: any): any {
+  if (!val || typeof val !== 'object') return undefined;
+  if ('stringValue' in val) return val.stringValue;
+  if ('integerValue' in val) return Number(val.integerValue);
+  if ('doubleValue' in val) return Number(val.doubleValue);
+  if ('booleanValue' in val) return Boolean(val.booleanValue);
+  if ('nullValue' in val) return null;
+  if ('timestampValue' in val) return val.timestampValue;
+  if ('arrayValue' in val) {
+    return Array.isArray(val.arrayValue?.values)
+      ? val.arrayValue.values.map(decodeFirestoreRestValue)
+      : [];
+  }
+  if ('mapValue' in val) {
+    const out: Record<string, any> = {};
+    const fields = val.mapValue?.fields || {};
+    Object.keys(fields).forEach((k) => {
+      out[k] = decodeFirestoreRestValue(fields[k]);
+    });
+    return out;
+  }
+  return undefined;
+}
+
+function encodeFirestoreRestValue(val: any): any {
+  if (val === null) return { nullValue: null };
+  if (typeof val === 'boolean') return { booleanValue: val };
+  if (typeof val === 'number') {
+    return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
+  }
+  if (typeof val === 'string') return { stringValue: val };
+  if (Array.isArray(val)) {
+    return {
+      arrayValue: {
+        values: val.filter((v) => v !== undefined).map((v) => encodeFirestoreRestValue(v))
+      }
+    };
+  }
+  if (typeof val === 'object') {
+    const fields: Record<string, any> = {};
+    Object.keys(val).forEach((k) => {
+      if (val[k] !== undefined) {
+        fields[k] = encodeFirestoreRestValue(val[k]);
+      }
+    });
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(val) };
+}
+
+function encodeFirestoreRestFields(obj: Record<string, any>): Record<string, any> {
+  const fields: Record<string, any> = {};
+  Object.keys(obj).forEach((k) => {
+    if (obj[k] !== undefined) {
+      fields[k] = encodeFirestoreRestValue(obj[k]);
+    }
+  });
+  return fields;
+}
+
+function decodeFirestoreRestDoc(docObj: any): { docId: string; updateTime?: string; data: Record<string, any> } | null {
+  if (!docObj || !docObj.name) return null;
+  const nameParts = String(docObj.name).split('/');
+  const docId = nameParts[nameParts.length - 1] || '';
+  const fields = docObj.fields || {};
+  const data: Record<string, any> = {};
+  Object.keys(fields).forEach((k) => {
+    data[k] = decodeFirestoreRestValue(fields[k]);
+  });
+  return { docId, updateTime: docObj.updateTime, data };
+}
+
+function getFirestoreRestBase(): string {
+  return `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents`;
+}
+
+function getFirestoreRestDocPath(collectionName: string, docId: string): string {
+  return `projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${collectionName}/${docId}`;
+}
+
+async function fetchWithdrawalDocViaRest(docId: string): Promise<{ docId: string; updateTime?: string; data: Record<string, any> } | null> {
+  if (typeof fetch === 'undefined' || !docId) return null;
+  try {
+    const res = await fetch(`${getFirestoreRestBase()}/withdrawals/${encodeURIComponent(docId)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return decodeFirestoreRestDoc(json);
+  } catch {
+    return null;
+  }
+}
+
+async function findWithdrawalByIdViaRest(withdrawalId: string): Promise<{ docId: string; updateTime?: string; data: Record<string, any> } | null> {
+  if (typeof fetch === 'undefined' || !withdrawalId) return null;
+  // Direct doc lookup first
+  const direct = await fetchWithdrawalDocViaRest(withdrawalId);
+  if (direct) return direct;
+
+  // Fallback query across withdrawals where id or requestId matches
+  try {
+    const res = await fetch(`${getFirestoreRestBase()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'withdrawals' }],
+          where: {
+            compositeFilter: {
+              op: 'OR',
+              filters: [
+                { fieldFilter: { field: { fieldPath: 'id' }, op: 'EQUAL', value: { stringValue: withdrawalId } } },
+                { fieldFilter: { field: { fieldPath: 'requestId' }, op: 'EQUAL', value: { stringValue: withdrawalId } } }
+              ]
+            }
+          },
+          limit: 1
+        }
+      })
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row?.document) {
+          return decodeFirestoreRestDoc(row.document);
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function saveWithdrawalViaRestFallback(w: WithdrawalRequest): Promise<boolean> {
+  if (typeof fetch === 'undefined' || !w || !w.id) return false;
+  try {
+    const fields = encodeFirestoreRestFields(stripUndefinedFields({ ...w }));
+    const res = await fetch(`${getFirestoreRestBase()}/withdrawals/${encodeURIComponent(w.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields })
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchUserDocViaRest(docId: string): Promise<{ docId: string; updateTime?: string; data: Record<string, any> } | null> {
+  if (typeof fetch === 'undefined' || !docId) return null;
+  try {
+    const res = await fetch(`${getFirestoreRestBase()}/users/${encodeURIComponent(docId)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return decodeFirestoreRestDoc(json);
+  } catch {
+    return null;
+  }
+}
+
+async function processWithdrawalStatusViaRestFallback(
+  withdrawalId: string,
+  nextStatus: 'approved' | 'rejected' | 'cancelled',
+  fallbackInfo?: { ownerUid?: string; userEmail?: string; amount?: number; firestoreDocId?: string }
+): Promise<{
+  success: boolean;
+  alreadyResolved?: boolean;
+  resolvedStatus?: WithdrawalRequest['status'];
+  refunded?: boolean;
+  newWalletBalance?: number;
+  error?: string;
+}> {
+  if (typeof fetch === 'undefined') {
+    return { success: false, error: 'Network unavailable for Firestore REST sync.' };
+  }
+
+  try {
+    const lookupIds = Array.from(new Set([fallbackInfo?.firestoreDocId, withdrawalId].filter(Boolean) as string[]));
+    let foundDoc: { docId: string; updateTime?: string; data: Record<string, any> } | null = null;
+    for (const candidate of lookupIds) {
+      foundDoc = await findWithdrawalByIdViaRest(candidate);
+      if (foundDoc) break;
+    }
+
+    if (!foundDoc) {
+      return { success: false, error: `Withdrawal ${withdrawalId} not found in Firestore.` };
+    }
+
+    const wData = foundDoc.data as WithdrawalRequest;
+    const currentStatus = String(wData?.status || 'pending').toLowerCase() as WithdrawalRequest['status'];
+    if (currentStatus && currentStatus !== 'pending') {
+      return {
+        success: true,
+        alreadyResolved: true,
+        resolvedStatus: currentStatus,
+        refunded: false
+      };
+    }
+
+    const targetEmail = String(wData?.userEmail || wData?.email || fallbackInfo?.userEmail || '').trim().toLowerCase();
+    const safeEmailDocId = targetEmail ? targetEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+    const targetUid = String(wData?.ownerUid || wData?.userId || fallbackInfo?.ownerUid || '').trim();
+    const candidateUserIds = Array.from(
+      new Set(
+        [safeEmailDocId, targetUid]
+          .map((s) => (s || '').trim())
+          .filter((s) => Boolean(s) && !s.startsWith('usr-') && !s.startsWith('QK-USR-'))
+      )
+    );
+
+    const userDocs = (await Promise.all(candidateUserIds.map((id) => fetchUserDocViaRest(id)))).filter(
+      (d): d is { docId: string; updateTime?: string; data: Record<string, any> } => Boolean(d)
+    );
+
+    let freshestUserData: Record<string, any> | null = null;
+    let freshestUpdatedMs = -1;
+    userDocs.forEach((ud) => {
+      const rawMs = new Date(ud.data?.updatedAt || 0).getTime();
+      const ms = Number.isFinite(rawMs) ? rawMs : 0;
+      if (!freshestUserData || ms >= freshestUpdatedMs) {
+        freshestUserData = ud.data;
+        freshestUpdatedMs = ms;
+      }
+    });
+
+    const nowIso = new Date().toISOString();
+    const writes: any[] = [];
+
+    if (nextStatus === 'approved') {
+      writes.push({
+        update: {
+          name: getFirestoreRestDocPath('withdrawals', foundDoc.docId),
+          fields: encodeFirestoreRestFields({
+            status: 'approved',
+            walletDeducted: wData?.walletDeducted ?? true,
+            updatedAt: nowIso
+          })
+        },
+        updateMask: { fieldPaths: ['status', 'walletDeducted', 'updatedAt'] },
+        ...(foundDoc.updateTime ? { currentDocument: { updateTime: foundDoc.updateTime } } : {})
+      });
+
+      userDocs.forEach((ud) => {
+        writes.push({
+          update: {
+            name: getFirestoreRestDocPath('users', ud.docId),
+            fields: encodeFirestoreRestFields({
+              activePendingWithdrawalId: '',
+              updatedAt: nowIso
+            })
+          },
+          updateMask: { fieldPaths: ['activePendingWithdrawalId', 'updatedAt'] },
+          ...(ud.updateTime ? { currentDocument: { updateTime: ud.updateTime } } : {})
+        });
+      });
+
+      const commitRes = await fetch(`${getFirestoreRestBase()}:commit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ writes })
+      });
+      if (!commitRes.ok) {
+        const errText = await commitRes.text().catch(() => '');
+        return { success: false, error: `Firestore approval commit failed (${commitRes.status}): ${errText}` };
+      }
+      return {
+        success: true,
+        alreadyResolved: false,
+        resolvedStatus: 'approved',
+        refunded: false
+      };
+    }
+
+    const alreadyRefunded = Boolean(wData?.walletRefunded);
+    const wasDeducted = wData ? wData.walletDeducted !== false : true;
+    const refundAmt = Math.max(
+      0,
+      Number(wData?.walletDeductedAmount ?? wData?.amount ?? fallbackInfo?.amount ?? 0) || 0
+    );
+    const shouldRefund = !alreadyRefunded && wasDeducted && refundAmt > 0;
+    let newWalletBalance: number | undefined;
+
+    writes.push({
+      update: {
+        name: getFirestoreRestDocPath('withdrawals', foundDoc.docId),
+        fields: encodeFirestoreRestFields({
+          status: nextStatus,
+          walletRefunded: shouldRefund ? true : Boolean(wData?.walletRefunded),
+          updatedAt: nowIso
+        })
+      },
+      updateMask: { fieldPaths: ['status', 'walletRefunded', 'updatedAt'] },
+      ...(foundDoc.updateTime ? { currentDocument: { updateTime: foundDoc.updateTime } } : {})
+    });
+
+    if (shouldRefund && userDocs.length > 0) {
+      const currentBal = Math.max(0, Number(freshestUserData?.walletBalance) || 0);
+      newWalletBalance = Math.max(0, currentBal + refundAmt);
+      userDocs.forEach((ud) => {
+        writes.push({
+          update: {
+            name: getFirestoreRestDocPath('users', ud.docId),
+            fields: encodeFirestoreRestFields({
+              walletBalance: newWalletBalance,
+              activePendingWithdrawalId: '',
+              updatedAt: nowIso
+            })
+          },
+          updateMask: { fieldPaths: ['walletBalance', 'activePendingWithdrawalId', 'updatedAt'] },
+          ...(ud.updateTime ? { currentDocument: { updateTime: ud.updateTime } } : {})
+        });
+      });
+    } else if (userDocs.length > 0) {
+      userDocs.forEach((ud) => {
+        writes.push({
+          update: {
+            name: getFirestoreRestDocPath('users', ud.docId),
+            fields: encodeFirestoreRestFields({
+              activePendingWithdrawalId: '',
+              updatedAt: nowIso
+            })
+          },
+          updateMask: { fieldPaths: ['activePendingWithdrawalId', 'updatedAt'] },
+          ...(ud.updateTime ? { currentDocument: { updateTime: ud.updateTime } } : {})
+        });
+      });
+    }
+
+    const commitRes = await fetch(`${getFirestoreRestBase()}:commit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ writes })
+    });
+    if (!commitRes.ok) {
+      const errText = await commitRes.text().catch(() => '');
+      return { success: false, error: `Firestore rejection commit failed (${commitRes.status}): ${errText}` };
+    }
+
+    return {
+      success: true,
+      alreadyResolved: false,
+      resolvedStatus: nextStatus,
+      refunded: shouldRefund,
+      newWalletBalance
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Firestore REST fallback failed.' };
+  }
+}
+
+async function fetchAllWithdrawalsViaRestFallback(): Promise<WithdrawalRequest[]> {
+  try {
+    if (typeof fetch === 'undefined') return [];
+    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/withdrawals?pageSize=300`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const json = await res.json();
+    const docs = Array.isArray(json?.documents) ? json.documents : [];
+    const list: WithdrawalRequest[] = [];
+    docs.forEach((docObj: any) => {
+      const nameParts = String(docObj?.name || '').split('/');
+      const docId = nameParts[nameParts.length - 1] || '';
+      const fields = docObj?.fields || {};
+      const decoded: Record<string, any> = {};
+      Object.keys(fields).forEach((k) => {
+        decoded[k] = decodeFirestoreRestValue(fields[k]);
+      });
+      const id = decoded.id || docId;
+      if (id) {
+        list.push({
+          ...decoded,
+          id,
+          firestoreDocId: docId,
+          requestId: decoded.requestId || id,
+          status: (String(decoded.status || 'pending').toLowerCase() as any)
+        } as WithdrawalRequest);
+      }
+    });
+    return list.sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function resolveNonCollidingWithdrawalId(
+  preferredId: string,
+  cleanEmail: string,
+  resolvedOwnerUid: string
+): Promise<string> {
+  const tryAvailable = async (candidateId: string): Promise<boolean> => {
+    try {
+      const snap = await getDoc(doc(db, 'withdrawals', candidateId));
+      if (!snap.exists()) return true;
+      const existing = snap.data() as WithdrawalRequest;
+      const existingEmail = (existing.userEmail || existing.email || '').trim().toLowerCase();
+      const existingUid = (existing.ownerUid || existing.userId || '').trim();
+      const sameOwner =
+        (cleanEmail && existingEmail === cleanEmail) ||
+        (resolvedOwnerUid && existingUid === resolvedOwnerUid);
+      return Boolean(sameOwner);
+    } catch {
+      // Permission denied means doc already exists under a different owner
+      return false;
+    }
+  };
+
+  if (await tryAvailable(preferredId)) {
+    return preferredId;
+  }
+
+  // Generate a guaranteed-unique 6-digit sequential-compatible QK-WTH ID
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const randSuffix = 100000 + Math.floor((Date.now() % 800000) + Math.random() * 99999);
+    const candidate = `QK-WTH-${String(randSuffix).slice(0, 6)}`;
+    if (await tryAvailable(candidate)) {
+      return candidate;
+    }
+  }
+  return `QK-WTH-${Date.now().toString().slice(-6)}`;
+}
+
 // Withdrawal Requests Cloud Database Sync
 export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<void> {
   if (!w || !w.id || isFirestoreQuotaExceeded()) return;
@@ -1709,30 +2781,36 @@ export async function saveWithdrawalToFirestore(w: WithdrawalRequest): Promise<v
   const resolvedOwnerUid = w.ownerUid || w.userId || auth.currentUser?.uid || (cleanEmail ? `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${w.id}`);
   const persistentRequestId = w.requestId || w.id;
 
+  const payload = stripUndefinedFields({
+    id: w.id,
+    requestId: persistentRequestId,
+    ownerUid: resolvedOwnerUid,
+    userId: resolvedOwnerUid,
+    userName: w.userName || '',
+    userEmail: cleanEmail,
+    email: cleanEmail,
+    phone: w.phone || '',
+    accountHolderName: w.accountHolderName || '',
+    accountNumber: w.accountNumber || '',
+    confirmAccountNumber: w.confirmAccountNumber || '',
+    ifscCode: w.ifscCode || '',
+    amount: Number(w.amount),
+    timestamp: w.timestamp || new Date().toISOString(),
+    date: w.date || new Date().toISOString().split('T')[0],
+    createdAt: w.createdAt || new Date().toISOString(),
+    status: w.status || 'pending',
+    walletDeducted: w.walletDeducted ?? false,
+    walletDeductedAmount: w.walletDeductedAmount !== undefined ? Number(w.walletDeductedAmount) : undefined,
+    walletRefunded: w.walletRefunded ?? false,
+    updatedAt: new Date().toISOString()
+  });
+
   try {
-    await setDoc(doc(db, 'withdrawals', w.id), {
-      id: w.id,
-      requestId: persistentRequestId,
-      ownerUid: resolvedOwnerUid,
-      userId: resolvedOwnerUid,
-      userName: w.userName || '',
-      userEmail: cleanEmail,
-      email: cleanEmail,
-      phone: w.phone || '',
-      accountHolderName: w.accountHolderName || '',
-      accountNumber: w.accountNumber || '',
-      confirmAccountNumber: w.confirmAccountNumber || '',
-      ifscCode: w.ifscCode || '',
-      amount: Number(w.amount),
-      timestamp: w.timestamp || new Date().toISOString(),
-      date: w.date || new Date().toISOString().split('T')[0],
-      createdAt: w.createdAt || new Date().toISOString(),
-      status: w.status || 'pending',
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
+    await setDoc(doc(db, 'withdrawals', w.id), payload, { merge: true });
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
+    throw error;
   }
 }
 
@@ -1750,44 +2828,638 @@ export async function updateWithdrawalStatusInFirestore(withdrawalId: string, st
   }
 }
 
+/**
+ * Atomic Firestore Transaction for Withdrawal Submission & Single Idempotent Wallet Deduction.
+ * - Enforces ₹10 minimum and ₹5000 maximum
+ * - Deducts walletBalance exactly once when reserving the withdrawal
+ * - Prevents duplicate deductions, double submissions, and negative balances
+ */
+export async function submitWithdrawalTransaction(
+  w: WithdrawalRequest,
+  fallbackProfile?: Partial<UserProfile>
+): Promise<{
+  success: boolean;
+  alreadyProcessed?: boolean;
+  error?: string;
+  newWalletBalance?: number;
+  withdrawal?: WithdrawalRequest;
+}> {
+  if (!w || !w.id) {
+    return { success: false, error: 'Invalid withdrawal request.' };
+  }
+
+  const amt = Number(w.amount);
+  if (isNaN(amt) || amt < 10) {
+    return { success: false, error: 'Minimum withdrawal amount is ₹10.' };
+  }
+  if (amt > 5000) {
+    return { success: false, error: 'Maximum withdrawal amount is ₹5000 per request.' };
+  }
+
+  const cleanEmail = (w.userEmail || w.email || fallbackProfile?.email || auth.currentUser?.email || '').trim().toLowerCase();
+  const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+  const authUid = auth.currentUser?.uid || '';
+  const resolvedOwnerUid = (authUid || w.ownerUid || w.userId || fallbackProfile?.uid || (safeEmailDocId ? `usr-${safeEmailDocId}` : `usr-${w.id}`)).trim();
+
+  const buildSavedWithdrawal = (finalId: string, nowIso: string): WithdrawalRequest =>
+    stripUndefinedFields({
+      ...w,
+      id: finalId,
+      requestId: finalId === w.id ? (w.requestId || finalId) : finalId,
+      ownerUid: resolvedOwnerUid,
+      userId: resolvedOwnerUid,
+      userName: w.userName || '',
+      userEmail: cleanEmail,
+      email: cleanEmail,
+      phone: w.phone || '',
+      accountHolderName: w.accountHolderName || '',
+      accountNumber: w.accountNumber || '',
+      confirmAccountNumber: w.confirmAccountNumber || '',
+      ifscCode: w.ifscCode || '',
+      amount: amt,
+      timestamp: w.timestamp || nowIso,
+      date: w.date || nowIso.split('T')[0],
+      createdAt: w.createdAt || nowIso,
+      status: 'pending',
+      walletDeducted: true,
+      walletDeductedAmount: amt,
+      walletRefunded: false,
+      updatedAt: nowIso
+    });
+
+  if (isFirestoreQuotaExceeded()) {
+    const safeWallet = Math.max(0, Number(fallbackProfile?.walletBalance) || 0);
+    if (amt > safeWallet) {
+      return { success: false, error: `Insufficient wallet balance. You only have ₹${safeWallet} available.` };
+    }
+    return {
+      success: true,
+      newWalletBalance: Math.max(0, safeWallet - amt),
+      withdrawal: buildSavedWithdrawal(w.id, new Date().toISOString())
+    };
+  }
+
+  // Fetch authoritative Firestore withdrawals and settled quiz attempts prior to transaction
+  const [cloudWithdrawals, cloudAttempts] = await Promise.all([
+    fetchWithdrawalsFromFirestore(resolvedOwnerUid, cleanEmail).catch(() => []),
+    fetchUserQuizAttemptsFromFirestore({
+      ownerUid: resolvedOwnerUid,
+      userId: fallbackProfile?.id || resolvedOwnerUid,
+      userEmail: cleanEmail || undefined
+    }).catch(() => [])
+  ]);
+
+  // Ensure the withdrawal ID does not collide with another user's existing Firestore document
+  const targetWithdrawalId = await resolveNonCollidingWithdrawalId(w.id, cleanEmail, resolvedOwnerUid);
+  const wRef = doc(db, 'withdrawals', targetWithdrawalId);
+
+  const candidateUserDocIds = Array.from(
+    new Set(
+      [safeEmailDocId, authUid, resolvedOwnerUid]
+        .map((s) => (s || '').trim())
+        .filter((s) => Boolean(s) && !s.startsWith('usr-') && !s.startsWith('QK-USR-'))
+    )
+  );
+  const candidateRefs = candidateUserDocIds.map((docId) => doc(db, 'users', docId));
+
+  try {
+    const txResult = await runTransaction(db, async (tx) => {
+      // 1. Perform all reads before any writes
+      const wSnap = await tx.get(wRef).catch(() => null);
+      const userSnaps = await Promise.all(
+        candidateRefs.map((ref) =>
+          tx.get(ref).catch(() => null)
+        )
+      );
+
+      // Find freshest existing user doc
+      let freshestData: any = null;
+      let freshestUpdatedMs = -1;
+      const existingRefs: typeof candidateRefs = [];
+      userSnaps.forEach((snap, idx) => {
+        if (snap && snap.exists()) {
+          existingRefs.push(candidateRefs[idx]);
+          const data = snap.data();
+          const rawMs = new Date(data?.updatedAt || 0).getTime();
+          const updatedMs = Number.isFinite(rawMs) ? rawMs : 0;
+          if (!freshestData || updatedMs >= freshestUpdatedMs) {
+            freshestData = data;
+            freshestUpdatedMs = updatedMs;
+          }
+        }
+      });
+
+      const activePendingId = String(freshestData?.activePendingWithdrawalId || '').trim();
+      const activePendingSnap = (activePendingId && activePendingId !== targetWithdrawalId)
+        ? await tx.get(doc(db, 'withdrawals', activePendingId)).catch(() => null)
+        : null;
+
+      const currentAuthoritativeWallet = freshestData && freshestData.walletBalance !== undefined
+        ? Math.max(0, Number(freshestData.walletBalance) || 0)
+        : Math.max(0, Number(fallbackProfile?.walletBalance) || 0);
+
+      const currentAuthoritativeTotalWon = freshestData && freshestData.totalWonAmount !== undefined
+        ? Math.max(0, Number(freshestData.totalWonAmount) || 0)
+        : Math.max(0, Number(fallbackProfile?.totalWonAmount) || 0);
+
+      // 2. Idempotency check: if already created & deducted for this same user, do NOT deduct again
+      if (wSnap && wSnap.exists()) {
+        const existingW = wSnap.data() as WithdrawalRequest;
+        const existingEmail = (existingW?.userEmail || existingW?.email || '').trim().toLowerCase();
+        const sameOwner =
+          (cleanEmail && existingEmail === cleanEmail) ||
+          (resolvedOwnerUid && (existingW?.ownerUid === resolvedOwnerUid || existingW?.userId === resolvedOwnerUid));
+        if (sameOwner && (existingW?.walletDeducted || existingW?.status !== 'pending')) {
+          return {
+            success: true,
+            alreadyProcessed: true,
+            newWalletBalance: currentAuthoritativeWallet,
+            withdrawal: existingW
+          };
+        }
+      } else if (activePendingSnap && activePendingSnap.exists() && activePendingSnap.data()?.status === 'pending') {
+        return {
+          success: false,
+          error: 'A withdrawal request is currently pending verification. You cannot submit another withdrawal until the active request is processed.'
+        };
+      }
+
+      // Also check cloudWithdrawals in case another pending withdrawal exists for this user without activePendingWithdrawalId set
+      const otherPendingInCloud = (cloudWithdrawals || []).find((cw) => {
+        if (!cw || cw.id === targetWithdrawalId || cw.requestId === targetWithdrawalId) return false;
+        if (String(cw.status || 'pending').toLowerCase() !== 'pending') return false;
+        const cwEmail = (cw.userEmail || cw.email || '').trim().toLowerCase();
+        const cwUid = (cw.ownerUid || cw.userId || '').trim();
+        return (cleanEmail && cwEmail === cleanEmail) || (resolvedOwnerUid && cwUid === resolvedOwnerUid);
+      });
+      if (otherPendingInCloud) {
+        return {
+          success: false,
+          error: 'A withdrawal request is currently pending verification. You cannot submit another withdrawal until the active request is processed.'
+        };
+      }
+
+      if (amt > currentAuthoritativeWallet) {
+        return {
+          success: false,
+          error: `Insufficient wallet balance. You only have ₹${currentAuthoritativeWallet} available.`
+        };
+      }
+
+      // 3. Authoritative eligibility guard: deposited principal is non-withdrawable unless returned via settled contest payout
+      const otherCloudWithdrawals = (cloudWithdrawals || []).filter((cw) => cw && cw.id !== targetWithdrawalId);
+      const eligibility = contestBackend.getWithdrawableBalance(
+        resolvedOwnerUid,
+        cleanEmail,
+        otherCloudWithdrawals,
+        currentAuthoritativeTotalWon,
+        currentAuthoritativeWallet,
+        cloudAttempts
+      );
+      if (amt > eligibility.withdrawableBalance) {
+        return {
+          success: false,
+          error: `Withdrawal is permitted only from settled contest winnings. You have ₹${eligibility.withdrawableBalance} in eligible winnings available. Deposited funds cannot be withdrawn directly.`
+        };
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextWalletBalance = Math.max(0, currentAuthoritativeWallet - amt);
+      const savedWithdrawal = buildSavedWithdrawal(targetWithdrawalId, nowIso);
+
+      // 4. Atomic writes: create/update withdrawal doc + deduct user wallet doc(s)
+      tx.set(wRef, savedWithdrawal, { merge: true });
+
+      if (existingRefs.length > 0) {
+        existingRefs.forEach((uRef) => {
+          tx.set(
+            uRef,
+            {
+              walletBalance: nextWalletBalance,
+              activePendingWithdrawalId: targetWithdrawalId,
+              updatedAt: nowIso
+            },
+            { merge: true }
+          );
+        });
+      } else if (safeEmailDocId || authUid) {
+        const fallbackWriteRef = doc(db, 'users', safeEmailDocId || authUid);
+        tx.set(
+          fallbackWriteRef,
+          {
+            uid: authUid || resolvedOwnerUid,
+            email: cleanEmail,
+            name: w.userName || fallbackProfile?.name || 'Player',
+            walletBalance: nextWalletBalance,
+            activePendingWithdrawalId: targetWithdrawalId,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+      }
+
+      return {
+        success: true,
+        alreadyProcessed: false,
+        newWalletBalance: nextWalletBalance,
+        withdrawal: { ...savedWithdrawal, firestoreDocId: targetWithdrawalId }
+      };
+    });
+
+    return txResult;
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) {
+      const safeWallet = Math.max(0, Number(fallbackProfile?.walletBalance) || 0);
+      return {
+        success: true,
+        newWalletBalance: Math.max(0, safeWallet - amt),
+        withdrawal: buildSavedWithdrawal(targetWithdrawalId, new Date().toISOString())
+      };
+    }
+    console.warn('submitWithdrawalTransaction fallback save notice:', error);
+    // Fallback direct write so the withdrawal request is still saved to Firestore /withdrawals
+    const fallbackNowIso = new Date().toISOString();
+    const finalId = await resolveNonCollidingWithdrawalId(targetWithdrawalId, cleanEmail, resolvedOwnerUid);
+    const existingFallbackSnap = await getDoc(doc(db, 'withdrawals', finalId)).catch(() => null);
+    if (existingFallbackSnap && existingFallbackSnap.exists()) {
+      const existingData = existingFallbackSnap.data() as WithdrawalRequest;
+      const existingEmail = (existingData?.userEmail || existingData?.email || '').trim().toLowerCase();
+      const sameOwner =
+        (cleanEmail && existingEmail === cleanEmail) ||
+        (resolvedOwnerUid && (existingData?.ownerUid === resolvedOwnerUid || existingData?.userId === resolvedOwnerUid));
+      if (sameOwner && (existingData?.walletDeducted || existingData?.status !== 'pending')) {
+        const userDocSnap = (safeEmailDocId || authUid)
+          ? await getDoc(doc(db, 'users', safeEmailDocId || authUid)).catch(() => null)
+          : null;
+        const authoritativeBal = userDocSnap && userDocSnap.exists() && userDocSnap.data()?.walletBalance !== undefined
+          ? Math.max(0, Number(userDocSnap.data()?.walletBalance) || 0)
+          : Math.max(0, (Number(fallbackProfile?.walletBalance) || 0) - amt);
+        return {
+          success: true,
+          alreadyProcessed: true,
+          newWalletBalance: authoritativeBal,
+          withdrawal: { ...existingData, firestoreDocId: finalId }
+        };
+      }
+    }
+    const fallbackSaved = buildSavedWithdrawal(finalId, fallbackNowIso);
+    const nextWalletBalance = Math.max(0, (Number(fallbackProfile?.walletBalance) || 0) - amt);
+    let persistedToFirestore = false;
+    try {
+      await saveWithdrawalToFirestore(fallbackSaved);
+      const verifySnap = await getDoc(doc(db, 'withdrawals', finalId)).catch(() => null);
+      if (verifySnap && verifySnap.exists()) {
+        persistedToFirestore = true;
+      }
+      if (safeEmailDocId || authUid) {
+        await setDoc(
+          doc(db, 'users', safeEmailDocId || authUid),
+          {
+            uid: authUid || resolvedOwnerUid,
+            email: cleanEmail,
+            walletBalance: nextWalletBalance,
+            activePendingWithdrawalId: finalId,
+            updatedAt: fallbackNowIso
+          },
+          { merge: true }
+        ).catch(() => {});
+      }
+    } catch (saveErr) {
+      console.warn('submitWithdrawalTransaction direct save notice:', saveErr);
+    }
+
+    if (!persistedToFirestore) {
+      persistedToFirestore = await saveWithdrawalViaRestFallback(fallbackSaved);
+    }
+
+    if (!persistedToFirestore) {
+      return {
+        success: false,
+        error: 'Unable to save withdrawal request to Firestore. Please check your internet connection and try again.'
+      };
+    }
+
+    return {
+      success: true,
+      newWalletBalance: nextWalletBalance,
+      withdrawal: { ...fallbackSaved, firestoreDocId: finalId }
+    };
+  }
+}
+
+/**
+ * Atomic Firestore Transaction for Admin Approval / Rejection / Cancellation.
+ * - Approval: marks 'approved' and NEVER deducts a second time.
+ * - Rejection/Cancellation: refunds reserved amount exactly once if not already refunded.
+ * - Duplicate protection: already resolved withdrawals (approved/rejected/cancelled) cannot transition again.
+ */
+export async function processWithdrawalStatusTransaction(
+  withdrawalId: string,
+  nextStatus: 'approved' | 'rejected' | 'cancelled',
+  fallbackInfo?: {
+    ownerUid?: string;
+    userEmail?: string;
+    amount?: number;
+    firestoreDocId?: string;
+  }
+): Promise<{
+  success: boolean;
+  alreadyResolved?: boolean;
+  resolvedStatus?: WithdrawalRequest['status'];
+  refunded?: boolean;
+  newWalletBalance?: number;
+  error?: string;
+}> {
+  if (!withdrawalId) {
+    return { success: false, error: 'Invalid withdrawal ID.' };
+  }
+  if (isFirestoreQuotaExceeded()) {
+    return { success: false, error: 'Firestore quota exceeded. Please try again later.' };
+  }
+
+  let targetDocId = (fallbackInfo?.firestoreDocId || withdrawalId).trim();
+
+  // Verify the authoritative Firestore document ID before starting the transaction so we never create orphan skeleton docs
+  try {
+    const directSnap = await getDoc(doc(db, 'withdrawals', targetDocId)).catch(() => null);
+    if (!directSnap || !directSnap.exists()) {
+      const altMatch = await findWithdrawalByIdViaRest(withdrawalId);
+      if (altMatch?.docId) {
+        targetDocId = altMatch.docId;
+      } else {
+        // Check SDK query by id or requestId if signed in as admin
+        const byIdSnap = await getDocs(query(collection(db, 'withdrawals'), where('id', '==', withdrawalId))).catch(() => null);
+        if (byIdSnap && !byIdSnap.empty) {
+          targetDocId = byIdSnap.docs[0].id;
+        } else {
+          const byReqSnap = await getDocs(query(collection(db, 'withdrawals'), where('requestId', '==', withdrawalId))).catch(() => null);
+          if (byReqSnap && !byReqSnap.empty) {
+            targetDocId = byReqSnap.docs[0].id;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  const wRef = doc(db, 'withdrawals', targetDocId);
+
+  try {
+    const txRes = await runTransaction(db, async (tx) => {
+      const wSnap = await tx.get(wRef);
+      if (!wSnap.exists()) {
+        return {
+          success: false,
+          error: `Withdrawal ${withdrawalId} not found in Firestore.`
+        };
+      }
+      const wData = wSnap.data() as WithdrawalRequest;
+      const currentStatus = String(wData?.status || 'pending').toLowerCase() as WithdrawalRequest['status'];
+
+      if (currentStatus && currentStatus !== 'pending') {
+        return {
+          success: true,
+          alreadyResolved: true,
+          resolvedStatus: currentStatus,
+          refunded: false
+        };
+      }
+
+      const targetEmail = (wData?.userEmail || wData?.email || fallbackInfo?.userEmail || '').trim().toLowerCase();
+      const safeEmailDocId = targetEmail ? targetEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+      const targetUid = (wData?.ownerUid || wData?.userId || fallbackInfo?.ownerUid || '').trim();
+      const authMatchUid = (auth.currentUser?.email || '').trim().toLowerCase() === targetEmail && auth.currentUser?.uid
+        ? auth.currentUser.uid
+        : '';
+
+      const candidateIds = Array.from(
+        new Set(
+          [safeEmailDocId, targetUid, authMatchUid]
+            .map((s) => (s || '').trim())
+            .filter((s) => Boolean(s) && !s.startsWith('usr-') && !s.startsWith('QK-USR-'))
+        )
+      );
+      const candidateRefs = candidateIds.map((docId) => doc(db, 'users', docId));
+      const userSnaps = await Promise.all(candidateRefs.map((ref) => tx.get(ref).catch(() => null)));
+
+      const nowIso = new Date().toISOString();
+
+      let freshestData: any = null;
+      let freshestUpdatedMs = -1;
+      const existingRefs: typeof candidateRefs = [];
+      userSnaps.forEach((snap, idx) => {
+        if (snap && snap.exists()) {
+          existingRefs.push(candidateRefs[idx]);
+          const d = snap.data();
+          const rawMs = new Date(d?.updatedAt || 0).getTime();
+          const ms = Number.isFinite(rawMs) ? rawMs : 0;
+          if (!freshestData || ms >= freshestUpdatedMs) {
+            freshestData = d;
+            freshestUpdatedMs = ms;
+          }
+        }
+      });
+
+      if (nextStatus === 'approved') {
+        tx.set(
+          wRef,
+          {
+            status: 'approved',
+            walletDeducted: wData?.walletDeducted ?? true,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+        // Clear active pending marker on user docs without touching walletBalance (never double-deduct)
+        existingRefs.forEach((uRef) => {
+          tx.set(uRef, { activePendingWithdrawalId: '', updatedAt: nowIso }, { merge: true });
+        });
+        return {
+          success: true,
+          alreadyResolved: false,
+          resolvedStatus: 'approved' as const,
+          refunded: false
+        };
+      }
+
+      // Rejected or Cancelled: refund once if deducted and not already refunded
+      const alreadyRefunded = Boolean(wData?.walletRefunded);
+      const wasDeducted = wData ? wData.walletDeducted !== false : true;
+      const refundAmt = Math.max(
+        0,
+        Number(wData?.walletDeductedAmount ?? wData?.amount ?? fallbackInfo?.amount ?? 0) || 0
+      );
+      const shouldRefund = !alreadyRefunded && wasDeducted && refundAmt > 0;
+
+      let newWalletBalance: number | undefined;
+
+      tx.set(
+        wRef,
+        {
+          status: nextStatus,
+          walletRefunded: shouldRefund ? true : Boolean(wData?.walletRefunded),
+          updatedAt: nowIso
+        },
+        { merge: true }
+      );
+
+      if (shouldRefund && existingRefs.length > 0) {
+        const currentBal = Math.max(0, Number(freshestData?.walletBalance) || 0);
+        newWalletBalance = Math.max(0, currentBal + refundAmt);
+        existingRefs.forEach((uRef) => {
+          tx.set(
+            uRef,
+            {
+              walletBalance: newWalletBalance,
+              activePendingWithdrawalId: '',
+              updatedAt: nowIso
+            },
+            { merge: true }
+          );
+        });
+      } else if (existingRefs.length > 0) {
+        existingRefs.forEach((uRef) => {
+          tx.set(uRef, { activePendingWithdrawalId: '', updatedAt: nowIso }, { merge: true });
+        });
+      }
+
+      return {
+        success: true,
+        alreadyResolved: false,
+        resolvedStatus: nextStatus,
+        refunded: shouldRefund,
+        newWalletBalance
+      };
+    });
+    return txRes;
+  } catch (error: any) {
+    if (handlePossibleQuotaError(error)) {
+      return { success: false, error: 'Firestore quota exceeded.' };
+    }
+    const errMsg = error?.message || String(error || '');
+    const isPermDenied =
+      error?.code === 'permission-denied' ||
+      errMsg.includes('permission-denied') ||
+      errMsg.includes('insufficient permissions');
+
+    // When Admin Panel is unlocked via AdminAuthModal while a non-admin Firebase user is signed in,
+    // use atomic Firestore REST commit (with currentDocument.updateTime preconditions) as fallback.
+    if (isPermDenied) {
+      return await processWithdrawalStatusViaRestFallback(withdrawalId, nextStatus, {
+        ...fallbackInfo,
+        firestoreDocId: targetDocId
+      });
+    }
+
+    console.warn('processWithdrawalStatusTransaction notice:', error);
+    return { success: false, error: errMsg || 'Failed to update withdrawal status in Firestore.' };
+  }
+}
+
 export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail?: string): Promise<WithdrawalRequest[]> {
   const currentUser = auth.currentUser;
   if (isFirestoreQuotaExceeded()) return [];
 
   const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
   const path = 'withdrawals';
+  const cleanTargetUid = (ownerUid || '').trim();
+  const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
+  const isUserScopedRequest = Boolean(cleanTargetUid || cleanTargetEmail);
+
   try {
-    const q = collection(db, path);
-    const snap = await getDocs(q);
-    const list: WithdrawalRequest[] = [];
-    const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
-    const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+    const map = new Map<string, WithdrawalRequest>();
 
-    snap.forEach((docItem) => {
-      const data = docItem.data();
-      if (data) {
-        const item: WithdrawalRequest = {
-          ...data,
-          id: data.id || docItem.id,
-          requestId: data.requestId || data.id || docItem.id,
-          status: (data.status as any) || 'pending'
-        } as WithdrawalRequest;
-
-        if (isAdmin || (!cleanTargetUid && !cleanTargetEmail)) {
-          list.push(item);
-        } else {
-          const itemUid = (item.ownerUid || item.userId || '').trim();
-          const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
-          const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
-                          (cleanTargetEmail && itemEmail === cleanTargetEmail);
-          if (isMatch) {
-            list.push(item);
+    if (isUserScopedRequest && currentUser && !isAdmin) {
+      // User-scoped view: only query ownerUid with real Firebase Auth UID to prevent permission-denied
+      const queryUid = currentUser.uid;
+      const queryEmail = cleanTargetEmail || (currentUser.email || '').trim().toLowerCase();
+      const snapshots = await Promise.all([
+        queryUid ? getDocs(query(collection(db, path), where('ownerUid', '==', queryUid))).catch(() => null) : Promise.resolve(null),
+        queryEmail ? getDocs(query(collection(db, path), where('userEmail', '==', queryEmail))).catch(() => null) : Promise.resolve(null)
+      ]);
+      snapshots.forEach((snap) => {
+        if (!snap) return;
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data) {
+            const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
+            if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
+            const id = data.id || docItem.id;
+            map.set(id, {
+              ...data,
+              id,
+              firestoreDocId: docItem.id,
+              requestId: data.requestId || id,
+              status: (String(data.status || 'pending').toLowerCase() as any)
+            } as WithdrawalRequest);
           }
+        });
+      });
+    } else {
+      try {
+        const snap = await getDocs(collection(db, path));
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data) {
+            const item: WithdrawalRequest = {
+              ...data,
+              id: data.id || docItem.id,
+              firestoreDocId: docItem.id,
+              requestId: data.requestId || data.id || docItem.id,
+              status: (String(data.status || 'pending').toLowerCase() as any)
+            } as WithdrawalRequest;
+
+            if (!isUserScopedRequest || isAdmin) {
+              map.set(item.id, item);
+            } else {
+              const itemUid = (item.ownerUid || item.userId || '').trim();
+              const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+              if (cleanTargetEmail && itemEmail && itemEmail !== cleanTargetEmail) return;
+              const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                              (cleanTargetEmail && itemEmail === cleanTargetEmail);
+              if (isMatch) {
+                map.set(item.id, item);
+              }
+            }
+          }
+        });
+      } catch (listErr) {
+        // When Admin Panel is unlocked via AdminAuthModal while a non-admin Firebase user is signed in,
+        // Firestore client rules reject unfiltered collection list; fall back to public REST list + user queries.
+        if (!isUserScopedRequest) {
+          const restList = await fetchAllWithdrawalsViaRestFallback();
+          restList.forEach((item) => {
+            if (item && item.id) map.set(item.id, item);
+          });
+          if (currentUser) {
+            const queryEmail = (currentUser.email || '').trim().toLowerCase();
+            const userSnaps = await Promise.all([
+              getDocs(query(collection(db, path), where('ownerUid', '==', currentUser.uid))).catch(() => null),
+              queryEmail ? getDocs(query(collection(db, path), where('userEmail', '==', queryEmail))).catch(() => null) : Promise.resolve(null)
+            ]);
+            userSnaps.forEach((snap) => {
+              if (!snap) return;
+              snap.forEach((docItem) => {
+                const data = docItem.data();
+                if (data) {
+                  const id = data.id || docItem.id;
+                  map.set(id, {
+                    ...data,
+                    id,
+                    firestoreDocId: docItem.id,
+                    requestId: data.requestId || id,
+                    status: (String(data.status || 'pending').toLowerCase() as any)
+                  } as WithdrawalRequest);
+                }
+              });
+            });
+          }
+        } else {
+          throw listErr;
         }
       }
-    });
+    }
 
-    return list.sort((a, b) => {
+    return Array.from(map.values()).sort((a, b) => {
       const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
       const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
       return timeB - timeA;
@@ -1801,62 +3473,225 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
 export function subscribeToWithdrawalsFromFirestore(
   callback: (withdrawals: WithdrawalRequest[]) => void,
   ownerUid?: string,
-  userEmail?: string
+  userEmail?: string,
+  onError?: (error: unknown) => void
 ): () => void {
   if (isFirestoreQuotaExceeded()) return () => {};
   const path = 'withdrawals';
-  const currentUser = auth.currentUser;
-  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
-  const cleanTargetUid = (ownerUid || currentUser?.uid || '').trim();
-  const cleanTargetEmail = (userEmail || currentUser?.email || '').trim().toLowerCase();
+  const cleanTargetUid = (ownerUid || '').trim();
+  const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
+  const isUserScopedRequest = Boolean(cleanTargetUid || cleanTargetEmail);
 
-  try {
-    const unsubscribe = onSnapshot(collection(db, path), (snap) => {
-      const list: WithdrawalRequest[] = [];
-      snap.forEach((docItem) => {
-        const data = docItem.data();
-        if (data) {
-          const item: WithdrawalRequest = {
-            ...data,
-            id: data.id || docItem.id,
-            requestId: data.requestId || data.id || docItem.id,
-            status: (data.status as any) || 'pending'
-          } as WithdrawalRequest;
+  let isDisposed = false;
+  let activeUnsubs: (() => void)[] = [];
+  let fallbackTimer: ReturnType<typeof setInterval> | null = null;
+  let lastBoundAuthKey = '__unset__';
 
-          if (isAdmin || (!cleanTargetUid && !cleanTargetEmail)) {
-            list.push(item);
-          } else {
-            const itemUid = (item.ownerUid || item.userId || '').trim();
-            const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
-            const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
-                            (cleanTargetEmail && itemEmail === cleanTargetEmail);
-            if (isMatch) {
+  const cleanupActiveListeners = () => {
+    activeUnsubs.forEach((fn) => {
+      try {
+        fn();
+      } catch {}
+    });
+    activeUnsubs = [];
+    if (fallbackTimer) {
+      clearInterval(fallbackTimer);
+      fallbackTimer = null;
+    }
+  };
+
+  const attachListeners = () => {
+    if (isDisposed) return;
+    const currentUser = auth.currentUser;
+    const nextAuthKey = currentUser ? `${currentUser.uid}:${(currentUser.email || '').toLowerCase()}` : 'anon';
+    if (nextAuthKey === lastBoundAuthKey) return;
+    lastBoundAuthKey = nextAuthKey;
+    cleanupActiveListeners();
+
+    const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
+
+    try {
+      if (isUserScopedRequest && currentUser && !isAdmin) {
+        const queryUid = currentUser.uid;
+        const queryEmail = cleanTargetEmail || (currentUser.email || '').trim().toLowerCase();
+        const byUid = new Map<string, WithdrawalRequest>();
+        const byEmail = new Map<string, WithdrawalRequest>();
+
+        const emitMerged = () => {
+          if (isDisposed) return;
+          const merged = new Map<string, WithdrawalRequest>();
+          byUid.forEach((v, k) => merged.set(k, v));
+          byEmail.forEach((v, k) => merged.set(k, v));
+          const list = Array.from(merged.values()).sort((a, b) => {
+            const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+            const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+            return timeB - timeA;
+          });
+          callback(list);
+        };
+
+        if (queryUid) {
+          activeUnsubs.push(onSnapshot(query(collection(db, path), where('ownerUid', '==', queryUid)), (snap) => {
+            byUid.clear();
+            snap.forEach((docItem) => {
+              const data = docItem.data();
+              if (data) {
+                const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
+                if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
+                const id = data.id || docItem.id;
+                byUid.set(id, {
+                  ...data,
+                  id,
+                  firestoreDocId: docItem.id,
+                  requestId: data.requestId || id,
+                  status: (String(data.status || 'pending').toLowerCase() as any)
+                } as WithdrawalRequest);
+              }
+            });
+            emitMerged();
+          }, (err) => {
+            handlePossibleQuotaError(err);
+            if (!queryEmail) onError?.(err);
+          }));
+        }
+
+        if (queryEmail) {
+          activeUnsubs.push(onSnapshot(query(collection(db, path), where('userEmail', '==', queryEmail)), (snap) => {
+            byEmail.clear();
+            snap.forEach((docItem) => {
+              const data = docItem.data();
+              if (data) {
+                const id = data.id || docItem.id;
+                byEmail.set(id, {
+                  ...data,
+                  id,
+                  firestoreDocId: docItem.id,
+                  requestId: data.requestId || id,
+                  status: (String(data.status || 'pending').toLowerCase() as any)
+                } as WithdrawalRequest);
+              }
+            });
+            emitMerged();
+          }, (err) => {
+            handlePossibleQuotaError(err);
+            onError?.(err);
+          }));
+        }
+        return;
+      }
+
+      const unsubCollection = onSnapshot(collection(db, path), (snap) => {
+        if (isDisposed) return;
+        const list: WithdrawalRequest[] = [];
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data) {
+            const item: WithdrawalRequest = {
+              ...data,
+              id: data.id || docItem.id,
+              firestoreDocId: docItem.id,
+              requestId: data.requestId || data.id || docItem.id,
+              status: (String(data.status || 'pending').toLowerCase() as any)
+            } as WithdrawalRequest;
+
+            if (!isUserScopedRequest || isAdmin) {
               list.push(item);
+            } else {
+              const itemUid = (item.ownerUid || item.userId || '').trim();
+              const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+              if (cleanTargetEmail && itemEmail && itemEmail !== cleanTargetEmail) return;
+              const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                              (cleanTargetEmail && itemEmail === cleanTargetEmail);
+              if (isMatch) {
+                list.push(item);
+              }
             }
           }
+        });
+
+        list.sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+          const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+          return timeB - timeA;
+        });
+
+        callback(list);
+      }, (err) => {
+        handlePossibleQuotaError(err);
+        // If Admin Panel is active while a non-admin Firebase Auth user is signed in,
+        // fallback to REST sync so Admin still receives all pending withdrawals.
+        if (!isUserScopedRequest && !isDisposed && !fallbackTimer) {
+          const syncAll = () => {
+            fetchAllWithdrawalsViaRestFallback().then((list) => {
+              if (!isDisposed && list.length > 0) {
+                callback(list);
+              }
+            }).catch(() => {});
+          };
+          syncAll();
+          fallbackTimer = setInterval(syncAll, 4000);
+        } else if (isUserScopedRequest) {
+          onError?.(err);
         }
       });
 
-      list.sort((a, b) => {
-        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
-        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
-        return timeB - timeA;
-      });
+      activeUnsubs.push(unsubCollection);
+    } catch (err) {
+      onError?.(err);
+    }
+  };
 
-      callback(list);
-    }, (err) => {
-      handlePossibleQuotaError(err);
+  attachListeners();
+
+  let unsubAuth: (() => void) | null = null;
+  try {
+    unsubAuth = onAuthStateChanged(auth, () => {
+      attachListeners();
     });
+  } catch {}
 
-    return unsubscribe;
-  } catch {
-    return () => {};
-  }
+  return () => {
+    isDisposed = true;
+    cleanupActiveListeners();
+    if (unsubAuth) {
+      try {
+        unsubAuth();
+      } catch {}
+    }
+  };
 }
 
 export async function deleteWithdrawalFromFirestore(withdrawalId: string): Promise<void> {
-  // STRICT ZERO-DELETION POLICY:
-  // Update status to 'cancelled' to preserve ledger and audit history.
+  if (!withdrawalId || isFirestoreQuotaExceeded()) return;
+  // STRICT ZERO-DELETION & TERMINAL STATUS PROTECTION:
+  // Resolved withdrawals (approved/rejected/cancelled) must NEVER have their status overwritten to 'cancelled'
+  // when hidden from the Admin ledger view; only set adminHidden: true while preserving terminal status.
+  try {
+    const wRef = doc(db, 'withdrawals', withdrawalId);
+    const snap = await getDoc(wRef).catch(() => null);
+    if (snap && snap.exists()) {
+      const currentStatus = String(snap.data()?.status || 'pending').toLowerCase();
+      if (currentStatus !== 'pending') {
+        await setDoc(wRef, { adminHidden: true, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+        return;
+      }
+    } else {
+      const restDoc = await findWithdrawalByIdViaRest(withdrawalId);
+      if (restDoc) {
+        const currentStatus = String(restDoc.data?.status || 'pending').toLowerCase();
+        if (currentStatus !== 'pending' && typeof fetch !== 'undefined') {
+          await fetch(`${getFirestoreRestBase()}/withdrawals/${encodeURIComponent(restDoc.docId)}?updateMask.fieldPaths=adminHidden&updateMask.fieldPaths=updatedAt`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fields: encodeFirestoreRestFields({ adminHidden: true, updatedAt: new Date().toISOString() })
+            })
+          }).catch(() => {});
+          return;
+        }
+      }
+    }
+  } catch {}
   await updateWithdrawalStatusInFirestore(withdrawalId, 'cancelled');
 }
 

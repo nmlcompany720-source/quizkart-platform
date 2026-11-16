@@ -1,4 +1,4 @@
-import { ContestEntry, ContestPoolCalculation, FinancialLedgerRecord, LeaderboardEntry, Question, ActiveContest, UserProfile, WithdrawalRequest } from '../types';
+import { ContestEntry, ContestPoolCalculation, FinancialLedgerRecord, LeaderboardEntry, Question, ActiveContest, UserProfile, WithdrawalRequest, QuizAttemptResult } from '../types';
 export type { ContestEntry, ContestPoolCalculation, FinancialLedgerRecord, LeaderboardEntry };
 
 /**
@@ -1177,6 +1177,7 @@ class QuizKartContestBackendService {
             ownerUid: entry.ownerUid,
             userEmail: entry.userEmail,
             type: 'PRIZE_PAYOUT',
+            status: 'COMPLETED',
             amountPaise: prizePaise,
             amountRupees: prizeRupees,
             timestamp: nowIso,
@@ -1461,7 +1462,9 @@ class QuizKartContestBackendService {
     ownerUid: string,
     userEmail?: string,
     withdrawalsList?: WithdrawalRequest[],
-    userProfileTotalWon?: number
+    userProfileTotalWon?: number,
+    walletBalance?: number,
+    quizAttemptsList?: QuizAttemptResult[]
   ): {
     settledWinnings: number;
     completedWithdrawals: number;
@@ -1472,22 +1475,66 @@ class QuizKartContestBackendService {
     const cleanUid = (ownerUid || '').trim();
     const cleanEmail = (userEmail || '').trim().toLowerCase();
     const cleanUidNoPrefix = cleanUid.replace(/^usr-/, '');
+    const emailSanitizedUnderscore = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9]/g, '_') : '';
+    const emailDerivedUid = emailSanitizedUnderscore ? `usr-${emailSanitizedUnderscore}` : '';
+    const emailDocUid = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
 
-    // Map: uniqueTransactionId -> prizeRupees (Strict zero duplicate counting)
+    const belongsToTargetUser = (recordUidRaw?: string, recordEmailRaw?: string): boolean => {
+      const recEmail = (recordEmailRaw || '').trim().toLowerCase();
+      const recUid = (recordUidRaw || '').trim();
+      // Strict cross-user isolation: reject if record carries an explicit different email
+      if (recEmail && cleanEmail && recEmail !== cleanEmail) return false;
+      const emailMatched = Boolean(cleanEmail && recEmail && recEmail === cleanEmail);
+      const uidMatched = Boolean(
+        recUid && (
+          (cleanUid && (recUid === cleanUid || recUid === cleanUidNoPrefix)) ||
+          (emailDerivedUid && recUid.toLowerCase() === emailDerivedUid) ||
+          (emailDocUid && recUid.toLowerCase() === emailDocUid)
+        )
+      );
+      return emailMatched || uidMatched;
+    };
+
+    // Map: uniqueTransactionId -> prizeRupees + canonical dedup sets (zero double-counting across ledger/entry/attempt)
     const countedPrizes = new Map<string, number>();
+    const countedEntryIds = new Set<string>();
+    const countedContestEntryKeys = new Set<string>();
+    const countedContestKeys = new Set<string>();
+    const ineligiblePayoutStatuses = new Set(['PENDING', 'PROVISIONAL', 'FAILED', 'CANCELLED', 'REJECTED', 'REVERSED']);
 
-    // 1. Authoritative Financial Ledgers from memory and persistent store (type === 'PRIZE_PAYOUT')
+    const registerPayout = (
+      primaryKey: string,
+      amountRupees: number,
+      contestId?: string,
+      entryId?: string
+    ) => {
+      const safeAmt = Math.max(0, Number(amountRupees) || 0);
+      if (!primaryKey || safeAmt <= 0) return;
+      const cleanContestId = (contestId || '').trim();
+      const cleanEntryId = (entryId || '').trim();
+      const contestEntryKey = cleanContestId && cleanEntryId ? `${cleanContestId}::${cleanEntryId}` : '';
+
+      if (countedPrizes.has(primaryKey)) return;
+      if (cleanEntryId && countedEntryIds.has(cleanEntryId)) return;
+      if (contestEntryKey && countedContestEntryKeys.has(contestEntryKey)) return;
+      if (!cleanEntryId && cleanContestId && countedContestKeys.has(cleanContestId)) return;
+
+      countedPrizes.set(primaryKey, safeAmt);
+      if (cleanEntryId) countedEntryIds.add(cleanEntryId);
+      if (contestEntryKey) countedContestEntryKeys.add(contestEntryKey);
+      if (cleanContestId) countedContestKeys.add(cleanContestId);
+    };
+
+    // 1. Authoritative Financial Ledgers from memory and persistent store (type === 'PRIZE_PAYOUT' only; ENTRY_FEE / REFUND / deposits excluded)
     const ledgers = this.getFinancialLedgers();
     ledgers.forEach(rec => {
-      if (rec.type !== 'PRIZE_PAYOUT' || rec.status !== 'COMPLETED') return;
-      if (rec.isDemo || rec.ownerUid.startsWith('demo-')) return;
+      if (!rec || rec.type !== 'PRIZE_PAYOUT') return;
+      const statusUpper = String(rec.status || '').trim().toUpperCase();
+      if (statusUpper && ineligiblePayoutStatuses.has(statusUpper)) return;
+      if (rec.isDemo || (rec.ownerUid || '').startsWith('demo-') || (rec.ownerUid || '').startsWith('seed-')) return;
 
-      const recUid = (rec.ownerUid || '').trim();
-      const matchUid = cleanUid && (recUid === cleanUid || recUid === cleanUidNoPrefix);
-      const matchEmail = cleanEmail && rec.ownerUid && rec.ownerUid.toLowerCase().includes(cleanEmail.replace(/[^a-zA-Z0-9]/g, '_'));
-
-      if (matchUid || matchEmail) {
-        countedPrizes.set(rec.transactionId, Number(rec.amountRupees) || 0);
+      if (belongsToTargetUser(rec.ownerUid, rec.userEmail)) {
+        registerPayout(rec.transactionId, Number(rec.amountRupees) || 0, rec.contestId, rec.entryId);
       }
     });
 
@@ -1495,74 +1542,65 @@ class QuizKartContestBackendService {
     this.settledContests.forEach(contestId => {
       const entries = this.entriesStore.get(contestId) || [];
       entries.forEach(e => {
-        if (e.isDemo || e.ownerUid.startsWith('demo-')) return;
+        if (!e || e.isDemo || (e.ownerUid || '').startsWith('demo-') || (e.ownerUid || '').startsWith('seed-')) return;
         if (e.settlementStatus === 'settled' && (e.settledPrizeRupees || 0) > 0) {
-          const entryUid = (e.ownerUid || '').trim();
-          const matchUid = cleanUid && (entryUid === cleanUid || entryUid === cleanUidNoPrefix);
-          const matchEmail = cleanEmail && e.ownerUid && e.ownerUid.toLowerCase().includes(cleanEmail.replace(/[^a-zA-Z0-9]/g, '_'));
-
-          if (matchUid || matchEmail) {
+          if (belongsToTargetUser(e.ownerUid, e.userEmail)) {
             const prizeKey = `SETTLED_${contestId}_ENTRY_${e.entryId}`;
-            // Deduplicate against any ledger records matching the same contest and entry
-            const alreadyInLedger = Array.from(countedPrizes.keys()).some(
-              k => k.includes(e.entryId) || (k.includes(contestId) && k.includes(entryUid))
-            );
-            if (!alreadyInLedger && !countedPrizes.has(prizeKey)) {
-              countedPrizes.set(prizeKey, Number(e.settledPrizeRupees) || 0);
-            }
+            registerPayout(prizeKey, Number(e.settledPrizeRupees) || 0, contestId, e.entryId);
           }
         }
       });
     });
 
-    // 3. User Quiz Attempts from localStorage cache (if running in browser client)
+    // 3. Authoritative Settled Quiz Attempts (passed from Firestore state and/or email-isolated localStorage cache)
+    const combinedAttempts: any[] = Array.isArray(quizAttemptsList) ? [...quizAttemptsList] : [];
     try {
       if (typeof localStorage !== 'undefined') {
+        const rawByEmail = cleanEmail ? localStorage.getItem(`quizkart_user_quiz_attempts_${cleanEmail}`) : null;
         const rawAttempts = localStorage.getItem('quizkart_user_quiz_attempts');
-        if (rawAttempts) {
-          const parsedAttempts = JSON.parse(rawAttempts);
-          if (Array.isArray(parsedAttempts)) {
-            parsedAttempts.forEach((att: any) => {
-              if (
-                att &&
-                att.settlementStatus === 'settled' &&
-                Number(att.finalPrizeRupees || att.rewardAmount) > 0 &&
-                (att.contestId ? this.isContestSettled(att.contestId) : true)
-              ) {
-                const attUid = (att.ownerUid || att.userId || '').trim();
-                const attEmail = (att.userEmail || '').trim().toLowerCase();
-                const isMatch =
-                  (cleanUid && (attUid === cleanUid || attUid === cleanUidNoPrefix)) ||
-                  (cleanEmail && attEmail && attEmail === cleanEmail);
-
-                if (isMatch) {
-                  const prize = Number(att.finalPrizeRupees || att.rewardAmount);
-                  const attemptKey = att.entryId ? `ATT_${att.entryId}` : `ATT_${att.attemptId}`;
-                  const alreadyCounted = Array.from(countedPrizes.keys()).some(
-                    k => (att.entryId && k.includes(att.entryId)) || k.includes(att.attemptId)
-                  );
-                  if (!alreadyCounted && !countedPrizes.has(attemptKey)) {
-                    countedPrizes.set(attemptKey, prize);
-                  }
-                }
-              }
-            });
-          }
-        }
+        [rawByEmail, rawAttempts].forEach((raw) => {
+          if (!raw) return;
+          try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              combinedAttempts.push(...parsed);
+            }
+          } catch {}
+        });
       }
     } catch {}
 
-    // Check user profile for authoritative settled totalWonAmount
-    let profileWon = Number(userProfileTotalWon) || 0;
-    if (!profileWon && typeof localStorage !== 'undefined') {
+    combinedAttempts.forEach((att: any) => {
+      if (!att || att.isDemo || att.rewardType === 'product') return;
+      if (att.settlementStatus !== 'settled') return;
+
+      // Never count provisional prizes; only finalized settled payout amount
+      const cashPrize = Number(att?.finalPrizeRupees !== undefined ? att.finalPrizeRupees : (att?.rewardAmount ?? 0));
+      if (!Number.isFinite(cashPrize) || cashPrize <= 0) return;
+
+      // If this contest's entries are loaded locally and not settled yet, reject unsettled prize
+      if (att.contestId) {
+        const loadedEntries = this.entriesStore.get(att.contestId);
+        if (loadedEntries && loadedEntries.length > 0 && !this.isContestSettled(att.contestId)) {
+          return;
+        }
+      }
+
+      if (belongsToTargetUser(att.ownerUid || att.userId, att.userEmail)) {
+        const attemptKey = att.entryId ? `ATT_${att.entryId}` : `ATT_${att.attemptId}`;
+        registerPayout(attemptKey, cashPrize, att.contestId, att.entryId);
+      }
+    });
+
+    // Check user profile for authoritative settled totalWonAmount (captures historical settled payouts from Firestore profile)
+    let profileWon = userProfileTotalWon !== undefined ? Math.max(0, Number(userProfileTotalWon) || 0) : 0;
+    if (userProfileTotalWon === undefined && typeof localStorage !== 'undefined') {
       try {
         const pRaw = localStorage.getItem('quizkart_user_profile');
         if (pRaw) {
           const p = JSON.parse(pRaw);
-          const pEmail = (p.email || '').trim().toLowerCase();
-          const pUid = (p.uid || p.id || '').trim();
-          if ((cleanEmail && pEmail === cleanEmail) || (cleanUid && pUid === cleanUid)) {
-            profileWon = Number(p.totalWonAmount) || 0;
+          if (belongsToTargetUser(p.uid || p.id, p.email)) {
+            profileWon = Math.max(0, Number(p.totalWonAmount) || 0);
           }
         }
       } catch {}
@@ -1575,41 +1613,52 @@ class QuizKartContestBackendService {
     let completedWithdrawals = 0;
     let activeWithdrawalHolds = 0;
 
+    const normWithdrawalKey = (w: any): string => {
+      const raw = String(w?.requestId || w?.id || '').trim();
+      return raw.replace(/^WTH-(\d+)$/i, 'QK-WTH-$1').toUpperCase();
+    };
+
     const dedupWithdrawals = new Map<string, WithdrawalRequest>();
     (withdrawalsList || []).forEach(w => {
-      if (!w || !w.id) return;
-      dedupWithdrawals.set(w.id, w);
+      if (!w || (!w.id && !w.requestId)) return;
+      const k = normWithdrawalKey(w);
+      if (k) dedupWithdrawals.set(k, w);
     });
 
     try {
       if (typeof localStorage !== 'undefined') {
-        const userPermW = cleanEmail ? localStorage.getItem(`quizkart_user_withdrawals_permanent_${cleanEmail}`) : null;
-        const permW = userPermW || localStorage.getItem('quizkart_user_withdrawals_permanent');
-        if (permW) {
-          const parsed = JSON.parse(permW);
-          if (Array.isArray(parsed)) {
-            parsed.forEach((w: any) => {
-              if (w && w.id && !dedupWithdrawals.has(w.id)) {
-                dedupWithdrawals.set(w.id, w);
-              }
-            });
-          }
-        }
+        const localSources = [
+          cleanEmail ? localStorage.getItem(`quizkart_user_withdrawals_permanent_${cleanEmail}`) : null,
+          localStorage.getItem('quizkart_user_withdrawals_permanent'),
+          localStorage.getItem('quizkart_admin_withdrawals')
+        ];
+        localSources.forEach((raw) => {
+          if (!raw) return;
+          try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              parsed.forEach((w: any) => {
+                if (!w || (!w.id && !w.requestId)) return;
+                const k = normWithdrawalKey(w);
+                if (!k) return;
+                const existing = dedupWithdrawals.get(k);
+                if (!existing) {
+                  dedupWithdrawals.set(k, w);
+                } else if (existing.status === 'pending' && w.status && w.status !== 'pending') {
+                  // Never let a stale local pending copy mask a resolved status from another local cache
+                  dedupWithdrawals.set(k, w);
+                }
+              });
+            }
+          } catch {}
+        });
       }
     } catch {}
 
     dedupWithdrawals.forEach(w => {
-      const wUid = (w.ownerUid || w.userId || '').trim();
-      const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
-      
-      // Strict user matching: never match if neither UID nor email matches
-      const isMatch =
-        (cleanUid && (wUid === cleanUid || wUid === cleanUidNoPrefix)) ||
-        (cleanEmail && wEmail && wEmail === cleanEmail);
+      if (!belongsToTargetUser(w.ownerUid || w.userId, w.userEmail || w.email)) return;
 
-      if (!isMatch) return;
-
-      const amt = Number(w.amount) || 0;
+      const amt = Math.max(0, Number(w.amount) || 0);
       if (w.status === 'approved') {
         completedWithdrawals += amt;
       } else if (w.status === 'pending') {
@@ -1618,7 +1667,11 @@ class QuizKartContestBackendService {
       // 'rejected' and 'cancelled' holds are released
     });
 
-    const withdrawableBalance = Math.max(0, settledWinnings - completedWithdrawals - activeWithdrawalHolds);
+    const rawWithdrawable = Math.max(0, settledWinnings - completedWithdrawals - activeWithdrawalHolds);
+    const withdrawableBalance =
+      walletBalance !== undefined && Number.isFinite(Number(walletBalance))
+        ? Math.min(Math.max(0, Number(walletBalance)), rawWithdrawable)
+        : rawWithdrawable;
 
     return {
       settledWinnings,
@@ -1629,6 +1682,9 @@ class QuizKartContestBackendService {
     };
   }
 
+  public readonly MINIMUM_WITHDRAWAL_RUPEES = 10;
+  public readonly MAXIMUM_WITHDRAWAL_RUPEES = 5000;
+
   /**
    * AUTHORITATIVE BACKEND VALIDATION FOR WITHDRAWAL SUBMISSION
    * Never trusts client-side numbers; calculates true settled winnings on the backend.
@@ -1638,7 +1694,9 @@ class QuizKartContestBackendService {
     ownerUid: string,
     userEmail?: string,
     withdrawalsList?: WithdrawalRequest[],
-    userProfileTotalWon?: number
+    userProfileTotalWon?: number,
+    walletBalance?: number,
+    quizAttemptsList?: QuizAttemptResult[]
   ): {
     success: boolean;
     error?: string;
@@ -1646,14 +1704,59 @@ class QuizKartContestBackendService {
     settledWinnings: number;
   } {
     const amt = Number(withdrawal.amount);
+    const balanceInfo = this.getWithdrawableBalance(
+      ownerUid,
+      userEmail,
+      withdrawalsList,
+      userProfileTotalWon,
+      walletBalance,
+      quizAttemptsList
+    );
+
     if (isNaN(amt) || amt <= 0) {
-      return { success: false, error: 'Please enter a valid withdrawal amount.', withdrawableBalance: 0, settledWinnings: 0 };
-    }
-    if (amt > 5000) {
-      return { success: false, error: 'Maximum withdrawal amount is ₹5000 per request.', withdrawableBalance: 0, settledWinnings: 0 };
+      return {
+        success: false,
+        error: 'Please enter a valid withdrawal amount.',
+        withdrawableBalance: balanceInfo.withdrawableBalance,
+        settledWinnings: balanceInfo.settledWinnings
+      };
     }
 
-    const balanceInfo = this.getWithdrawableBalance(ownerUid, userEmail, withdrawalsList, userProfileTotalWon);
+    if (amt < this.MINIMUM_WITHDRAWAL_RUPEES) {
+      return {
+        success: false,
+        error: `Minimum withdrawal amount is ₹${this.MINIMUM_WITHDRAWAL_RUPEES}.`,
+        withdrawableBalance: balanceInfo.withdrawableBalance,
+        settledWinnings: balanceInfo.settledWinnings
+      };
+    }
+
+    if (amt > this.MAXIMUM_WITHDRAWAL_RUPEES) {
+      return {
+        success: false,
+        error: `Maximum withdrawal amount is ₹${this.MAXIMUM_WITHDRAWAL_RUPEES} per request.`,
+        withdrawableBalance: balanceInfo.withdrawableBalance,
+        settledWinnings: balanceInfo.settledWinnings
+      };
+    }
+
+    // Duplicate ID idempotency check
+    const reqId = (withdrawal.id || withdrawal.requestId || '').trim().toUpperCase();
+    if (reqId && Array.isArray(withdrawalsList)) {
+      const duplicate = withdrawalsList.some((w) => {
+        if (!w) return false;
+        const wId = (w.id || w.requestId || '').trim().toUpperCase();
+        return wId === reqId && (w.walletDeducted || w.status === 'pending' || w.status === 'approved');
+      });
+      if (duplicate) {
+        return {
+          success: false,
+          error: 'This withdrawal request has already been submitted.',
+          withdrawableBalance: balanceInfo.withdrawableBalance,
+          settledWinnings: balanceInfo.settledWinnings
+        };
+      }
+    }
 
     // Rule: Pending withdrawal requests must reserve the applicable amount to prevent duplicate withdrawals
     if (balanceInfo.activeWithdrawalHolds > 0) {
@@ -1677,8 +1780,214 @@ class QuizKartContestBackendService {
 
     return {
       success: true,
-      withdrawableBalance: balanceInfo.withdrawableBalance - amt,
+      withdrawableBalance: Math.max(0, balanceInfo.withdrawableBalance - amt),
       settledWinnings: balanceInfo.settledWinnings
+    };
+  }
+
+  /**
+   * Idempotent wallet deduction for withdrawal reservation.
+   * Ensures walletBalance never goes negative and duplicate calls never double-deduct.
+   */
+  public applyWithdrawalDeduction(
+    currentWalletBalance: number,
+    withdrawal: WithdrawalRequest
+  ): {
+    success: boolean;
+    alreadyDeducted: boolean;
+    error?: string;
+    nextWalletBalance: number;
+    updatedWithdrawal: WithdrawalRequest;
+  } {
+    const safeWallet = Math.max(0, Number(currentWalletBalance) || 0);
+    const amt = Number(withdrawal.amount);
+
+    if (withdrawal.walletDeducted) {
+      return {
+        success: true,
+        alreadyDeducted: true,
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    if (isNaN(amt) || amt < this.MINIMUM_WITHDRAWAL_RUPEES) {
+      return {
+        success: false,
+        alreadyDeducted: false,
+        error: `Minimum withdrawal amount is ₹${this.MINIMUM_WITHDRAWAL_RUPEES}.`,
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    if (amt > this.MAXIMUM_WITHDRAWAL_RUPEES) {
+      return {
+        success: false,
+        alreadyDeducted: false,
+        error: `Maximum withdrawal amount is ₹${this.MAXIMUM_WITHDRAWAL_RUPEES} per request.`,
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    if (amt > safeWallet) {
+      return {
+        success: false,
+        alreadyDeducted: false,
+        error: `Insufficient wallet balance. You only have ₹${safeWallet} available.`,
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    const nextWalletBalance = Math.max(0, safeWallet - amt);
+    return {
+      success: true,
+      alreadyDeducted: false,
+      nextWalletBalance,
+      updatedWithdrawal: {
+        ...withdrawal,
+        status: withdrawal.status || 'pending',
+        walletDeducted: true,
+        walletDeductedAmount: amt,
+        walletRefunded: false,
+        updatedAt: new Date().toISOString()
+      }
+    };
+  }
+
+  /**
+   * Idempotent wallet status transition (approved / rejected / cancelled).
+   * - Approved: never triggers a second deduction.
+   * - Rejected / Cancelled: refunds reserved amount exactly once.
+   */
+  public applyWithdrawalStatusTransition(
+    currentWalletBalance: number,
+    withdrawal: WithdrawalRequest,
+    nextStatus: 'approved' | 'rejected' | 'cancelled'
+  ): {
+    changed: boolean;
+    refunded: boolean;
+    nextWalletBalance: number;
+    updatedWithdrawal: WithdrawalRequest;
+  } {
+    const safeWallet = Math.max(0, Number(currentWalletBalance) || 0);
+    if (!withdrawal || withdrawal.status !== 'pending') {
+      return {
+        changed: false,
+        refunded: false,
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    if (nextStatus === 'approved') {
+      return {
+        changed: true,
+        refunded: false,
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: {
+          ...withdrawal,
+          status: 'approved',
+          walletDeducted: withdrawal.walletDeducted ?? true,
+          updatedAt: nowIso
+        }
+      };
+    }
+
+    const shouldRefund = !withdrawal.walletRefunded && withdrawal.walletDeducted !== false;
+    const refundAmt = shouldRefund ? Math.max(0, Number(withdrawal.walletDeductedAmount ?? withdrawal.amount) || 0) : 0;
+    const nextWalletBalance = Math.max(0, safeWallet + refundAmt);
+
+    return {
+      changed: true,
+      refunded: shouldRefund && refundAmt > 0,
+      nextWalletBalance,
+      updatedWithdrawal: {
+        ...withdrawal,
+        status: nextStatus,
+        walletRefunded: shouldRefund ? true : Boolean(withdrawal.walletRefunded),
+        updatedAt: nowIso
+      }
+    };
+  }
+
+  /**
+   * Reconciles a single pending withdrawal reservation without touching completed (approved) withdrawals.
+   * - Historical approved withdrawals (e.g. QK-WTH-1009): preserved untouched.
+   * - Pending withdrawal already reserved (walletDeducted === true): never deducted again.
+   * - Unreserved pending withdrawal (walletDeducted !== true): reserves amount once if sufficient balance exists.
+   */
+  public reconcilePendingWithdrawalReservation(
+    currentWalletBalance: number,
+    withdrawal: WithdrawalRequest
+  ): {
+    changed: boolean;
+    action: 'preserved_completed' | 'already_reserved' | 'reserved_once' | 'insufficient_balance' | 'unchanged';
+    nextWalletBalance: number;
+    updatedWithdrawal: WithdrawalRequest;
+  } {
+    const safeWallet = Math.max(0, Number(currentWalletBalance) || 0);
+    if (!withdrawal) {
+      return {
+        changed: false,
+        action: 'unchanged',
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    if (withdrawal.status === 'approved') {
+      return {
+        changed: false,
+        action: 'preserved_completed',
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    if (withdrawal.status !== 'pending') {
+      return {
+        changed: false,
+        action: 'unchanged',
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    if (withdrawal.walletDeducted) {
+      return {
+        changed: false,
+        action: 'already_reserved',
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    const amt = Math.max(0, Number(withdrawal.amount) || 0);
+    if (amt <= 0 || amt > safeWallet) {
+      return {
+        changed: false,
+        action: 'insufficient_balance',
+        nextWalletBalance: safeWallet,
+        updatedWithdrawal: withdrawal
+      };
+    }
+
+    const nextWalletBalance = Math.max(0, safeWallet - amt);
+    return {
+      changed: true,
+      action: 'reserved_once',
+      nextWalletBalance,
+      updatedWithdrawal: {
+        ...withdrawal,
+        walletDeducted: true,
+        walletDeductedAmount: amt,
+        walletRefunded: false,
+        updatedAt: new Date().toISOString()
+      }
     };
   }
 

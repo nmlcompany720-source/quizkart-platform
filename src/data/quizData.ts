@@ -242,17 +242,98 @@ export const DEFAULT_USER_PROFILE: UserProfile = {
   }
 };
 
+const CONFIRMED_TEST_USER_EMAILS = new Set([
+  'player@quizkart.in',
+  'demo@quizkart.in',
+  'alpha@quizkart.in',
+  'beta@quizkart.in'
+]);
+
+const CONFIRMED_SEED_TEST_UID_PREFIXES = [
+  'demo-',
+  'seed-',
+  'test_uid_',
+  'uid_multientry_player',
+  'uid_competitor'
+];
+
+const CONFIRMED_SEED_TEST_CUSTOM_IDS = new Set([
+  'QK-USR-MULTI',
+  'QK-USR-COMPETITOR'
+]);
+
 export function isDemoSeedUser(u?: Partial<UserProfile> | null): boolean {
   if (!u) return true;
-  // ABSOLUTE DATA PERSISTENCE: If user has an active/registered account, NEVER drop or hide them!
-  if (u.isRegistered && u.email && !u.isDeleted) {
-    return false;
+
+  const flagged = u as Partial<UserProfile> & { isDemo?: boolean; isTest?: boolean };
+  if (flagged.isDemo === true || flagged.isTest === true) {
+    return true;
   }
+
   const email = (u.email || '').trim().toLowerCase();
   const name = (u.name || '').trim().toLowerCase();
-  if (email === 'player@quizkart.in' && !u.isRegistered) return true;
-  if (name === 'nml admin' && !u.email) return true;
+  const uid = (u.uid || '').trim().toLowerCase();
+  const id = (u.id || '').trim().toUpperCase();
+  const customUserId = (u.customUserId || '').trim().toUpperCase();
+
+  // Confirmed seeded/test UID prefixes from backend test suites and demo bots
+  if (CONFIRMED_SEED_TEST_UID_PREFIXES.some((prefix) => uid.startsWith(prefix) || id.toLowerCase().startsWith(prefix))) {
+    return true;
+  }
+
+  // Confirmed synthetic test IDs from ranking engine test scripts
+  if (CONFIRMED_SEED_TEST_CUSTOM_IDS.has(id) || CONFIRMED_SEED_TEST_CUSTOM_IDS.has(customUserId)) {
+    return true;
+  }
+
+  // Confirmed seeded placeholder/test emails
+  if (email && CONFIRMED_TEST_USER_EMAILS.has(email)) {
+    return true;
+  }
+
+  // Confirmed test_batch2 / test_batch3 accounts
+  if (
+    (name === 'alpha contestant' && (customUserId === 'QK-USR-9001' || id === 'QK-USR-9001' || !u.isRegistered)) ||
+    (name === 'beta contestant' && (customUserId === 'QK-USR-9002' || id === 'QK-USR-9002' || !u.isRegistered)) ||
+    (name === 'multi entry master' && (!email || !u.isRegistered)) ||
+    (name === 'single entry challenger' && (!email || !u.isRegistered))
+  ) {
+    return true;
+  }
+
+  // Seeded INITIAL_REGISTERED_USERS dummy array from src/utils/userManagement.ts
+  if (
+    /^usr-100[1-5]$/.test(uid) &&
+    u.passwordStatus === 'Configured' &&
+    ['2026-09-15', '2026-09-18', '2026-09-19', '2026-09-20', '2026-09-21'].includes(String(u.registrationDate || ''))
+  ) {
+    return true;
+  }
+
+  if (name === 'nml admin' && !email) return true;
+  if (name === 'new player' && !email && !u.isRegistered) return true;
+
+  // ABSOLUTE DATA PERSISTENCE: Keep all genuine registered users (including those without profile photos or incomplete fields)
+  if (u.isRegistered && email && !u.isDeleted) {
+    return false;
+  }
+
   return false;
+}
+
+export function isConfirmedFakeDisplayUser(u?: Partial<UserProfile> | null): boolean {
+  if (!u) return false;
+  const rawId = (u.customUserId || u.id || '').trim().toUpperCase();
+  const normalizedId = /^(?:QK-)?USR-\d+$/i.test(rawId)
+    ? (rawId.startsWith('QK-') ? rawId : `QK-${rawId}`)
+    : rawId;
+  const uNum = typeof u.userNumber === 'number' ? u.userNumber : NaN;
+  return (
+    normalizedId === 'QK-USR-9009' ||
+    normalizedId === 'QK-USR-9012' ||
+    uNum === 9009 ||
+    uNum === 9012
+  );
 }
 
 export const DEFAULT_REGISTERED_USERS: UserProfile[] = [];

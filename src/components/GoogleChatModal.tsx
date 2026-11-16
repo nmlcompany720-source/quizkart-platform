@@ -18,7 +18,7 @@ import {
   Trophy
 } from 'lucide-react';
 import { googleChatService, GoogleChatSpace, GoogleChatMessage } from '../services/googleChatService';
-import { getCachedAccessToken, signInWithGoogle, logOutUser, auth } from '../firebase';
+import { getCachedAccessToken, signInForGoogleChat, logOutUser, auth } from '../firebase';
 import { DailyPrizeItem } from '../types';
 
 interface GoogleChatModalProps {
@@ -99,7 +99,7 @@ export const GoogleChatModal: React.FC<GoogleChatModalProps> = ({
     setIsAuthenticating(true);
     setAuthError(null);
     try {
-      const { accessToken } = await signInWithGoogle();
+      const { accessToken } = await signInForGoogleChat();
       if (accessToken) {
         setHasToken(true);
         showNotice('Successfully connected to Google Chat!', 'success');

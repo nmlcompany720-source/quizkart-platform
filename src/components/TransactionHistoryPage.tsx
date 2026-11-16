@@ -7,12 +7,22 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  X
+  X,
+  Loader2,
+  AlertCircle,
+  RefreshCw
 } from 'lucide-react';
+import { onAuthStateChanged } from 'firebase/auth';
 import { DepositRequest, WithdrawalRequest, UserProfile } from '../types';
 import { soundFx } from '../utils/audio';
 import { formatDepositId, formatWithdrawalId, formatDepositTimestamp } from '../utils/depositUtils';
-import { fetchDepositsFromFirestore, subscribeToDepositsFromFirestore } from '../firebase';
+import {
+  auth,
+  fetchDepositsFromFirestore,
+  subscribeToDepositsFromFirestore,
+  fetchWithdrawalsFromFirestore,
+  subscribeToWithdrawalsFromFirestore
+} from '../firebase';
 
 interface TransactionHistoryPageProps {
   userProfile: UserProfile;
@@ -116,27 +126,59 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
     }
   };
 
-  // Filter user's specific deposits and withdrawals strictly by logged-in user's exact Email Address
-  const currentUserEmail = (userProfile.email || '').trim().toLowerCase();
-  const currentUid = userProfile.uid || userProfile.id || '';
-
-  // Direct Firestore real-time synchronization for current user's deposit history
-  const [cloudUserDeposits, setCloudUserDeposits] = useState<DepositRequest[]>([]);
+  const [authSessionKey, setAuthSessionKey] = useState<string>(() =>
+    auth.currentUser ? `${auth.currentUser.uid}:${(auth.currentUser.email || '').toLowerCase()}` : 'anon'
+  );
+  const [authUid, setAuthUid] = useState<string>(() => auth.currentUser?.uid || '');
+  const [retrySyncTick, setRetrySyncTick] = useState<number>(0);
 
   useEffect(() => {
-    if (!currentUserEmail && !currentUid) return;
+    try {
+      return onAuthStateChanged(auth, (fbUser) => {
+        setAuthUid(fbUser?.uid || '');
+        setAuthSessionKey(fbUser ? `${fbUser.uid}:${(fbUser.email || '').toLowerCase()}` : 'anon');
+      });
+    } catch {
+      return () => {};
+    }
+  }, []);
+
+  // Filter user's specific deposits and withdrawals strictly by logged-in user's exact Email Address
+  const currentUserEmail = (userProfile.email || auth.currentUser?.email || '').trim().toLowerCase();
+  const currentUid = authUid || userProfile.uid || userProfile.id || '';
+
+  // Direct Firestore real-time synchronization for current user's deposit and withdrawal history
+  const [cloudUserDeposits, setCloudUserDeposits] = useState<DepositRequest[]>([]);
+  const [cloudUserWithdrawals, setCloudUserWithdrawals] = useState<WithdrawalRequest[]>([]);
+  const [hasLoadedCloudWithdrawals, setHasLoadedCloudWithdrawals] = useState<boolean>(false);
+  const [isWithdrawalsLoading, setIsWithdrawalsLoading] = useState<boolean>(true);
+  const [withdrawalsSyncError, setWithdrawalsSyncError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!currentUserEmail && !currentUid) {
+      setCloudUserDeposits([]);
+      setCloudUserWithdrawals([]);
+      setHasLoadedCloudWithdrawals(false);
+      setIsWithdrawalsLoading(false);
+      setWithdrawalsSyncError(null);
+      return;
+    }
+
+    let isActive = true;
+    setIsWithdrawalsLoading(true);
+    setWithdrawalsSyncError(null);
 
     fetchDepositsFromFirestore(currentUid, currentUserEmail)
       .then((items) => {
-        if (items && items.length > 0) {
+        if (isActive && items && items.length > 0) {
           setCloudUserDeposits(items);
         }
       })
       .catch(() => {});
 
-    const unsub = subscribeToDepositsFromFirestore(
+    const unsubDeps = subscribeToDepositsFromFirestore(
       (items) => {
-        if (items) {
+        if (isActive && items) {
           setCloudUserDeposits(items);
         }
       },
@@ -144,18 +186,50 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
       currentUserEmail
     );
 
+    fetchWithdrawalsFromFirestore(currentUid, currentUserEmail)
+      .then((items) => {
+        if (!isActive) return;
+        setCloudUserWithdrawals(items || []);
+        setHasLoadedCloudWithdrawals(true);
+        setIsWithdrawalsLoading(false);
+      })
+      .catch((err) => {
+        if (!isActive) return;
+        setIsWithdrawalsLoading(false);
+        setWithdrawalsSyncError(err?.message || 'Unable to sync withdrawal history from Firestore.');
+      });
+
+    const unsubWths = subscribeToWithdrawalsFromFirestore(
+      (items) => {
+        if (!isActive) return;
+        setCloudUserWithdrawals(items || []);
+        setHasLoadedCloudWithdrawals(true);
+        setWithdrawalsSyncError(null);
+        setIsWithdrawalsLoading(false);
+      },
+      currentUid,
+      currentUserEmail,
+      (err: any) => {
+        if (!isActive) return;
+        setIsWithdrawalsLoading(false);
+        setWithdrawalsSyncError(err?.message || 'Real-time withdrawal sync interrupted.');
+      }
+    );
+
     return () => {
-      unsub();
+      isActive = false;
+      unsubDeps();
+      unsubWths();
     };
-  }, [currentUserEmail, currentUid]);
+  }, [currentUserEmail, currentUid, authSessionKey, retrySyncTick]);
 
   const rawUserDeposits = useMemo(() => {
     const belongsToCurrentUser = (d: DepositRequest) => {
       if (!d) return false;
-      if (currentUid && (d.ownerUid === currentUid || d.userId === currentUid)) return true;
-      if (!currentUserEmail) return false;
       const dEmail = (d.userEmail || d.email || '').trim().toLowerCase();
-      if (!dEmail) return false;
+      if (dEmail && currentUserEmail && dEmail !== currentUserEmail) return false;
+      if (currentUid && (d.ownerUid === currentUid || d.userId === currentUid)) return true;
+      if (!currentUserEmail || !dEmail) return false;
       return dEmail === currentUserEmail;
     };
 
@@ -256,17 +330,29 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
 
     const belongsToCurrentUser = (w: WithdrawalRequest) => {
       if (!w || isBuggedDemoWithdrawal(w)) return false;
-      if (currentUid && (w.ownerUid === currentUid || w.userId === currentUid)) return true;
-      if (!currentUserEmail) return false;
       const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
-      if (!wEmail) return false;
+      // Strict cross-user isolation: never allow records with another email
+      if (wEmail && currentUserEmail && wEmail !== currentUserEmail) return false;
+      if (currentUid && (w.ownerUid === currentUid || w.userId === currentUid)) return true;
+      if (!currentUserEmail || !wEmail) return false;
       return wEmail === currentUserEmail;
+    };
+
+    const getCanonicalWthKey = (w: WithdrawalRequest): string => {
+      const raw = String(w.id || w.requestId || '').trim();
+      if (!raw) return '';
+      if (/^QK-WTH-\d{4,6}$/i.test(raw)) {
+        return raw.toUpperCase();
+      }
+      return raw;
     };
 
     // 1. Read permanent user audit log filtered strictly to current user's email
     let permanentList: WithdrawalRequest[] = [];
     try {
-      const savedByEmail = localStorage.getItem(`quizkart_user_withdrawals_permanent_${currentUserEmail}`);
+      const savedByEmail = currentUserEmail
+        ? localStorage.getItem(`quizkart_user_withdrawals_permanent_${currentUserEmail}`)
+        : null;
       const savedGlobal = localStorage.getItem('quizkart_user_withdrawals_permanent');
       const combinedRaw: WithdrawalRequest[] = [
         ...(savedByEmail ? JSON.parse(savedByEmail) : []),
@@ -277,45 +363,86 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
       }
     } catch {}
 
-    // 2. Filter matching withdrawals from live props strictly by email
+    // 2. Filter matching withdrawals from live props and authoritative Firestore listener strictly by email/ownerUid
     const matchingFromProps = (withdrawals || []).filter(belongsToCurrentUser);
+    const matchingFromCloud = (cloudUserWithdrawals || []).filter(belongsToCurrentUser);
 
-    // 3. Merge both sets, prioritizing latest status and ensuring no user transaction is ever lost
-    const map = new Map<string, WithdrawalRequest>();
-    permanentList.forEach((item, idx) => {
-      if (item && item.id) {
-        map.set(formatWithdrawalId(item.id, idx + 1), item);
-      }
+    const cloudKeys = new Set<string>();
+    matchingFromCloud.forEach((item) => {
+      const k = getCanonicalWthKey(item);
+      if (k) cloudKeys.add(k);
+      if (item.id) cloudKeys.add(String(item.id).trim());
+      if (item.requestId) cloudKeys.add(String(item.requestId).trim());
+      if (item.firestoreDocId) cloudKeys.add(String(item.firestoreDocId).trim());
     });
-    matchingFromProps.forEach((item, idx) => {
-      if (item && item.id) {
-        const normId = formatWithdrawalId(item.id, idx + 1);
-        const existing = map.get(normId);
-        // Protect resolved statuses from being reverted to pending
-        const resolvedStatus = (existing?.status && existing.status !== 'pending')
-          ? existing.status
-          : (item.status || existing?.status || 'pending');
-        map.set(normId, {
-          ...existing,
+
+    const isCloudAuthoritative = hasLoadedCloudWithdrawals && !withdrawalsSyncError;
+    const isPhantomCachedPending = (item: WithdrawalRequest) => {
+      if (!isCloudAuthoritative) return false;
+      const st = String(item.status || 'pending').toLowerCase();
+      if (st !== 'pending') return false;
+      const key = getCanonicalWthKey(item);
+      const idMatch =
+        (key && cloudKeys.has(key)) ||
+        (item.id && cloudKeys.has(String(item.id).trim())) ||
+        (item.requestId && cloudKeys.has(String(item.requestId).trim()));
+      return !idMatch;
+    };
+
+    // 3. Merge all sources, making authoritative Firestore records the Single Source of Truth
+    const map = new Map<string, WithdrawalRequest>();
+    permanentList.forEach((item) => {
+      if (!item || !item.id || isPhantomCachedPending(item)) return;
+      const key = getCanonicalWthKey(item);
+      if (key) {
+        map.set(key, {
           ...item,
-          id: normId,
-          userEmail: currentUserEmail,
-          email: currentUserEmail,
-          status: resolvedStatus
+          status: (String(item.status || 'pending').toLowerCase() as WithdrawalRequest['status'])
         });
       }
     });
 
-    return Array.from(map.values()).map((w, idx) => ({
-      ...w,
-      id: formatWithdrawalId(w.id, idx + 1),
-      userEmail: currentUserEmail,
-      email: currentUserEmail,
-      timestamp: formatDepositTimestamp(w.timestamp, (w as any).createdAt, (w as any).date)
-    }));
-  }, [withdrawals, currentUserEmail, syncTick]);
+    const mergeRecord = (item: WithdrawalRequest, preferItemStatus: boolean) => {
+      if (!item || !item.id) return;
+      if (!preferItemStatus && isPhantomCachedPending(item)) return;
+      const key = getCanonicalWthKey(item);
+      if (!key) return;
+      const existing = map.get(key);
+      const itemStatus = String(item.status || 'pending').toLowerCase() as WithdrawalRequest['status'];
+      const existingStatus = String(existing?.status || 'pending').toLowerCase() as WithdrawalRequest['status'];
+      const resolvedStatus = preferItemStatus
+        ? itemStatus
+        : ((existing && existingStatus !== 'pending') ? existingStatus : itemStatus);
+      map.set(key, {
+        ...existing,
+        ...item,
+        id: item.id || existing?.id || key,
+        requestId: item.requestId || existing?.requestId || item.id || key,
+        userEmail: currentUserEmail || item.userEmail || item.email,
+        email: currentUserEmail || item.userEmail || item.email,
+        status: resolvedStatus
+      });
+    };
 
-  // Permanently sync merged user transactions isolated by email
+    matchingFromProps.forEach((item) => mergeRecord(item, false));
+    matchingFromCloud.forEach((item) => mergeRecord(item, true));
+
+    return Array.from(map.values())
+      .map((w) => ({
+        ...w,
+        id: w.id || w.requestId,
+        userEmail: currentUserEmail || w.userEmail || w.email,
+        email: currentUserEmail || w.userEmail || w.email,
+        timestamp: formatDepositTimestamp(w.timestamp, (w as any).createdAt, (w as any).date)
+      }))
+      .sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+        return timeB - timeA;
+      });
+  }, [withdrawals, cloudUserWithdrawals, hasLoadedCloudWithdrawals, withdrawalsSyncError, currentUserEmail, currentUid, syncTick]);
+
+  // Permanently sync merged user transactions isolated by email & reconcile active pending lock
   useEffect(() => {
     if (currentUserEmail && rawUserDeposits.length > 0) {
       try {
@@ -325,12 +452,22 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
   }, [rawUserDeposits, currentUserEmail]);
 
   useEffect(() => {
-    if (currentUserEmail && rawUserWithdrawals.length > 0) {
+    if (!currentUserEmail) return;
+    if (rawUserWithdrawals.length > 0 || hasLoadedCloudWithdrawals) {
       try {
         localStorage.setItem(`quizkart_user_withdrawals_permanent_${currentUserEmail}`, JSON.stringify(rawUserWithdrawals));
+        const activePendingId = localStorage.getItem('quizkart_active_pending_withdrawal_id');
+        if (activePendingId && hasLoadedCloudWithdrawals && !withdrawalsSyncError) {
+          const matched = rawUserWithdrawals.find(
+            (w) => w.id === activePendingId || w.requestId === activePendingId || formatWithdrawalId(w.id) === formatWithdrawalId(activePendingId)
+          );
+          if (!matched || matched.status !== 'pending') {
+            localStorage.removeItem('quizkart_active_pending_withdrawal_id');
+          }
+        }
       } catch {}
     }
-  }, [rawUserWithdrawals, currentUserEmail]);
+  }, [rawUserWithdrawals, hasLoadedCloudWithdrawals, withdrawalsSyncError, currentUserEmail]);
 
   // Apply date range filter
   const userDeposits = useMemo(() => {
@@ -597,63 +734,91 @@ export const TransactionHistoryPage: React.FC<TransactionHistoryPageProps> = ({
               </div>
             )
           ) : (
-            paginatedList.length > 0 ? (
-              paginatedList.map((wth, idx) => {
-                const actualIdx = startIndex + idx;
-                const requestId = formatWithdrawalId(wth.id, actualIdx + 1);
-                const timestamp = formatDepositTimestamp(wth.timestamp, (wth as any).createdAt, (wth as any).date);
-                const isSuccess = wth.status === 'approved';
-                const isRejected = wth.status === 'rejected';
-                const isCancelled = wth.status === 'cancelled';
-
-                return (
-                  <div
-                    key={wth.id ? `wth-card-${wth.id}-${actualIdx}` : `wth-card-${actualIdx}`}
-                    className="p-4 rounded-2xl border border-slate-200 bg-white hover:bg-white hover:border-slate-300 transition-all flex items-center justify-between gap-4"
-                    style={{ backgroundColor: '#FFFFFF' }}
-                  >
-                    {/* Left: Amount ONLY alongside Request ID, and static timestamp directly beneath */}
-                    <div className="space-y-1 min-w-0">
-                      <div className="flex items-center gap-2.5">
-                        <span className="text-base font-black text-rose-600" style={{ color: '#DC2626' }}>
-                          - ₹{wth.amount}
-                        </span>
-                        <span
-                          className="font-mono text-xs font-bold text-black bg-white px-2 py-0.5 rounded-md border border-slate-200"
-                          style={{ backgroundColor: '#FFFFFF', color: '#000000' }}
-                        >
-                          {requestId}
-                        </span>
-                      </div>
-                      {/* Immutable static timestamp without countdown or timers */}
-                      <div className="text-[11px] text-slate-500 font-mono tracking-wide">
-                        {timestamp}
-                      </div>
-                    </div>
-
-                    {/* Right: Solid Static Status Badge (NO animation, pulsing, or blinking) */}
-                    <div className="shrink-0">
-                      <span className={`px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wider select-none ${
-                        isSuccess
-                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                          : (isRejected || isCancelled)
-                          ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                          : 'bg-amber-100 text-amber-900 border border-amber-200'
-                      }`}>
-                        {isSuccess ? 'SUCCESS' : isRejected ? 'REJECTED' : isCancelled ? 'CANCELLED' : 'PENDING'}
-                      </span>
-                    </div>
+            <div className="space-y-3">
+              {withdrawalsSyncError && (
+                <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-semibold flex items-center justify-between gap-3">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <span>Unable to refresh live status from Firestore.</span>
                   </div>
-                );
-              })
-            ) : (
-              <div
-                className="py-16 text-center text-xs font-semibold text-slate-400 border border-dashed border-slate-200 rounded-2xl bg-white"
-                style={{ backgroundColor: '#FFFFFF' }}
-              >
-                {dateFilter !== 'all' ? `No Transactions Found for ${filterLabels[dateFilter].toLowerCase()}` : 'No Transactions Found'}
-              </div>
-            )
+                  <button
+                    type="button"
+                    onClick={() => setRetrySyncTick((prev) => prev + 1)}
+                    className="px-2.5 py-1 rounded-lg bg-white border border-rose-200 text-rose-700 font-bold text-[11px] hover:bg-rose-100 transition-colors cursor-pointer flex items-center gap-1 shrink-0"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>Retry</span>
+                  </button>
+                </div>
+              )}
+
+              {isWithdrawalsLoading && paginatedList.length === 0 ? (
+                <div
+                  className="py-16 text-center text-xs font-semibold text-slate-500 border border-dashed border-slate-200 rounded-2xl bg-white flex flex-col items-center justify-center gap-2"
+                  style={{ backgroundColor: '#FFFFFF' }}
+                >
+                  <Loader2 className="w-5 h-5 animate-spin text-indigo-500" />
+                  <span>Syncing withdrawal history...</span>
+                </div>
+              ) : paginatedList.length > 0 ? (
+                paginatedList.map((wth, idx) => {
+                  const actualIdx = startIndex + idx;
+                  const requestId = formatWithdrawalId(wth.id, actualIdx + 1);
+                  const timestamp = formatDepositTimestamp(wth.timestamp, (wth as any).createdAt, (wth as any).date);
+                  const normalizedStatus = String(wth.status || 'pending').toLowerCase();
+                  const isSuccess = normalizedStatus === 'approved';
+                  const isRejected = normalizedStatus === 'rejected';
+                  const isCancelled = normalizedStatus === 'cancelled';
+
+                  return (
+                    <div
+                      key={wth.id ? `wth-card-${wth.id}-${actualIdx}` : `wth-card-${actualIdx}`}
+                      className="p-4 rounded-2xl border border-slate-200 bg-white hover:bg-white hover:border-slate-300 transition-all flex items-center justify-between gap-4"
+                      style={{ backgroundColor: '#FFFFFF' }}
+                    >
+                      {/* Left: Amount ONLY alongside Request ID, and static timestamp directly beneath */}
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex items-center gap-2.5">
+                          <span className="text-base font-black text-rose-600" style={{ color: '#DC2626' }}>
+                            - ₹{wth.amount}
+                          </span>
+                          <span
+                            className="font-mono text-xs font-bold text-black bg-white px-2 py-0.5 rounded-md border border-slate-200"
+                            style={{ backgroundColor: '#FFFFFF', color: '#000000' }}
+                          >
+                            {requestId}
+                          </span>
+                        </div>
+                        {/* Immutable static timestamp without countdown or timers */}
+                        <div className="text-[11px] text-slate-500 font-mono tracking-wide">
+                          {timestamp}
+                        </div>
+                      </div>
+
+                      {/* Right: Solid Static Status Badge (NO animation, pulsing, or blinking) */}
+                      <div className="shrink-0">
+                        <span className={`px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wider select-none ${
+                          isSuccess
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                            : (isRejected || isCancelled)
+                            ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                            : 'bg-amber-100 text-amber-900 border border-amber-200'
+                        }`}>
+                          {isSuccess ? 'SUCCESS' : isRejected ? 'REJECTED' : isCancelled ? 'CANCELLED' : 'PENDING'}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div
+                  className="py-16 text-center text-xs font-semibold text-slate-400 border border-dashed border-slate-200 rounded-2xl bg-white"
+                  style={{ backgroundColor: '#FFFFFF' }}
+                >
+                  {dateFilter !== 'all' ? `No Transactions Found for ${filterLabels[dateFilter].toLowerCase()}` : 'No Transactions Found'}
+                </div>
+              )}
+            </div>
           )}
         </div>
 
