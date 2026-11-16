@@ -1877,92 +1877,6 @@ export default function App() {
     };
   }, [isUserAuthenticated, userProfile?.email, currentUser?.uid]);
 
-  const reconciledDepositIdsRef = useRef<Set<string>>(new Set());
-
-  // Safe one-time reconciliation for an existing approved (SUCCESS) deposit whose wallet credit was never recorded before this fix
-  useEffect(() => {
-    if (!isUserAuthenticated || !userProfile?.email || isDemoSeedUser(userProfile)) return;
-    if (withdrawalTxInFlightRef.current > 0) return;
-    if ((Number(userProfile.walletBalance) || 0) !== 0) return;
-    if ((Number(userProfile.quizzesPlayed) || 0) !== 0) return;
-    if ((Number(userProfile.totalWonAmount) || 0) !== 0) return;
-    if ((userQuizAttempts || []).length > 0) return;
-
-    const cleanEmail = userProfile.email.trim().toLowerCase();
-    const targetUid = (userProfile.uid || currentUser?.uid || '').trim();
-
-    const userWithdrawals = (withdrawals || []).filter((w) => {
-      if (!w) return false;
-      const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
-      const wUid = (w.ownerUid || w.userId || '').trim();
-      return (cleanEmail && wEmail === cleanEmail) || (targetUid && wUid === targetUid);
-    });
-    if (userWithdrawals.length > 0) return;
-
-    const uncreditedApproved = (deposits || []).find((d) => {
-      if (!d || !d.id || d.status !== 'approved') return false;
-      if (d.walletCredited === true || Boolean(d.creditedAt) || Number(d.walletCreditedAmount || 0) > 0) return false;
-      if ((Number(d.amount) || 0) <= 0) return false;
-      if (reconciledDepositIdsRef.current.has(d.id)) return false;
-      const dEmail = (d.userEmail || d.email || '').trim().toLowerCase();
-      const dUid = (d.ownerUid || d.userId || '').trim();
-      return (cleanEmail && dEmail === cleanEmail) || (targetUid && dUid === targetUid);
-    });
-
-    if (!uncreditedApproved) return;
-    reconciledDepositIdsRef.current.add(uncreditedApproved.id);
-
-    reconcileUncreditedApprovedDeposit(uncreditedApproved.id, {
-      ownerUid: targetUid,
-      userEmail: cleanEmail,
-      firestoreDocId: uncreditedApproved.firestoreDocId
-    })
-      .then((res) => {
-        if (res.success && res.credited && res.newWalletBalance !== undefined) {
-          const syncedIso = new Date().toISOString();
-          setDeposits((prev) =>
-            prev.map((item) =>
-              item && item.id === uncreditedApproved.id
-                ? {
-                    ...item,
-                    walletCredited: true,
-                    walletCreditedAmount: Number(res.creditedAmount ?? item.amount),
-                    creditedAt: syncedIso,
-                    updatedAt: syncedIso
-                  }
-                : item
-            )
-          );
-          setUserProfile((prev) => {
-            const prevEmail = (prev.email || '').trim().toLowerCase();
-            if (prevEmail !== cleanEmail) return prev;
-            const updated: UserProfile = {
-              ...prev,
-              walletBalance: res.newWalletBalance!,
-              lastCreditedDepositId: uncreditedApproved.id,
-              updatedAt: syncedIso
-            };
-            try {
-              localStorage.setItem('quizkart_user_profile', JSON.stringify(updated));
-            } catch {}
-            return updated;
-          });
-        }
-      })
-      .catch(() => {});
-  }, [
-    isUserAuthenticated,
-    userProfile?.email,
-    userProfile?.uid,
-    userProfile?.walletBalance,
-    userProfile?.quizzesPlayed,
-    userProfile?.totalWonAmount,
-    currentUser?.uid,
-    deposits,
-    withdrawals,
-    userQuizAttempts
-  ]);
-
   // Sanitize permanent user transaction history so only records with an explicit email are retained (never match or seed by phone/name)
   useEffect(() => {
     try {
@@ -2310,6 +2224,92 @@ export default function App() {
     return [];
   });
   userQuizAttemptsRef.current = userQuizAttempts;
+
+  const reconciledDepositIdsRef = useRef<Set<string>>(new Set());
+
+  // Safe one-time reconciliation for an existing approved (SUCCESS) deposit whose wallet credit was never recorded before this fix
+  useEffect(() => {
+    if (!isUserAuthenticated || !userProfile?.email || isDemoSeedUser(userProfile)) return;
+    if (withdrawalTxInFlightRef.current > 0) return;
+    if ((Number(userProfile.walletBalance) || 0) !== 0) return;
+    if ((Number(userProfile.quizzesPlayed) || 0) !== 0) return;
+    if ((Number(userProfile.totalWonAmount) || 0) !== 0) return;
+    if ((userQuizAttempts || []).length > 0) return;
+
+    const cleanEmail = userProfile.email.trim().toLowerCase();
+    const targetUid = (userProfile.uid || currentUser?.uid || '').trim();
+
+    const userWithdrawals = (withdrawals || []).filter((w) => {
+      if (!w) return false;
+      const wEmail = (w.userEmail || w.email || '').trim().toLowerCase();
+      const wUid = (w.ownerUid || w.userId || '').trim();
+      return (cleanEmail && wEmail === cleanEmail) || (targetUid && wUid === targetUid);
+    });
+    if (userWithdrawals.length > 0) return;
+
+    const uncreditedApproved = (deposits || []).find((d) => {
+      if (!d || !d.id || d.status !== 'approved') return false;
+      if (d.walletCredited === true || Boolean(d.creditedAt) || Number(d.walletCreditedAmount || 0) > 0) return false;
+      if ((Number(d.amount) || 0) <= 0) return false;
+      if (reconciledDepositIdsRef.current.has(d.id)) return false;
+      const dEmail = (d.userEmail || d.email || '').trim().toLowerCase();
+      const dUid = (d.ownerUid || d.userId || '').trim();
+      return (cleanEmail && dEmail === cleanEmail) || (targetUid && dUid === targetUid);
+    });
+
+    if (!uncreditedApproved) return;
+    reconciledDepositIdsRef.current.add(uncreditedApproved.id);
+
+    reconcileUncreditedApprovedDeposit(uncreditedApproved.id, {
+      ownerUid: targetUid,
+      userEmail: cleanEmail,
+      firestoreDocId: uncreditedApproved.firestoreDocId
+    })
+      .then((res) => {
+        if (res.success && res.credited && res.newWalletBalance !== undefined) {
+          const syncedIso = new Date().toISOString();
+          setDeposits((prev) =>
+            prev.map((item) =>
+              item && item.id === uncreditedApproved.id
+                ? {
+                    ...item,
+                    walletCredited: true,
+                    walletCreditedAmount: Number(res.creditedAmount ?? item.amount),
+                    creditedAt: syncedIso,
+                    updatedAt: syncedIso
+                  }
+                : item
+            )
+          );
+          setUserProfile((prev) => {
+            const prevEmail = (prev.email || '').trim().toLowerCase();
+            if (prevEmail !== cleanEmail) return prev;
+            const updated: UserProfile = {
+              ...prev,
+              walletBalance: res.newWalletBalance!,
+              lastCreditedDepositId: uncreditedApproved.id,
+              updatedAt: syncedIso
+            };
+            try {
+              localStorage.setItem('quizkart_user_profile', JSON.stringify(updated));
+            } catch {}
+            return updated;
+          });
+        }
+      })
+      .catch(() => {});
+  }, [
+    isUserAuthenticated,
+    userProfile?.email,
+    userProfile?.uid,
+    userProfile?.walletBalance,
+    userProfile?.quizzesPlayed,
+    userProfile?.totalWonAmount,
+    currentUser?.uid,
+    deposits,
+    withdrawals,
+    userQuizAttempts
+  ]);
 
   // Subscribe to real-time user quiz attempts from Firestore permanently
   useEffect(() => {
