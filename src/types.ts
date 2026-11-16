@@ -104,6 +104,7 @@ export interface UserProfile {
   updatedAt?: string;
   deletedAt?: string;
   deletedTimestampMs?: number;
+  lastCreditedDepositId?: string;
   quizActivity?: QuizAttemptResult[];
 }
 
@@ -306,6 +307,10 @@ export interface DepositRequest {
   createdAt?: string;
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   updatedAt?: string;
+  walletCredited?: boolean;
+  walletCreditedAmount?: number;
+  creditedAt?: string;
+  firestoreDocId?: string;
 }
 
 export interface WithdrawalRequest {

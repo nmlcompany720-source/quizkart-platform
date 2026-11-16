@@ -2110,10 +2110,17 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
       date: deposit.date || new Date().toISOString().split('T')[0],
       createdAt: deposit.createdAt || new Date().toISOString(),
       status: deposit.status || 'pending',
+      ...(deposit.walletCredited !== undefined ? { walletCredited: deposit.walletCredited } : (deposit.status === 'pending' ? { walletCredited: false } : {})),
       updatedAt: new Date().toISOString()
     }, { merge: true });
 
-    if (auth.currentUser && !isFirestoreQuotaExceeded()) {
+    const authEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+    const matchesCurrentAuthOwner = Boolean(
+      auth.currentUser &&
+      !isFirestoreQuotaExceeded() &&
+      ((cleanEmail && authEmail === cleanEmail) || resolvedOwnerUid === auth.currentUser.uid)
+    );
+    if (matchesCurrentAuthOwner && auth.currentUser) {
       await setDoc(doc(db, 'users', auth.currentUser.uid), {
         pendingDepositId: deposit.status === 'pending' ? deposit.id : null,
         pendingDepositStatus: deposit.status,
@@ -2128,20 +2135,16 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
 
 export async function updateDepositStatusInFirestore(depositId: string, status: 'pending' | 'approved' | 'rejected' | 'cancelled'): Promise<void> {
   if (!depositId || isFirestoreQuotaExceeded()) return;
+  if (status === 'approved' || status === 'rejected' || status === 'cancelled') {
+    const res = await processDepositApprovalTransaction(depositId, status);
+    if (res.success) return;
+  }
   const path = `deposits/${depositId}`;
   try {
     await setDoc(doc(db, 'deposits', depositId), {
       status,
       updatedAt: new Date().toISOString()
     }, { merge: true });
-
-    if (auth.currentUser && !isFirestoreQuotaExceeded()) {
-      await setDoc(doc(db, 'users', auth.currentUser.uid), {
-        pendingDepositId: status === 'pending' ? depositId : null,
-        pendingDepositStatus: status,
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
-    }
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
     handleFirestoreError(error, OperationType.UPDATE, path);
@@ -2166,6 +2169,7 @@ export async function fetchDepositsFromFirestore(ownerUid?: string, userEmail?: 
           ...data,
           id: data.id || docItem.id,
           requestId: data.requestId || data.id || docItem.id,
+          firestoreDocId: docItem.id,
           status: (data.status as any) || 'pending'
         } as DepositRequest;
 
@@ -2214,6 +2218,7 @@ export function subscribeToDepositsFromFirestore(
             ...data,
             id: data.id || docItem.id,
             requestId: data.requestId || data.id || docItem.id,
+            firestoreDocId: docItem.id,
             status: (data.status as any) || 'pending'
           } as DepositRequest;
 
@@ -2506,6 +2511,653 @@ async function fetchUserDocViaRest(docId: string): Promise<{ docId: string; upda
   } catch {
     return null;
   }
+}
+
+export interface DepositTransactionResult {
+  success: boolean;
+  alreadyCredited?: boolean;
+  alreadyResolved?: boolean;
+  resolvedStatus?: DepositRequest['status'];
+  credited?: boolean;
+  creditedAmount?: number;
+  newWalletBalance?: number;
+  ownerEmail?: string;
+  ownerUid?: string;
+  reconciled?: boolean;
+  error?: string;
+}
+
+export interface DepositTransactionFallbackInfo {
+  ownerUid?: string;
+  userEmail?: string;
+  amount?: number;
+  firestoreDocId?: string;
+  reconcileUncreditedApproved?: boolean;
+}
+
+function resolveCandidateUserDocIdsForDeposit(
+  targetEmail: string,
+  targetUid: string,
+  authMatchUid: string
+): { safeEmailDocId: string; candidateIds: string[] } {
+  const safeEmailDocId = targetEmail ? targetEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+  const candidateIds = Array.from(
+    new Set(
+      [safeEmailDocId, targetUid, authMatchUid]
+        .map((s) => (s || '').trim())
+        .filter((s) => Boolean(s) && !s.startsWith('QK-USR-'))
+    )
+  );
+  return { safeEmailDocId, candidateIds };
+}
+
+async function fetchDepositDocViaRest(docId: string): Promise<{ docId: string; updateTime?: string; data: Record<string, any> } | null> {
+  if (typeof fetch === 'undefined' || !docId) return null;
+  try {
+    const res = await fetch(`${getFirestoreRestBase()}/deposits/${encodeURIComponent(docId)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return decodeFirestoreRestDoc(json);
+  } catch {
+    return null;
+  }
+}
+
+async function findDepositByIdViaRest(depositId: string): Promise<{ docId: string; updateTime?: string; data: Record<string, any> } | null> {
+  if (typeof fetch === 'undefined' || !depositId) return null;
+  const direct = await fetchDepositDocViaRest(depositId);
+  if (direct) return direct;
+
+  try {
+    const res = await fetch(`${getFirestoreRestBase()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'deposits' }],
+          where: {
+            compositeFilter: {
+              op: 'OR',
+              filters: [
+                { fieldFilter: { field: { fieldPath: 'id' }, op: 'EQUAL', value: { stringValue: depositId } } },
+                { fieldFilter: { field: { fieldPath: 'requestId' }, op: 'EQUAL', value: { stringValue: depositId } } }
+              ]
+            }
+          },
+          limit: 1
+        }
+      })
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row?.document) {
+          return decodeFirestoreRestDoc(row.document);
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function processDepositStatusViaRestFallback(
+  depositId: string,
+  nextStatus: 'approved' | 'rejected' | 'cancelled',
+  fallbackInfo?: DepositTransactionFallbackInfo
+): Promise<DepositTransactionResult> {
+  if (typeof fetch === 'undefined') {
+    return { success: false, error: 'Network unavailable for Firestore REST sync.' };
+  }
+
+  try {
+    const lookupIds = Array.from(new Set([fallbackInfo?.firestoreDocId, depositId].filter(Boolean) as string[]));
+    let foundDoc: { docId: string; updateTime?: string; data: Record<string, any> } | null = null;
+    for (const candidate of lookupIds) {
+      foundDoc = await findDepositByIdViaRest(candidate);
+      if (foundDoc) break;
+    }
+
+    if (!foundDoc) {
+      return { success: false, error: `Deposit ${depositId} not found in Firestore.` };
+    }
+
+    const dData = foundDoc.data as DepositRequest;
+    const currentStatus = String(dData?.status || 'pending').toLowerCase() as DepositRequest['status'];
+    const alreadyCreditedFlag = Boolean(
+      dData?.walletCredited === true ||
+      dData?.creditedAt ||
+      Number(dData?.walletCreditedAmount || 0) > 0
+    );
+
+    const targetEmail = String(dData?.userEmail || dData?.email || fallbackInfo?.userEmail || '').trim().toLowerCase();
+    const targetUid = String(dData?.ownerUid || dData?.userId || fallbackInfo?.ownerUid || '').trim();
+    const { safeEmailDocId, candidateIds } = resolveCandidateUserDocIdsForDeposit(targetEmail, targetUid, '');
+
+    if (nextStatus === 'approved') {
+      if (currentStatus === 'approved' && alreadyCreditedFlag) {
+        return {
+          success: true,
+          alreadyCredited: true,
+          alreadyResolved: true,
+          resolvedStatus: 'approved',
+          credited: false,
+          ownerEmail: targetEmail,
+          ownerUid: targetUid
+        };
+      }
+      if (currentStatus === 'rejected' || currentStatus === 'cancelled') {
+        return {
+          success: true,
+          alreadyResolved: true,
+          resolvedStatus: currentStatus,
+          credited: false,
+          ownerEmail: targetEmail,
+          ownerUid: targetUid
+        };
+      }
+      if (currentStatus === 'approved' && !fallbackInfo?.reconcileUncreditedApproved) {
+        return {
+          success: true,
+          alreadyResolved: true,
+          resolvedStatus: 'approved',
+          credited: false,
+          ownerEmail: targetEmail,
+          ownerUid: targetUid
+        };
+      }
+
+      const approvedAmount = Number(dData?.amount ?? 0);
+      if (!Number.isFinite(approvedAmount) || approvedAmount <= 0) {
+        return { success: false, error: `Invalid deposit amount for ${depositId}.` };
+      }
+
+      const userDocs = (await Promise.all(candidateIds.map((id) => fetchUserDocViaRest(id)))).filter(
+        (d): d is { docId: string; updateTime?: string; data: Record<string, any> } => Boolean(d)
+      );
+
+      let freshestUserData: Record<string, any> | null = null;
+      let freshestUpdatedMs = -1;
+      userDocs.forEach((ud) => {
+        const rawMs = new Date(ud.data?.updatedAt || 0).getTime();
+        const ms = Number.isFinite(rawMs) ? rawMs : 0;
+        if (!freshestUserData || ms >= freshestUpdatedMs) {
+          freshestUserData = ud.data;
+          freshestUpdatedMs = ms;
+        }
+      });
+
+      const currentBal = Math.max(0, Number(freshestUserData?.walletBalance) || 0);
+      const isReconcile = currentStatus === 'approved' && Boolean(fallbackInfo?.reconcileUncreditedApproved);
+      if (isReconcile) {
+        const played = Number(freshestUserData?.quizzesPlayed) || 0;
+        const won = Number(freshestUserData?.totalWonAmount) || 0;
+        if (currentBal > 0 || played > 0 || won > 0) {
+          return {
+            success: true,
+            alreadyCredited: true,
+            alreadyResolved: true,
+            resolvedStatus: 'approved',
+            credited: false,
+            newWalletBalance: currentBal,
+            ownerEmail: targetEmail,
+            ownerUid: targetUid
+          };
+        }
+      }
+
+      const newWalletBalance = Math.max(0, currentBal + approvedAmount);
+      const nowIso = new Date().toISOString();
+      const canonicalDepId = dData?.id || foundDoc.docId || depositId;
+      const writes: any[] = [
+        {
+          update: {
+            name: getFirestoreRestDocPath('deposits', foundDoc.docId),
+            fields: encodeFirestoreRestFields({
+              status: 'approved',
+              walletCredited: true,
+              walletCreditedAmount: approvedAmount,
+              creditedAt: nowIso,
+              updatedAt: nowIso
+            })
+          },
+          updateMask: { fieldPaths: ['status', 'walletCredited', 'walletCreditedAmount', 'creditedAt', 'updatedAt'] },
+          ...(foundDoc.updateTime ? { currentDocument: { updateTime: foundDoc.updateTime } } : {})
+        }
+      ];
+
+      if (userDocs.length > 0) {
+        userDocs.forEach((ud) => {
+          writes.push({
+            update: {
+              name: getFirestoreRestDocPath('users', ud.docId),
+              fields: encodeFirestoreRestFields({
+                walletBalance: newWalletBalance,
+                lastCreditedDepositId: canonicalDepId,
+                pendingDepositId: null,
+                pendingDepositStatus: 'approved',
+                updatedAt: nowIso
+              })
+            },
+            updateMask: { fieldPaths: ['walletBalance', 'lastCreditedDepositId', 'pendingDepositId', 'pendingDepositStatus', 'updatedAt'] },
+            ...(ud.updateTime ? { currentDocument: { updateTime: ud.updateTime } } : {})
+          });
+        });
+      } else if (safeEmailDocId) {
+        writes.push({
+          update: {
+            name: getFirestoreRestDocPath('users', safeEmailDocId),
+            fields: encodeFirestoreRestFields({
+              email: targetEmail,
+              name: dData?.userName || 'Player',
+              mobile: dData?.phone || '',
+              walletBalance: newWalletBalance,
+              lastCreditedDepositId: canonicalDepId,
+              pendingDepositId: null,
+              pendingDepositStatus: 'approved',
+              updatedAt: nowIso
+            })
+          },
+          updateMask: { fieldPaths: ['email', 'name', 'mobile', 'walletBalance', 'lastCreditedDepositId', 'pendingDepositId', 'pendingDepositStatus', 'updatedAt'] }
+        });
+      }
+
+      const commitRes = await fetch(`${getFirestoreRestBase()}:commit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ writes })
+      });
+      if (!commitRes.ok) {
+        const errText = await commitRes.text().catch(() => '');
+        return { success: false, error: `Firestore deposit approval commit failed (${commitRes.status}): ${errText}` };
+      }
+
+      return {
+        success: true,
+        alreadyCredited: false,
+        alreadyResolved: false,
+        resolvedStatus: 'approved',
+        credited: true,
+        creditedAmount: approvedAmount,
+        newWalletBalance,
+        ownerEmail: targetEmail,
+        ownerUid: targetUid,
+        reconciled: isReconcile
+      };
+    }
+
+    // Rejected or Cancelled
+    if (currentStatus === 'approved' && alreadyCreditedFlag) {
+      return {
+        success: true,
+        alreadyResolved: true,
+        alreadyCredited: true,
+        resolvedStatus: 'approved',
+        credited: false,
+        ownerEmail: targetEmail,
+        ownerUid: targetUid
+      };
+    }
+    if (currentStatus && currentStatus !== 'pending') {
+      return {
+        success: true,
+        alreadyResolved: true,
+        resolvedStatus: currentStatus,
+        credited: false,
+        ownerEmail: targetEmail,
+        ownerUid: targetUid
+      };
+    }
+
+    const userDocs = (await Promise.all(candidateIds.map((id) => fetchUserDocViaRest(id)))).filter(
+      (d): d is { docId: string; updateTime?: string; data: Record<string, any> } => Boolean(d)
+    );
+    const nowIso = new Date().toISOString();
+    const writes: any[] = [
+      {
+        update: {
+          name: getFirestoreRestDocPath('deposits', foundDoc.docId),
+          fields: encodeFirestoreRestFields({
+            status: nextStatus,
+            updatedAt: nowIso
+          })
+        },
+        updateMask: { fieldPaths: ['status', 'updatedAt'] },
+        ...(foundDoc.updateTime ? { currentDocument: { updateTime: foundDoc.updateTime } } : {})
+      }
+    ];
+    userDocs.forEach((ud) => {
+      writes.push({
+        update: {
+          name: getFirestoreRestDocPath('users', ud.docId),
+          fields: encodeFirestoreRestFields({
+            pendingDepositId: null,
+            pendingDepositStatus: nextStatus,
+            updatedAt: nowIso
+          })
+        },
+        updateMask: { fieldPaths: ['pendingDepositId', 'pendingDepositStatus', 'updatedAt'] },
+        ...(ud.updateTime ? { currentDocument: { updateTime: ud.updateTime } } : {})
+      });
+    });
+
+    const commitRes = await fetch(`${getFirestoreRestBase()}:commit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ writes })
+    });
+    if (!commitRes.ok) {
+      const errText = await commitRes.text().catch(() => '');
+      return { success: false, error: `Firestore deposit ${nextStatus} commit failed (${commitRes.status}): ${errText}` };
+    }
+
+    return {
+      success: true,
+      alreadyResolved: false,
+      resolvedStatus: nextStatus,
+      credited: false,
+      ownerEmail: targetEmail,
+      ownerUid: targetUid
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Firestore deposit REST fallback failed.' };
+  }
+}
+
+export async function processDepositApprovalTransaction(
+  depositId: string,
+  nextStatus: 'approved' | 'rejected' | 'cancelled',
+  fallbackInfo?: DepositTransactionFallbackInfo
+): Promise<DepositTransactionResult> {
+  if (!depositId) {
+    return { success: false, error: 'Invalid deposit ID.' };
+  }
+  if (isFirestoreQuotaExceeded()) {
+    return { success: false, error: 'Firestore quota exceeded. Please try again later.' };
+  }
+
+  let targetDocId = (fallbackInfo?.firestoreDocId || depositId).trim();
+
+  try {
+    const directSnap = await getDoc(doc(db, 'deposits', targetDocId)).catch(() => null);
+    if (!directSnap || !directSnap.exists()) {
+      const altMatch = await findDepositByIdViaRest(depositId);
+      if (altMatch?.docId) {
+        targetDocId = altMatch.docId;
+      } else {
+        const byIdSnap = await getDocs(query(collection(db, 'deposits'), where('id', '==', depositId))).catch(() => null);
+        if (byIdSnap && !byIdSnap.empty) {
+          targetDocId = byIdSnap.docs[0].id;
+        } else {
+          const byReqSnap = await getDocs(query(collection(db, 'deposits'), where('requestId', '==', depositId))).catch(() => null);
+          if (byReqSnap && !byReqSnap.empty) {
+            targetDocId = byReqSnap.docs[0].id;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  const dRef = doc(db, 'deposits', targetDocId);
+
+  try {
+    const txRes = await runTransaction(db, async (tx): Promise<DepositTransactionResult> => {
+      const dSnap = await tx.get(dRef);
+      if (!dSnap.exists()) {
+        return {
+          success: false,
+          error: `Deposit ${depositId} not found in Firestore.`
+        };
+      }
+
+      const dData = dSnap.data() as DepositRequest;
+      const currentStatus = String(dData?.status || 'pending').toLowerCase() as DepositRequest['status'];
+      const alreadyCreditedFlag = Boolean(
+        dData?.walletCredited === true ||
+        dData?.creditedAt ||
+        Number(dData?.walletCreditedAmount || 0) > 0
+      );
+
+      const targetEmail = (dData?.userEmail || dData?.email || fallbackInfo?.userEmail || '').trim().toLowerCase();
+      const targetUid = (dData?.ownerUid || dData?.userId || fallbackInfo?.ownerUid || '').trim();
+      const authMatchUid = (auth.currentUser?.email || '').trim().toLowerCase() === targetEmail && auth.currentUser?.uid
+        ? auth.currentUser.uid
+        : '';
+
+      const { safeEmailDocId, candidateIds } = resolveCandidateUserDocIdsForDeposit(
+        targetEmail,
+        targetUid,
+        authMatchUid
+      );
+      const candidateRefs = candidateIds.map((docId) => doc(db, 'users', docId));
+      const userSnaps = await Promise.all(candidateRefs.map((ref) => tx.get(ref).catch(() => null)));
+
+      let freshestData: any = null;
+      let freshestUpdatedMs = -1;
+      const existingRefs: typeof candidateRefs = [];
+      userSnaps.forEach((snap, idx) => {
+        if (snap && snap.exists()) {
+          existingRefs.push(candidateRefs[idx]);
+          const u = snap.data();
+          const rawMs = new Date(u?.updatedAt || 0).getTime();
+          const ms = Number.isFinite(rawMs) ? rawMs : 0;
+          if (!freshestData || ms >= freshestUpdatedMs) {
+            freshestData = u;
+            freshestUpdatedMs = ms;
+          }
+        }
+      });
+
+      const currentBal = Math.max(0, Number(freshestData?.walletBalance) || 0);
+      const nowIso = new Date().toISOString();
+
+      if (nextStatus === 'approved') {
+        if (currentStatus === 'approved' && alreadyCreditedFlag) {
+          return {
+            success: true,
+            alreadyCredited: true,
+            alreadyResolved: true,
+            resolvedStatus: 'approved',
+            credited: false,
+            newWalletBalance: currentBal,
+            ownerEmail: targetEmail,
+            ownerUid: targetUid
+          };
+        }
+
+        if (currentStatus === 'rejected' || currentStatus === 'cancelled') {
+          return {
+            success: true,
+            alreadyResolved: true,
+            resolvedStatus: currentStatus,
+            credited: false,
+            newWalletBalance: currentBal,
+            ownerEmail: targetEmail,
+            ownerUid: targetUid
+          };
+        }
+
+        const isReconcile = currentStatus === 'approved' && !alreadyCreditedFlag;
+        if (isReconcile && !fallbackInfo?.reconcileUncreditedApproved) {
+          return {
+            success: true,
+            alreadyResolved: true,
+            resolvedStatus: 'approved',
+            credited: false,
+            newWalletBalance: currentBal,
+            ownerEmail: targetEmail,
+            ownerUid: targetUid
+          };
+        }
+
+        if (isReconcile) {
+          const played = Number(freshestData?.quizzesPlayed) || 0;
+          const won = Number(freshestData?.totalWonAmount) || 0;
+          if (currentBal > 0 || played > 0 || won > 0) {
+            return {
+              success: true,
+              alreadyCredited: true,
+              alreadyResolved: true,
+              resolvedStatus: 'approved',
+              credited: false,
+              newWalletBalance: currentBal,
+              ownerEmail: targetEmail,
+              ownerUid: targetUid
+            };
+          }
+        }
+
+        const approvedAmount = Number(dData?.amount ?? 0);
+        if (!Number.isFinite(approvedAmount) || approvedAmount <= 0) {
+          return {
+            success: false,
+            error: `Invalid deposit amount for ${depositId}.`
+          };
+        }
+
+        const newWalletBalance = Math.max(0, currentBal + approvedAmount);
+        const canonicalDepId = dData?.id || targetDocId || depositId;
+
+        tx.set(
+          dRef,
+          {
+            status: 'approved',
+            walletCredited: true,
+            walletCreditedAmount: approvedAmount,
+            creditedAt: nowIso,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+
+        const targetUserRefs = existingRefs.length > 0
+          ? existingRefs
+          : (safeEmailDocId ? [doc(db, 'users', safeEmailDocId)] : []);
+
+        targetUserRefs.forEach((uRef) => {
+          tx.set(
+            uRef,
+            {
+              ...(existingRefs.length === 0 && targetEmail
+                ? {
+                    email: targetEmail,
+                    name: dData?.userName || 'Player',
+                    mobile: dData?.phone || '',
+                    isRegistered: true
+                  }
+                : {}),
+              walletBalance: newWalletBalance,
+              lastCreditedDepositId: canonicalDepId,
+              pendingDepositId: null,
+              pendingDepositStatus: 'approved',
+              updatedAt: nowIso
+            },
+            { merge: true }
+          );
+        });
+
+        return {
+          success: true,
+          alreadyCredited: false,
+          alreadyResolved: false,
+          resolvedStatus: 'approved',
+          credited: true,
+          creditedAmount: approvedAmount,
+          newWalletBalance,
+          ownerEmail: targetEmail,
+          ownerUid: targetUid,
+          reconciled: isReconcile
+        };
+      }
+
+      // Rejected or Cancelled
+      if (currentStatus === 'approved' && alreadyCreditedFlag) {
+        return {
+          success: true,
+          alreadyResolved: true,
+          alreadyCredited: true,
+          resolvedStatus: 'approved',
+          credited: false,
+          newWalletBalance: currentBal,
+          ownerEmail: targetEmail,
+          ownerUid: targetUid
+        };
+      }
+
+      if (currentStatus && currentStatus !== 'pending') {
+        return {
+          success: true,
+          alreadyResolved: true,
+          resolvedStatus: currentStatus,
+          credited: false,
+          newWalletBalance: currentBal,
+          ownerEmail: targetEmail,
+          ownerUid: targetUid
+        };
+      }
+
+      tx.set(
+        dRef,
+        {
+          status: nextStatus,
+          updatedAt: nowIso
+        },
+        { merge: true }
+      );
+
+      existingRefs.forEach((uRef) => {
+        tx.set(
+          uRef,
+          {
+            pendingDepositId: null,
+            pendingDepositStatus: nextStatus,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+      });
+
+      return {
+        success: true,
+        alreadyResolved: false,
+        resolvedStatus: nextStatus,
+        credited: false,
+        ownerEmail: targetEmail,
+        ownerUid: targetUid
+      };
+    });
+
+    return txRes;
+  } catch (error: any) {
+    if (handlePossibleQuotaError(error)) {
+      return { success: false, error: 'Firestore quota exceeded.' };
+    }
+    const errMsg = error?.message || String(error || '');
+    const isPermDenied =
+      error?.code === 'permission-denied' ||
+      errMsg.includes('permission-denied') ||
+      errMsg.includes('insufficient permissions');
+
+    if (isPermDenied) {
+      return await processDepositStatusViaRestFallback(depositId, nextStatus, {
+        ...fallbackInfo,
+        firestoreDocId: targetDocId
+      });
+    }
+
+    console.warn('processDepositApprovalTransaction notice:', error);
+    return { success: false, error: errMsg || 'Failed to update deposit status in Firestore.' };
+  }
+}
+
+export async function reconcileUncreditedApprovedDeposit(
+  depositId: string,
+  fallbackInfo?: Omit<DepositTransactionFallbackInfo, 'reconcileUncreditedApproved'>
+): Promise<DepositTransactionResult> {
+  return processDepositApprovalTransaction(depositId, 'approved', {
+    ...fallbackInfo,
+    reconcileUncreditedApproved: true
+  });
 }
 
 async function processWithdrawalStatusViaRestFallback(

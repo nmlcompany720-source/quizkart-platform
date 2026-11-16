@@ -114,6 +114,7 @@ import {
   signInAdminWithGoogle,
   verifyAdminSessionAndLoadUsers,
   updateDepositStatusInFirestore, 
+  processDepositApprovalTransaction,
   syncUserProfile, 
   updateUserBlockStatusInFirestore,
   subscribeToAllUsersFromFirestore,
@@ -2124,115 +2125,70 @@ RULES:
     safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(newDeposits));
   };
 
-  const handleCancelDeposit = (id: string) => {
-    const dep = (deposits || []).find(d => d && d.id === id);
-    if (!dep) return;
-    if (dep.status === 'cancelled') {
-      showToast(`Deposit #${id} is already cancelled.`, 'info');
-      return;
-    }
-    const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'cancelled' as const } : d);
-    saveDeposits(updated);
+  const processingDepositIdsRef = useRef<Set<string>>(new Set());
 
-    const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
-
-    // Update status in user permanent audit log (never deleted)
-    try {
-      const permDeposits = localStorage.getItem('quizkart_user_deposits_permanent');
-      const list: DepositRequest[] = permDeposits ? JSON.parse(permDeposits) : [];
-      let found = false;
-      const updatedPerm = list.map((item: any) => {
-        if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
-          found = true;
-          return { ...item, status: 'cancelled' };
-        }
-        return item;
-      });
-      if (!found && dep) {
-        updatedPerm.unshift({ ...dep, status: 'cancelled' });
-      }
-      localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
-
-      if (targetEmail) {
-        const uKey = `quizkart_user_deposits_permanent_${targetEmail}`;
-        const uRaw = localStorage.getItem(uKey);
-        const uList = uRaw ? JSON.parse(uRaw) : [];
-        let uFound = false;
-        const uUpdated = uList.map((item: any) => {
-          if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
-            uFound = true;
-            return { ...item, status: 'cancelled' };
+  const syncUserDepositPermanentLogs = (
+    targetEmail: string,
+    id: string,
+    normTargetId: string,
+    dep: DepositRequest,
+    patch: Partial<DepositRequest>
+  ) => {
+    const syncPermLog = (storageKey: string) => {
+      try {
+        const permDeposits = localStorage.getItem(storageKey);
+        const list: DepositRequest[] = permDeposits ? JSON.parse(permDeposits) : [];
+        let found = false;
+        const updatedPerm = (Array.isArray(list) ? list : []).map((item: any) => {
+          if (item && (item.id === id || item.id === dep.id || formatDepositId(item.id) === normTargetId)) {
+            found = true;
+            return { ...item, ...patch };
           }
           return item;
         });
-        if (!uFound) {
-          uUpdated.unshift({ ...dep, status: 'cancelled' });
+        if (!found && dep) {
+          updatedPerm.unshift({ ...dep, ...patch });
         }
-        localStorage.setItem(uKey, JSON.stringify(uUpdated));
-      }
-    } catch {}
-
-    try {
-      localStorage.removeItem('quizkart_active_pending_deposit_id');
-    } catch {}
-
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id, status: 'cancelled' } }));
-    }
-
-    updateDepositStatusInFirestore(id, 'cancelled').catch(() => {});
-    soundFx.playWrong();
-    showToast(`Deposit #${id} marked as Cancelled.`, 'info');
+        localStorage.setItem(storageKey, JSON.stringify(updatedPerm));
+      } catch {}
+    };
+    syncPermLog('quizkart_user_deposits_permanent');
+    if (targetEmail) syncPermLog(`quizkart_user_deposits_permanent_${targetEmail}`);
   };
 
-  const handleDeleteDeposit = (id: string) => {
-    handleCancelDeposit(id);
-  };
+  const syncLocalWalletCacheAfterDepositCredit = (
+    targetEmail: string,
+    nextBalance: number | undefined,
+    creditDelta: number,
+    lastCreditedDepositId: string
+  ) => {
+    if (!targetEmail) return;
+    const syncedIso = new Date().toISOString();
 
-  const handleBulkDeleteDeposits = () => {
-    if (selectedDepositIds.length === 0) return;
-    const count = selectedDepositIds.length;
-    const toCancelSet = new Set(selectedDepositIds);
-    const updated = (deposits || []).map(d => d && toCancelSet.has(d.id) ? { ...d, status: 'cancelled' as const } : d);
-    saveDeposits(updated);
+    setRegisteredUsersList((prevUsers) =>
+      prevUsers.map((u) => {
+        if (u && (u.email || '').trim().toLowerCase() === targetEmail) {
+          const resolvedBal = nextBalance !== undefined ? nextBalance : (Number(u.walletBalance) || 0) + creditDelta;
+          return {
+            ...u,
+            walletBalance: resolvedBal,
+            lastCreditedDepositId,
+            updatedAt: syncedIso
+          };
+        }
+        return u;
+      })
+    );
 
-    selectedDepositIds.forEach(id => {
-      updateDepositStatusInFirestore(id, 'cancelled').catch(() => {});
-    });
-
-    try {
-      localStorage.removeItem('quizkart_active_pending_deposit_id');
-    } catch {}
-
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { status: 'cancelled' } }));
-    }
-
-    setSelectedDepositIds([]);
-    soundFx.playClick();
-    showToast(`Marked ${count} deposit record${count > 1 ? 's' : ''} as Cancelled.`);
-  };
-
-  const handleApproveDeposit = (id: string) => {
-    const dep = (deposits || []).find(d => d && d.id === id);
-    if (!dep) return;
-    if (dep.status === 'approved') {
-      showToast(`Deposit #${id} is already approved.`, 'info');
-      return;
-    }
-    const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'approved' as const } : d);
-    saveDeposits(updated);
-
-    // AUTOMATIC BALANCE CREDIT: When Admin clicks "Approve", automatically credit the submitted deposit amount strictly to the matching user's wallet balance by Email
-    const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
     try {
       const rawUsers = localStorage.getItem('quizkart_registered_users');
-      if (rawUsers && targetEmail) {
+      if (rawUsers) {
         const parsedUsers: UserProfile[] = JSON.parse(rawUsers);
         if (Array.isArray(parsedUsers)) {
           const updatedUsers = parsedUsers.map((u) => {
             if (u && (u.email || '').trim().toLowerCase() === targetEmail) {
-              return { ...u, walletBalance: (Number(u.walletBalance) || 0) + Number(dep.amount) };
+              const resolvedBal = nextBalance !== undefined ? nextBalance : (Number(u.walletBalance) || 0) + creditDelta;
+              return { ...u, walletBalance: resolvedBal, lastCreditedDepositId, updatedAt: syncedIso };
             }
             return u;
           });
@@ -2248,129 +2204,283 @@ RULES:
     } catch {}
 
     const activeProfileEmail = (targetProfile?.email || '').trim().toLowerCase();
-    if (targetProfile && onUpdateProfile && targetEmail && activeProfileEmail === targetEmail) {
-      const newBalance = (targetProfile.walletBalance || 0) + Number(dep.amount);
+    if (targetProfile && onUpdateProfile && activeProfileEmail === targetEmail) {
+      const resolvedBal = nextBalance !== undefined ? nextBalance : (Number(targetProfile.walletBalance) || 0) + creditDelta;
       const updatedProfile: UserProfile = {
         ...targetProfile,
-        walletBalance: newBalance
+        walletBalance: resolvedBal,
+        lastCreditedDepositId,
+        updatedAt: syncedIso
       };
       onUpdateProfile(updatedProfile);
       try {
         localStorage.setItem('quizkart_user_profile', JSON.stringify(updatedProfile));
       } catch {}
-      syncUserProfile(updatedProfile).catch(() => {});
     }
-
-    // Update status in user permanent audit log (never deleted)
-    try {
-      const permDeposits = localStorage.getItem('quizkart_user_deposits_permanent');
-      const list: DepositRequest[] = permDeposits ? JSON.parse(permDeposits) : [];
-      let found = false;
-      const updatedPerm = list.map((item: any) => {
-        if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
-          found = true;
-          return { ...item, status: 'approved' };
-        }
-        return item;
-      });
-      if (!found && dep) {
-        updatedPerm.unshift({ ...dep, status: 'approved' });
-      }
-      localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
-
-      if (targetEmail) {
-        const uKey = `quizkart_user_deposits_permanent_${targetEmail}`;
-        const uRaw = localStorage.getItem(uKey);
-        const uList = uRaw ? JSON.parse(uRaw) : [];
-        let uFound = false;
-        const uUpdated = uList.map((item: any) => {
-          if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
-            uFound = true;
-            return { ...item, status: 'approved' };
-          }
-          return item;
-        });
-        if (!uFound) {
-          uUpdated.unshift({ ...dep, status: 'approved' });
-        }
-        localStorage.setItem(uKey, JSON.stringify(uUpdated));
-      }
-    } catch {}
-
-    // Clear active pending deposit lock
-    try {
-      localStorage.removeItem('quizkart_active_pending_deposit_id');
-    } catch {}
-
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id, status: 'approved' } }));
-    }
-
-    updateDepositStatusInFirestore(id, 'approved').catch(() => {});
-
-    soundFx.playSuccess();
-    showToast(`Deposit #${id} approved! ₹${dep.amount} credited to ${dep.userName}'s wallet.`);
   };
 
-  const handleRejectDeposit = (id: string) => {
-    const dep = (deposits || []).find(d => d && d.id === id);
+  const handleCancelDeposit = async (id: string) => {
+    const normTargetId = formatDepositId(id);
+    const lockKey = id || normTargetId;
+    if (processingDepositIdsRef.current.has(lockKey) || processingDepositIdsRef.current.has(normTargetId)) return;
+
+    const dep = (deposits || []).find(d => d && (d.id === id || formatDepositId(d.id) === normTargetId));
     if (!dep) return;
-    if (dep.status === 'rejected') {
-      showToast(`Deposit #${id} is already rejected.`, 'info');
+    if (dep.status !== 'pending') {
+      showToast(`Deposit #${normTargetId} is already ${dep.status}.`, 'info');
       return;
     }
-    const updated = (deposits || []).map(d => d && d.id === id ? { ...d, status: 'rejected' as const } : d);
-    saveDeposits(updated);
 
+    processingDepositIdsRef.current.add(lockKey);
+    processingDepositIdsRef.current.add(normTargetId);
+    const nowIso = new Date().toISOString();
     const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
 
-    // Update status in user permanent audit log
-    try {
-      const permDeposits = localStorage.getItem('quizkart_user_deposits_permanent');
-      const list: DepositRequest[] = permDeposits ? JSON.parse(permDeposits) : [];
-      let found = false;
-      const updatedPerm = list.map((item: any) => {
-        if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
-          found = true;
-          return { ...item, status: 'rejected' };
-        }
-        return item;
-      });
-      if (!found && dep) {
-        updatedPerm.unshift({ ...dep, status: 'rejected' });
-      }
-      localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(updatedPerm));
+    const updated = (deposits || []).map(d =>
+      d && (d.id === id || d.id === dep.id) ? { ...d, status: 'cancelled' as const, updatedAt: nowIso } : d
+    );
+    saveDeposits(updated);
 
-      if (targetEmail) {
-        const uKey = `quizkart_user_deposits_permanent_${targetEmail}`;
-        const uRaw = localStorage.getItem(uKey);
-        const uList = uRaw ? JSON.parse(uRaw) : [];
-        let uFound = false;
-        const uUpdated = uList.map((item: any) => {
-          if (item && (item.id === id || formatDepositId(item.id) === formatDepositId(id))) {
-            uFound = true;
-            return { ...item, status: 'rejected' };
-          }
-          return item;
-        });
-        if (!uFound) {
-          uUpdated.unshift({ ...dep, status: 'rejected' });
-        }
-        localStorage.setItem(uKey, JSON.stringify(uUpdated));
+    try {
+      const txRes = await processDepositApprovalTransaction(dep.id || id, 'cancelled', {
+        ownerUid: dep.ownerUid || dep.userId,
+        userEmail: targetEmail,
+        firestoreDocId: dep.firestoreDocId
+      });
+
+      if (!txRes.success) {
+        const reverted = (deposits || []).map(d =>
+          d && (d.id === id || d.id === dep.id) ? { ...d, status: dep.status } : d
+        );
+        saveDeposits(reverted);
+        soundFx.playWrong();
+        showToast(txRes.error || `Failed to cancel deposit #${normTargetId} in Firestore.`, 'info');
+        return;
       }
-    } catch {}
+
+      const finalStatus = (txRes.resolvedStatus || 'cancelled') as DepositRequest['status'];
+      const confirmed = (deposits || []).map(d =>
+        d && (d.id === id || d.id === dep.id) ? { ...d, status: finalStatus, updatedAt: nowIso } : d
+      );
+      saveDeposits(confirmed);
+      syncUserDepositPermanentLogs(targetEmail, id, normTargetId, dep, { status: finalStatus, updatedAt: nowIso });
+
+      try {
+        localStorage.removeItem('quizkart_active_pending_deposit_id');
+      } catch {}
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+      }
+
+      soundFx.playWrong();
+      showToast(`Deposit #${normTargetId} marked as ${finalStatus === 'cancelled' ? 'Cancelled' : finalStatus}.`, 'info');
+    } finally {
+      processingDepositIdsRef.current.delete(lockKey);
+      processingDepositIdsRef.current.delete(normTargetId);
+    }
+  };
+
+  const handleDeleteDeposit = (id: string) => {
+    handleCancelDeposit(id);
+  };
+
+  const handleBulkDeleteDeposits = () => {
+    if (selectedDepositIds.length === 0) return;
+    const count = selectedDepositIds.length;
+    const toCancelSet = new Set(selectedDepositIds);
+    const updated = (deposits || []).map(d => d && toCancelSet.has(d.id) && d.status === 'pending' ? { ...d, status: 'cancelled' as const } : d);
+    saveDeposits(updated);
+
+    selectedDepositIds.forEach(id => {
+      const dep = (deposits || []).find(d => d && d.id === id);
+      if (dep && dep.status === 'pending') {
+        processDepositApprovalTransaction(dep.id || id, 'cancelled', {
+          ownerUid: dep.ownerUid || dep.userId,
+          userEmail: (dep.userEmail || dep.email || '').trim().toLowerCase(),
+          firestoreDocId: dep.firestoreDocId
+        }).catch(() => {});
+      }
+    });
 
     try {
       localStorage.removeItem('quizkart_active_pending_deposit_id');
     } catch {}
 
     if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id, status: 'rejected' } }));
+      window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { status: 'cancelled' } }));
     }
 
-    updateDepositStatusInFirestore(id, 'rejected').catch(() => {});
-    soundFx.playWrong();
-    showToast(`Deposit #${id} rejected.`, 'info');
+    setSelectedDepositIds([]);
+    soundFx.playClick();
+    showToast(`Marked ${count} deposit record${count > 1 ? 's' : ''} as Cancelled.`);
+  };
+
+  const handleApproveDeposit = async (id: string) => {
+    const normTargetId = formatDepositId(id);
+    const lockKey = id || normTargetId;
+    if (processingDepositIdsRef.current.has(lockKey) || processingDepositIdsRef.current.has(normTargetId)) return;
+
+    const dep = (deposits || []).find(d => d && (d.id === id || formatDepositId(d.id) === normTargetId));
+    if (!dep) return;
+
+    if (dep.status === 'approved') {
+      showToast(`Deposit #${normTargetId} is already approved.`, 'info');
+      return;
+    }
+    if (dep.status === 'rejected' || dep.status === 'cancelled') {
+      soundFx.playWrong();
+      showToast(`Deposit #${normTargetId} is already ${dep.status}.`, 'info');
+      return;
+    }
+
+    processingDepositIdsRef.current.add(lockKey);
+    processingDepositIdsRef.current.add(normTargetId);
+    const nowIso = new Date().toISOString();
+    const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
+
+    // Optimistic UI status update ONLY; wallet credit caches update strictly after Firestore confirms
+    const updated = (deposits || []).map(d =>
+      d && (d.id === id || d.id === dep.id) ? { ...d, status: 'approved' as const, updatedAt: nowIso } : d
+    );
+    saveDeposits(updated);
+
+    try {
+      const txRes = await processDepositApprovalTransaction(dep.id || id, 'approved', {
+        ownerUid: dep.ownerUid || dep.userId,
+        userEmail: targetEmail,
+        amount: Number(dep.amount) || 0,
+        firestoreDocId: dep.firestoreDocId
+      });
+
+      if (!txRes.success) {
+        // Revert optimistic UI status cleanly if Firestore transaction failed
+        const reverted = (deposits || []).map(d =>
+          d && (d.id === id || d.id === dep.id) ? { ...d, status: dep.status } : d
+        );
+        saveDeposits(reverted);
+        soundFx.playWrong();
+        showToast(txRes.error || `Failed to approve deposit #${normTargetId} in Firestore. Please retry.`, 'info');
+        return;
+      }
+
+      const finalStatus = (txRes.resolvedStatus || 'approved') as DepositRequest['status'];
+      const creditedAmt = Number(txRes.creditedAmount ?? dep.amount ?? 0);
+      const resolvedEmail = (txRes.ownerEmail || targetEmail || '').trim().toLowerCase();
+      const patch: Partial<DepositRequest> = {
+        status: finalStatus,
+        ...(finalStatus === 'approved'
+          ? {
+              walletCredited: true,
+              walletCreditedAmount: Number(dep.walletCreditedAmount ?? creditedAmt),
+              creditedAt: dep.creditedAt || nowIso
+            }
+          : {}),
+        updatedAt: nowIso
+      };
+
+      const confirmedList = (deposits || []).map(d =>
+        d && (d.id === id || d.id === dep.id) ? { ...d, ...patch } : d
+      );
+      saveDeposits(confirmedList);
+      syncUserDepositPermanentLogs(resolvedEmail, id, normTargetId, dep, patch);
+
+      if (txRes.alreadyCredited || txRes.alreadyResolved) {
+        if (txRes.newWalletBalance !== undefined && resolvedEmail) {
+          syncLocalWalletCacheAfterDepositCredit(resolvedEmail, txRes.newWalletBalance, 0, dep.id || normTargetId);
+        }
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+        }
+        soundFx.playWrong();
+        showToast(`Deposit #${normTargetId} was already ${finalStatus} in Firestore.`, 'info');
+        return;
+      }
+
+      if (txRes.credited && resolvedEmail) {
+        syncLocalWalletCacheAfterDepositCredit(resolvedEmail, txRes.newWalletBalance, creditedAmt, dep.id || normTargetId);
+      }
+
+      try {
+        const activePending = localStorage.getItem('quizkart_active_pending_deposit_id');
+        if (activePending && (activePending === id || activePending === dep.id || formatDepositId(activePending) === normTargetId)) {
+          localStorage.removeItem('quizkart_active_pending_deposit_id');
+        }
+      } catch {}
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+      }
+
+      soundFx.playSuccess();
+      showToast(`Deposit #${normTargetId} approved! ₹${creditedAmt} credited to ${dep.userName}'s wallet.`);
+    } finally {
+      processingDepositIdsRef.current.delete(lockKey);
+      processingDepositIdsRef.current.delete(normTargetId);
+    }
+  };
+
+  const handleRejectDeposit = async (id: string) => {
+    const normTargetId = formatDepositId(id);
+    const lockKey = id || normTargetId;
+    if (processingDepositIdsRef.current.has(lockKey) || processingDepositIdsRef.current.has(normTargetId)) return;
+
+    const dep = (deposits || []).find(d => d && (d.id === id || formatDepositId(d.id) === normTargetId));
+    if (!dep) return;
+    if (dep.status !== 'pending') {
+      soundFx.playWrong();
+      showToast(`Deposit #${normTargetId} is already ${dep.status}.`, 'info');
+      return;
+    }
+
+    processingDepositIdsRef.current.add(lockKey);
+    processingDepositIdsRef.current.add(normTargetId);
+    const nowIso = new Date().toISOString();
+    const targetEmail = (dep.userEmail || dep.email || '').trim().toLowerCase();
+
+    const updated = (deposits || []).map(d =>
+      d && (d.id === id || d.id === dep.id) ? { ...d, status: 'rejected' as const, updatedAt: nowIso } : d
+    );
+    saveDeposits(updated);
+
+    try {
+      const txRes = await processDepositApprovalTransaction(dep.id || id, 'rejected', {
+        ownerUid: dep.ownerUid || dep.userId,
+        userEmail: targetEmail,
+        firestoreDocId: dep.firestoreDocId
+      });
+
+      if (!txRes.success) {
+        const reverted = (deposits || []).map(d =>
+          d && (d.id === id || d.id === dep.id) ? { ...d, status: dep.status } : d
+        );
+        saveDeposits(reverted);
+        soundFx.playWrong();
+        showToast(txRes.error || `Failed to reject deposit #${normTargetId} in Firestore.`, 'info');
+        return;
+      }
+
+      const finalStatus = (txRes.resolvedStatus || 'rejected') as DepositRequest['status'];
+      const confirmed = (deposits || []).map(d =>
+        d && (d.id === id || d.id === dep.id) ? { ...d, status: finalStatus, updatedAt: nowIso } : d
+      );
+      saveDeposits(confirmed);
+      syncUserDepositPermanentLogs(targetEmail, id, normTargetId, dep, { status: finalStatus, updatedAt: nowIso });
+
+      try {
+        localStorage.removeItem('quizkart_active_pending_deposit_id');
+      } catch {}
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id: normTargetId, status: finalStatus } }));
+      }
+
+      soundFx.playWrong();
+      showToast(`Deposit #${normTargetId} ${finalStatus === 'rejected' ? 'rejected' : finalStatus}.`, 'info');
+    } finally {
+      processingDepositIdsRef.current.delete(lockKey);
+      processingDepositIdsRef.current.delete(normTargetId);
+    }
   };
 
   // -------------------------------------------------------------
