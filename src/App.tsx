@@ -60,13 +60,16 @@ import {
   fetchLeaderboardFromFirestore, 
   recordQuizAttemptInFirestore,
   fetchContestsFromFirestore,
+  fetchContestsFromFirestoreAuthoritative,
+  subscribeToContestsFromFirestore,
   removeContestFromFirestore,
   saveContestToFirestore,
-  fetchDepositsFromFirestore,
+  fetchDepositsWithStatusFromFirestore,
   saveDepositToFirestore,
+  submitDepositTransaction,
   subscribeToDepositsFromFirestore,
   reconcileUncreditedApprovedDeposit,
-  fetchWithdrawalsFromFirestore,
+  fetchWithdrawalsWithStatusFromFirestore,
   saveWithdrawalToFirestore,
   submitWithdrawalTransaction,
   subscribeToWithdrawalsFromFirestore,
@@ -334,7 +337,7 @@ export default function App() {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
           const list = parsed
-            .filter((c: any) => c && c.id && !deletedList.includes(c.id) && c.id !== 'CNT-CASH-LIVE' && c.id !== 'CNT-FALLBACK-PLACEHOLDER' && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202')
+            .filter((c: any) => c && c.id && c.isDeleted !== true && !deletedList.includes(c.id) && c.id !== 'CNT-CASH-LIVE' && c.id !== 'CNT-FALLBACK-PLACEHOLDER' && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202')
             .map(sanitizeContestSynchronous);
           if (list.length > 0) return list;
         }
@@ -342,6 +345,9 @@ export default function App() {
     } catch {}
     return [];
   });
+
+  const deletingContestIdsRef = useRef<Set<string>>(new Set());
+  const recentlySavedContestsRef = useRef<Map<string, number>>(new Map());
 
   // Persistent active contest pointer: only real active contests
   const [activeContestId, setActiveContestId] = useState<string | null>(() => {
@@ -578,10 +584,13 @@ export default function App() {
     }
   }, []);
 
-  // Immediate permanent deletion handler to synchronize front-end and storage
-  const handleDeleteContest = useCallback((contestId: string) => {
+  // Immediate permanent deletion handler to synchronize front-end and Firestore
+  const handleDeleteContest = useCallback(async (contestId: string): Promise<boolean> => {
     // 1. FIRST finalize contest using current valid ranking and settle winner's prize (Req 4)
     settleAndDisburseContest(contestId);
+
+    deletingContestIdsRef.current.add(contestId);
+    recentlySavedContestsRef.current.delete(contestId);
 
     try {
       const deletedList: string[] = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
@@ -590,8 +599,6 @@ export default function App() {
         localStorage.setItem('quizkart_deleted_contests', JSON.stringify(deletedList));
       }
     } catch {}
-
-    removeContestFromFirestore(contestId).catch(err => console.warn('Firestore remove error:', err));
 
     setContests(prev => {
       const filtered = prev.filter(c => c && c.id !== contestId);
@@ -624,9 +631,12 @@ export default function App() {
         if (nextActiveId) {
           localStorage.setItem('quizkart_active_contest_id', nextActiveId);
           localStorage.setItem('quizkart_current_active_contest', JSON.stringify(updatedList.find(c => c.id === nextActiveId)));
-        } else if (activeContestId === contestId) {
+        } else if (activeContestId === contestId || updatedList.length === 0) {
           localStorage.removeItem('quizkart_current_active_contest');
           localStorage.setItem('quizkart_active_contest_id', '');
+          if (updatedList.length === 0) {
+            localStorage.removeItem('quizkart_today_prize');
+          }
         }
       } catch {}
 
@@ -643,10 +653,14 @@ export default function App() {
           localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
           localStorage.setItem('quizkart_real_active_participants', String(mapped.length));
         } catch {}
-      } else if (activeContestId === contestId) {
+      } else if (activeContestId === contestId || updatedList.length === 0) {
         setActiveContestId(null);
         setLeaderboard([]);
         setRealActiveParticipants(0);
+        if (updatedList.length === 0) {
+          setTodayPrize(TODAY_PRIZE);
+          setPoolData(INITIAL_POOL_ECONOMICS);
+        }
         try {
           localStorage.setItem('quizkart_leaderboard', JSON.stringify([]));
           localStorage.setItem('quizkart_real_active_participants', '0');
@@ -655,7 +669,17 @@ export default function App() {
 
       return updatedList;
     });
-  }, [activeContestId]);
+
+    const deletedOk = await removeContestFromFirestore(contestId).catch(err => {
+      console.warn('Firestore remove error:', err);
+      return false;
+    });
+
+    if (deletedOk) {
+      deletingContestIdsRef.current.delete(contestId);
+    }
+    return deletedOk;
+  }, [activeContestId, settleAndDisburseContest]);
 
   // Track strictly real-time participant active joins for Admin visibility
   const [realActiveParticipants, setRealActiveParticipants] = useState<number>(() => {
@@ -706,74 +730,129 @@ export default function App() {
     safeSetLocalStorageJson('quizkart_active_contests', compactContestsForLocalCache(safe));
   }, [contests]);
 
-  // Load contests from Firestore on mount & merge
+  // Authoritative real-time Firestore sync for contests (never resurrects deleted contests from localStorage)
   useEffect(() => {
-    async function loadContestsFromCloud() {
+    const isSyntheticId = (id: string) =>
+      id === 'CNT-CASH-LIVE' ||
+      id === 'CNT-FALLBACK-PLACEHOLDER' ||
+      id === 'CNT-PROD-101' ||
+      id === 'CNT-CASH-202';
+
+    const applyAuthoritativeCloudContests = (cloudContests: ActiveContest[]) => {
+      let deletedList: string[] = [];
       try {
-        const cloudContests = await fetchContestsFromFirestore();
-        if (cloudContests && cloudContests.length > 0) {
-          let deletedList: string[] = [];
-          try {
-            deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
-          } catch {}
-          const validCloud = cloudContests
-            .filter((c: any) => c && c.id && !deletedList.includes(c.id) && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202');
-          if (validCloud.length > 0) {
-            setContests(prev => {
-              const prevMap = new Map<string, ActiveContest>();
-              prev.forEach(p => prevMap.set(p.id, p));
+        deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
+      } catch {}
+      const now = Date.now();
 
-              const map = new Map<string, ActiveContest>();
-              validCloud.forEach(c => {
-                const localExisting = prevMap.get(c.id);
-                // Preserve local uploaded image/GIF if local copy has custom image
-                const preservedCashImage = localExisting?.cashConfig?.cashImageUrl?.startsWith('data:image/')
-                  ? localExisting.cashConfig.cashImageUrl
-                  : c.cashConfig?.cashImageUrl;
-                const preservedProdImage = localExisting?.productConfig?.productImageUrl?.startsWith('data:image/')
-                  ? localExisting.productConfig.productImageUrl
-                  : c.productConfig?.productImageUrl;
+      const validCloud = (cloudContests || []).filter(
+        (c: any) =>
+          c &&
+          c.id &&
+          c.isDeleted !== true &&
+          !isSyntheticId(c.id) &&
+          !deletedList.includes(c.id) &&
+          !deletingContestIdsRef.current.has(c.id)
+      );
 
-                const mergedContest: ActiveContest = {
-                  ...c,
-                  cashConfig: c.cashConfig ? { ...c.cashConfig, cashImageUrl: preservedCashImage } : c.cashConfig,
-                  productConfig: c.productConfig ? { ...c.productConfig, productImageUrl: preservedProdImage } : c.productConfig,
-                };
-                map.set(c.id, mergedContest);
-              });
+      setContests(prev => {
+        const prevMap = new Map<string, ActiveContest>();
+        prev.forEach(p => prevMap.set(p.id, p));
 
-              prev.forEach(c => {
-                if (!map.has(c.id) && !deletedList.includes(c.id)) map.set(c.id, c);
-              });
-              const merged = Array.from(map.values());
-              safeSetLocalStorageJson('quizkart_active_contests', compactContestsForLocalCache(merged));
-              return merged;
-            });
+        const map = new Map<string, ActiveContest>();
+        validCloud.forEach(c => {
+          const localExisting = prevMap.get(c.id);
+          const preservedCashImage = localExisting?.cashConfig?.cashImageUrl?.startsWith('data:image/')
+            ? localExisting.cashConfig.cashImageUrl
+            : c.cashConfig?.cashImageUrl;
+          const preservedProdImage = localExisting?.productConfig?.productImageUrl?.startsWith('data:image/')
+            ? localExisting.productConfig.productImageUrl
+            : c.productConfig?.productImageUrl;
 
-            // Ensure activeContestId is initialized if currently empty
-            setActiveContestId(curr => {
-              if (curr && !deletedList.includes(curr)) {
-                return curr;
-              }
-              const active = validCloud.find((c: any) => c.status === 'active') ||
-                             validCloud.find((c: any) => c.status === 'scheduled') ||
-                             validCloud[0];
-              if (active) {
-                try {
-                  localStorage.setItem('quizkart_active_contest_id', active.id);
-                } catch {}
-                return active.id;
-              }
-              return curr;
-            });
+          const mergedContest: ActiveContest = {
+            ...c,
+            cashConfig: c.cashConfig ? { ...c.cashConfig, cashImageUrl: preservedCashImage } : c.cashConfig,
+            productConfig: c.productConfig ? { ...c.productConfig, productImageUrl: preservedProdImage } : c.productConfig,
+          };
+          map.set(c.id, mergedContest);
+        });
+
+        // Keep ONLY brand-new locally created contests whose Firestore write settled within the last 12 seconds
+        prev.forEach(c => {
+          if (!c || !c.id || map.has(c.id)) return;
+          if (c.isDeleted === true || isSyntheticId(c.id) || deletedList.includes(c.id) || deletingContestIdsRef.current.has(c.id)) return;
+          const savedAt = recentlySavedContestsRef.current.get(c.id);
+          if (savedAt && now - savedAt < 12_000) {
+            map.set(c.id, c);
           }
+        });
+
+        const nextList = Array.from(map.values());
+        safeSetLocalStorageJson('quizkart_active_contests', compactContestsForLocalCache(nextList));
+        return nextList;
+      });
+
+      setActiveContestId(curr => {
+        const currentExistsInCloud = Boolean(curr && validCloud.some(c => c.id === curr));
+        const currentIsFreshLocal = Boolean(
+          curr &&
+          !deletedList.includes(curr) &&
+          !deletingContestIdsRef.current.has(curr) &&
+          (recentlySavedContestsRef.current.get(curr) || 0) > now - 12_000
+        );
+
+        if (currentExistsInCloud || currentIsFreshLocal) {
+          return curr;
+        }
+
+        const nextActive =
+          validCloud.find((c: any) => c.status === 'active') ||
+          validCloud.find((c: any) => c.status === 'scheduled') ||
+          validCloud[0] ||
+          null;
+
+        if (nextActive) {
+          try {
+            localStorage.setItem('quizkart_active_contest_id', nextActive.id);
+          } catch {}
+          return nextActive.id;
+        }
+
+        try {
+          localStorage.removeItem('quizkart_current_active_contest');
+          localStorage.setItem('quizkart_active_contest_id', '');
+        } catch {}
+        return null;
+      });
+    };
+
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetchContestsFromFirestoreAuthoritative();
+        if (active && res.ok) {
+          applyAuthoritativeCloudContests(res.contests);
         }
       } catch (err) {
         console.warn('Firestore contests load error:', err);
       }
-    }
+    })();
 
-    loadContestsFromCloud();
+    const unsubscribe = subscribeToContestsFromFirestore(
+      (liveContests) => {
+        if (active) {
+          applyAuthoritativeCloudContests(liveContests);
+        }
+      },
+      (err) => {
+        console.warn('Firestore contests real-time listener notice:', err);
+      }
+    );
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   // Timed transition handler: automatically transition contest to LIVE when start timer triggers
@@ -962,9 +1041,15 @@ export default function App() {
     return () => clearInterval(interval);
   }, [handleContestExpired]);
 
-  // When activeContest changes, sync todayPrize and poolData in real-time
+  // When activeContest changes, sync todayPrize and poolData in real-time (or reset cleanly when none exists)
   useEffect(() => {
-    if (!activeContest) return;
+    if (!activeContest) {
+      if (contests.length === 0) {
+        setTodayPrize(prev => (prev.id ? TODAY_PRIZE : prev));
+        setPoolData(prev => (prev.totalPoolAmount !== 0 || prev.activeParticipants !== 0 || prev.entryFee !== 0 ? INITIAL_POOL_ECONOMICS : prev));
+      }
+      return;
+    }
 
     if (activeContest.type === 'product' && activeContest.productConfig) {
       setTodayPrize(prev => {
@@ -1621,72 +1706,149 @@ export default function App() {
     };
   }, []);
 
-  // Authoritative real-time Firestore synchronization for deposits (permanent persistence)
+  const processedDepositTxIdsRef = useRef<Set<string>>(new Set());
+
+  // Authoritative real-time Firestore synchronization for deposits (all auth types: Google + Email/Phone + Admin Panel)
   useEffect(() => {
-    // 1. Initial direct fetch from Firestore (loads on boot for all users)
-    fetchDepositsFromFirestore()
-      .then((cloudDeposits) => {
-        if (cloudDeposits && cloudDeposits.length > 0) {
-          setDeposits((prev) => {
-            const map = new Map<string, DepositRequest>();
-            cloudDeposits.forEach((d) => {
-              if (d && d.id) {
-                map.set(d.id, d);
+    const targetUid = currentUser?.uid || userProfile?.uid || '';
+    const targetEmail = (currentUser?.email || userProfile?.email || '').trim().toLowerCase();
+    const isAdmin = targetEmail === AUTHORIZED_ADMIN_EMAIL || isAdminPageActive;
+
+    let hasCloudSnapshot = false;
+
+    const mergeCloudDeposits = (cloudDeposits: DepositRequest[], isAuthoritativeSnapshot = true) => {
+      if (!cloudDeposits) return;
+      if (isAuthoritativeSnapshot) {
+        hasCloudSnapshot = true;
+      }
+      const deletedDeposits = getDeletedDepositIds();
+      setDeposits((prev) => {
+        const map = new Map<string, DepositRequest>();
+        const prevStatusById = new Map<string, string>();
+        const coveredIds = new Set<string>();
+        prev.forEach((p) => {
+          if (p && p.id) {
+            const st = String(p.status || 'pending').trim().toLowerCase();
+            prevStatusById.set(p.id, st);
+            prevStatusById.set(formatDepositId(p.id), st);
+          }
+        });
+
+        let statusChangedDetail: { id: string; status: string } | null = null;
+
+        cloudDeposits.forEach((d) => {
+          if (d && d.id) {
+            const normId = formatDepositId(d.id);
+            const dedupKey = d.firestoreDocId || d.id;
+            const normalizedStatus = String(d.status || 'pending').trim().toLowerCase() as DepositRequest['status'];
+            const isDeletedResolved = normalizedStatus !== 'pending' && (deletedDeposits.includes(d.id) || deletedDeposits.includes(normId) || Boolean((d as any).adminHidden));
+            if (!(isAdmin && isDeletedResolved)) {
+              const prevSt = prevStatusById.get(d.id) || prevStatusById.get(normId);
+              if (prevSt === 'pending' && normalizedStatus !== 'pending') {
+                statusChangedDetail = { id: d.id, status: normalizedStatus };
               }
+              coveredIds.add(d.id);
+              coveredIds.add(normId);
+              map.set(dedupKey, {
+                ...d,
+                id: d.id,
+                status: normalizedStatus,
+                timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
+              });
+            }
+          }
+        });
+
+        prev.forEach((d) => {
+          if (d && d.id) {
+            const normId = formatDepositId(d.id);
+            const dedupKey = d.firestoreDocId || d.id;
+            const prevEmail = (d.userEmail || d.email || '').trim().toLowerCase();
+            // Strict cross-user isolation: non-admin sessions must never retain another user's cached deposits
+            if (!isAdmin && targetEmail && prevEmail && prevEmail !== targetEmail) return;
+            const prevSt = String(d.status || 'pending').trim().toLowerCase() as DepositRequest['status'];
+            const isDeletedResolved = prevSt !== 'pending' && (deletedDeposits.includes(d.id) || deletedDeposits.includes(normId) || Boolean((d as any).adminHidden));
+            const isInFlightSubmit = processedDepositTxIdsRef.current.has(d.id) || processedDepositTxIdsRef.current.has(normId);
+            // Once authoritative Firestore snapshot arrives, prune stale unpersisted/local pending caches
+            if (hasCloudSnapshot && prevSt === 'pending' && !isInFlightSubmit && !coveredIds.has(d.id) && !coveredIds.has(normId)) {
+              return;
+            }
+            if (!(isAdmin && isDeletedResolved) && !map.has(dedupKey) && !coveredIds.has(d.id) && !coveredIds.has(normId)) {
+              coveredIds.add(d.id);
+              coveredIds.add(normId);
+              map.set(dedupKey, {
+                ...d,
+                id: d.id,
+                status: prevSt,
+                timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
+              });
+            }
+          }
+        });
+
+        const merged = Array.from(map.values()).sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+          const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+          return timeB - timeA;
+        });
+
+        safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
+        try {
+          if (targetEmail && !isAdmin) {
+            const emailKey = `quizkart_user_deposits_permanent_${targetEmail}`;
+            const userScoped = merged.filter((item) => {
+              const e = (item.userEmail || item.email || '').trim().toLowerCase();
+              return e === targetEmail || (targetUid && (item.ownerUid === targetUid || item.userId === targetUid));
             });
-            prev.forEach((d) => {
-              if (d && d.id && !map.has(d.id)) {
-                map.set(d.id, d);
-              }
-            });
-            const merged = Array.from(map.values()).sort((a, b) => {
-              const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
-              const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
-              return timeB - timeA;
-            });
-            safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
-            return merged;
-          });
+            if (userScoped.length > 0 || hasCloudSnapshot) {
+              localStorage.setItem(emailKey, JSON.stringify(compactDepositsForLocalCache(userScoped)));
+            }
+          }
+          const activePendingId = localStorage.getItem('quizkart_active_pending_deposit_id');
+          if (activePendingId) {
+            const normActive = formatDepositId(activePendingId);
+            const matched = merged.find((item) => item.id === activePendingId || item.requestId === activePendingId || formatDepositId(item.id) === normActive);
+            if ((matched && matched.status !== 'pending') || (hasCloudSnapshot && !matched && !processedDepositTxIdsRef.current.has(activePendingId) && !processedDepositTxIdsRef.current.has(normActive))) {
+              localStorage.removeItem('quizkart_active_pending_deposit_id');
+              window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: { id: matched?.id || activePendingId, status: matched?.status || 'resolved' } }));
+            }
+          }
+          if (statusChangedDetail) {
+            window.dispatchEvent(new CustomEvent('quizkart_deposit_status_changed', { detail: statusChangedDetail }));
+          }
+        } catch {}
+        return merged;
+      });
+    };
+
+    // 1. Initial direct fetch from Firestore (loads for Admin or current signed-in user)
+    fetchDepositsWithStatusFromFirestore(isAdmin ? undefined : targetUid, isAdmin ? undefined : targetEmail)
+      .then((res) => {
+        if (res && res.ok) {
+          mergeCloudDeposits(res.deposits || [], true);
         }
       })
       .catch((err) => console.warn('Firestore initial deposits load notice:', err));
 
     // 2. Real-time subscription to Firestore /deposits collection
-    const unsub = subscribeToDepositsFromFirestore((cloudDeposits) => {
-      if (cloudDeposits) {
-        setDeposits((prev) => {
-          const map = new Map<string, DepositRequest>();
-          cloudDeposits.forEach((d) => {
-            if (d && d.id) {
-              map.set(d.id, d);
-            }
-          });
-          prev.forEach((d) => {
-            if (d && d.id && !map.has(d.id)) {
-              map.set(d.id, d);
-            }
-          });
-          const merged = Array.from(map.values()).sort((a, b) => {
-            const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
-            const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
-            return timeB - timeA;
-          });
-          safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
-          return merged;
-        });
-      }
-    });
+    const unsub = subscribeToDepositsFromFirestore(
+      (cloudDeposits) => {
+        mergeCloudDeposits(cloudDeposits, true);
+      },
+      isAdmin ? undefined : targetUid,
+      isAdmin ? undefined : targetEmail
+    );
 
     return () => {
       unsub();
     };
-  }, []);
+  }, [currentUser?.uid, currentUser?.email, currentUser?.emailVerified, userProfile?.uid, userProfile?.email, isAdminPageActive]);
 
   // Authoritative real-time Firestore synchronization for withdrawals (all auth types: Google + Email/Phone + Admin Panel)
   useEffect(() => {
     const targetUid = currentUser?.uid || userProfile?.uid || '';
     const targetEmail = (currentUser?.email || userProfile?.email || '').trim().toLowerCase();
-    const isAdmin = targetEmail === 'nmlcompany720@gmail.com' || isAdminPageActive;
+    const isAdmin = targetEmail === AUTHORIZED_ADMIN_EMAIL || isAdminPageActive;
 
     let hasCloudSnapshot = false;
 
@@ -1699,10 +1861,12 @@ export default function App() {
       setWithdrawals((prev) => {
         const map = new Map<string, WithdrawalRequest>();
         const prevStatusById = new Map<string, string>();
+        const coveredIds = new Set<string>();
         prev.forEach((p) => {
           if (p && p.id) {
-            prevStatusById.set(p.id, String(p.status || 'pending').toLowerCase());
-            prevStatusById.set(formatWithdrawalId(p.id), String(p.status || 'pending').toLowerCase());
+            const st = String(p.status || 'pending').trim().toLowerCase();
+            prevStatusById.set(p.id, st);
+            prevStatusById.set(formatWithdrawalId(p.id), st);
           }
         });
 
@@ -1711,14 +1875,17 @@ export default function App() {
         cloudWithdrawals.forEach((w) => {
           if (w && w.id) {
             const normId = formatWithdrawalId(w.id);
-            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+            const dedupKey = w.firestoreDocId || w.id;
+            const normalizedStatus = String(w.status || 'pending').trim().toLowerCase() as WithdrawalRequest['status'];
+            const isDeletedResolved = normalizedStatus !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
             if (!(isAdmin && isDeletedResolved)) {
-              const normalizedStatus = String(w.status || 'pending').toLowerCase() as WithdrawalRequest['status'];
               const prevSt = prevStatusById.get(w.id) || prevStatusById.get(normId);
               if (prevSt === 'pending' && normalizedStatus !== 'pending') {
                 statusChangedDetail = { id: w.id, status: normalizedStatus };
               }
-              map.set(w.id, {
+              coveredIds.add(w.id);
+              coveredIds.add(normId);
+              map.set(dedupKey, {
                 ...w,
                 id: w.id,
                 status: normalizedStatus,
@@ -1731,19 +1898,24 @@ export default function App() {
         prev.forEach((w) => {
           if (w && w.id) {
             const normId = formatWithdrawalId(w.id);
+            const dedupKey = w.firestoreDocId || w.id;
             const prevEmail = (w.userEmail || w.email || '').trim().toLowerCase();
             // Strict cross-user isolation: non-admin sessions must never retain another user's cached withdrawals
             if (!isAdmin && targetEmail && prevEmail && prevEmail !== targetEmail) return;
-            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+            const prevSt = String(w.status || 'pending').trim().toLowerCase() as WithdrawalRequest['status'];
+            const isDeletedResolved = prevSt !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
             const isInFlightSubmit = processedWithdrawalTxIdsRef.current.has(w.id) || processedWithdrawalTxIdsRef.current.has(normId);
             // Once authoritative Firestore snapshot arrives, prune stale unpersisted local pending caches
-            if (hasCloudSnapshot && w.status === 'pending' && !isInFlightSubmit && !map.has(w.id) && !map.has(normId)) {
+            if (hasCloudSnapshot && prevSt === 'pending' && !isInFlightSubmit && !coveredIds.has(w.id) && !coveredIds.has(normId)) {
               return;
             }
-            if (!(isAdmin && isDeletedResolved) && !map.has(w.id) && !map.has(normId)) {
-              map.set(w.id, {
+            if (!(isAdmin && isDeletedResolved) && !map.has(dedupKey) && !coveredIds.has(w.id) && !coveredIds.has(normId)) {
+              coveredIds.add(w.id);
+              coveredIds.add(normId);
+              map.set(dedupKey, {
                 ...w,
                 id: w.id,
+                status: prevSt,
                 timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
               });
             }
@@ -1770,8 +1942,9 @@ export default function App() {
           }
           const activePendingId = localStorage.getItem('quizkart_active_pending_withdrawal_id');
           if (activePendingId) {
-            const matched = merged.find((item) => item.id === activePendingId || formatWithdrawalId(item.id) === formatWithdrawalId(activePendingId));
-            if ((matched && matched.status !== 'pending') || (hasCloudSnapshot && !matched && !processedWithdrawalTxIdsRef.current.has(activePendingId))) {
+            const normActive = formatWithdrawalId(activePendingId);
+            const matched = merged.find((item) => item.id === activePendingId || item.requestId === activePendingId || formatWithdrawalId(item.id) === normActive);
+            if ((matched && matched.status !== 'pending') || (hasCloudSnapshot && !matched && !processedWithdrawalTxIdsRef.current.has(activePendingId) && !processedWithdrawalTxIdsRef.current.has(normActive))) {
               localStorage.removeItem('quizkart_active_pending_withdrawal_id');
               window.dispatchEvent(new CustomEvent('quizkart_withdrawal_status_changed', { detail: { id: matched?.id || activePendingId, status: matched?.status || 'resolved' } }));
             }
@@ -1784,17 +1957,17 @@ export default function App() {
       });
     };
 
-    fetchWithdrawalsFromFirestore(isAdmin ? undefined : targetUid, isAdmin ? undefined : targetEmail)
-      .then((cloudWithdrawals) => {
-        if (cloudWithdrawals) {
-          mergeCloudWithdrawals(cloudWithdrawals);
+    fetchWithdrawalsWithStatusFromFirestore(isAdmin ? undefined : targetUid, isAdmin ? undefined : targetEmail)
+      .then((res) => {
+        if (res && res.ok) {
+          mergeCloudWithdrawals(res.withdrawals || [], true);
         }
       })
       .catch((err) => console.warn('Firestore initial withdrawals load notice:', err));
 
     const unsubWithdrawals = subscribeToWithdrawalsFromFirestore(
       (cloudWithdrawals) => {
-        mergeCloudWithdrawals(cloudWithdrawals);
+        mergeCloudWithdrawals(cloudWithdrawals, true);
       },
       isAdmin ? undefined : targetUid,
       isAdmin ? undefined : targetEmail
@@ -1803,7 +1976,7 @@ export default function App() {
     return () => {
       unsubWithdrawals();
     };
-  }, [currentUser?.uid, currentUser?.email, userProfile?.uid, userProfile?.email, isAdminPageActive]);
+  }, [currentUser?.uid, currentUser?.email, currentUser?.emailVerified, userProfile?.uid, userProfile?.email, isAdminPageActive]);
 
   // Boot-time + real-time Firestore profile sync for authenticated email/phone users (ensures Wallet & Total Won stay synchronized on reload and after atomic withdrawal/refund transactions)
   useEffect(() => {
@@ -1899,50 +2072,144 @@ export default function App() {
     } catch {}
   }, [userProfile.email]);
 
-  const handleAddDeposit = useCallback((newDeposit: Partial<DepositRequest> & { amount: number }) => {
+  const userProfileRef = useRef<UserProfile>(userProfile);
+  userProfileRef.current = userProfile;
+
+  const handleAddDeposit = useCallback(async (newDeposit: Partial<DepositRequest> & { amount: number }): Promise<{
+    success: boolean;
+    deposit?: DepositRequest;
+    error?: string;
+  }> => {
+    const currentSnap = userProfileRef.current;
+    const resolvedEmail = (newDeposit.userEmail || newDeposit.email || currentSnap.email || '').trim().toLowerCase();
+    const depId = newDeposit.id ? formatDepositId(newDeposit.id) : getNextDepositId(deposits);
+    const nowIso = new Date().toISOString();
+
+    const fullDeposit: DepositRequest = {
+      ...newDeposit,
+      id: depId,
+      requestId: newDeposit.requestId || depId,
+      ownerUid: newDeposit.ownerUid || currentSnap.uid || currentSnap.id || '',
+      userId: newDeposit.userId || currentSnap.id || currentSnap.uid || '',
+      userName: newDeposit.userName || currentSnap.name,
+      userEmail: resolvedEmail,
+      email: resolvedEmail,
+      phone: newDeposit.phone || currentSnap.mobile,
+      upiId: newDeposit.upiId || currentSnap.upiId || 'Contestant UPI',
+      amount: Number(newDeposit.amount),
+      utrNumber: (newDeposit.utrNumber || '').trim(),
+      screenshotUrl: newDeposit.screenshotUrl,
+      app: (newDeposit.app as any) || 'PhonePe',
+      timestamp: formatDepositTimestamp(newDeposit.timestamp, newDeposit.createdAt, newDeposit.date),
+      date: newDeposit.date || nowIso.split('T')[0],
+      createdAt: newDeposit.createdAt || nowIso,
+      status: 'pending',
+      walletCredited: false
+    };
+
+    processedDepositTxIdsRef.current.add(depId);
+
     setDeposits((prev) => {
-      const resolvedEmail = (newDeposit.userEmail || newDeposit.email || userProfile.email || '').trim();
-      const depId = newDeposit.id ? formatDepositId(newDeposit.id) : getNextDepositId(prev);
-      const fullDeposit: DepositRequest = {
-        ...newDeposit,
-        id: depId,
-        requestId: newDeposit.requestId || depId,
-        ownerUid: newDeposit.ownerUid || userProfile.uid || userProfile.id || '',
-        userId: newDeposit.userId || userProfile.id || userProfile.uid || '',
-        userName: newDeposit.userName || userProfile.name,
-        userEmail: resolvedEmail,
-        email: resolvedEmail,
-        phone: newDeposit.phone || userProfile.mobile,
-        upiId: newDeposit.upiId || userProfile.upiId || 'Contestant UPI',
-        amount: newDeposit.amount,
-        utrNumber: newDeposit.utrNumber || '',
-        screenshotUrl: newDeposit.screenshotUrl,
-        app: (newDeposit.app as any) || 'PhonePe',
-        timestamp: formatDepositTimestamp(newDeposit.timestamp, newDeposit.createdAt, newDeposit.date),
-        date: newDeposit.date || new Date().toISOString().split('T')[0],
-        createdAt: newDeposit.createdAt || new Date().toISOString(),
-        status: newDeposit.status || 'pending'
-      };
-
-      // Ensure persistence in permanent user log (zero-deletion policy)
-      try {
-        const savedPerm = localStorage.getItem('quizkart_user_deposits_permanent');
-        const list = savedPerm ? JSON.parse(savedPerm) : [];
-        if (Array.isArray(list)) {
-          const filtered = list.filter((item: any) => item && item.id !== fullDeposit.id);
-          localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify([fullDeposit, ...filtered]));
-        }
-      } catch {}
-
-      saveDepositToFirestore(fullDeposit).catch(err => console.warn('Firestore deposit sync notice:', err));
-      return [fullDeposit, ...prev];
+      const exists = prev.some((d) => d && (d.id === depId || formatDepositId(d.id) === depId));
+      const nextList = exists
+        ? prev.map((d) => (d && (d.id === depId || formatDepositId(d.id) === depId) ? fullDeposit : d))
+        : [fullDeposit, ...prev];
+      safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(nextList));
+      return nextList;
     });
-  }, [userProfile]);
+
+    try {
+      const savedPerm = localStorage.getItem('quizkart_user_deposits_permanent');
+      const list = savedPerm ? JSON.parse(savedPerm) : [];
+      if (Array.isArray(list)) {
+        const filtered = list.filter((item: any) => item && item.id !== depId);
+        localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(compactDepositsForLocalCache([fullDeposit, ...filtered])));
+      }
+      if (resolvedEmail) {
+        const emailKey = `quizkart_user_deposits_permanent_${resolvedEmail}`;
+        const savedEmailPerm = localStorage.getItem(emailKey);
+        const emailList = savedEmailPerm ? JSON.parse(savedEmailPerm) : [];
+        if (Array.isArray(emailList)) {
+          const filteredEmail = emailList.filter((item: any) => item && item.id !== depId);
+          localStorage.setItem(emailKey, JSON.stringify(compactDepositsForLocalCache([fullDeposit, ...filteredEmail])));
+        }
+      }
+    } catch {}
+
+    try {
+      const txRes = await submitDepositTransaction(fullDeposit, currentSnap);
+      if (!txRes.success) {
+        processedDepositTxIdsRef.current.delete(depId);
+        setDeposits((prev) => {
+          const rolledBack = prev.filter((d) => d && d.id !== depId && formatDepositId(d.id) !== depId);
+          safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(rolledBack));
+          return rolledBack;
+        });
+        try {
+          localStorage.removeItem('quizkart_active_pending_deposit_id');
+          const permList = JSON.parse(localStorage.getItem('quizkart_user_deposits_permanent') || '[]');
+          if (Array.isArray(permList)) {
+            localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(permList.filter((item: any) => item && item.id !== depId)));
+          }
+          if (resolvedEmail) {
+            const emailKey = `quizkart_user_deposits_permanent_${resolvedEmail}`;
+            const emailList = JSON.parse(localStorage.getItem(emailKey) || '[]');
+            if (Array.isArray(emailList)) {
+              localStorage.setItem(emailKey, JSON.stringify(emailList.filter((item: any) => item && item.id !== depId)));
+            }
+          }
+        } catch {}
+        if (txRes.error) {
+          showTunedToast(txRes.error);
+        }
+        return { success: false, error: txRes.error || 'Failed to save deposit request.' };
+      }
+
+      const finalDep: DepositRequest = txRes.deposit
+        ? {
+            ...fullDeposit,
+            ...txRes.deposit,
+            id: txRes.deposit.id || depId,
+            requestId: txRes.deposit.requestId || txRes.deposit.id || depId,
+            timestamp: formatDepositTimestamp(txRes.deposit.timestamp || fullDeposit.timestamp, txRes.deposit.createdAt || fullDeposit.createdAt, txRes.deposit.date || fullDeposit.date)
+          }
+        : fullDeposit;
+
+      processedDepositTxIdsRef.current.add(finalDep.id);
+      if (finalDep.id !== depId) {
+        setDeposits((prev) => {
+          const nextList = [finalDep, ...prev.filter((d) => d && d.id !== depId && d.id !== finalDep.id && formatDepositId(d.id) !== depId)];
+          safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(nextList));
+          return nextList;
+        });
+        try {
+          localStorage.setItem('quizkart_active_pending_deposit_id', finalDep.id);
+          const permList = JSON.parse(localStorage.getItem('quizkart_user_deposits_permanent') || '[]');
+          if (Array.isArray(permList)) {
+            const updatedPerm = [finalDep, ...permList.filter((item: any) => item && item.id !== depId && item.id !== finalDep.id)];
+            localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify(compactDepositsForLocalCache(updatedPerm)));
+          }
+          if (resolvedEmail) {
+            const emailKey = `quizkart_user_deposits_permanent_${resolvedEmail}`;
+            const emailList = JSON.parse(localStorage.getItem(emailKey) || '[]');
+            if (Array.isArray(emailList)) {
+              const updatedEmail = [finalDep, ...emailList.filter((item: any) => item && item.id !== depId && item.id !== finalDep.id)];
+              localStorage.setItem(emailKey, JSON.stringify(compactDepositsForLocalCache(updatedEmail)));
+            }
+          }
+        } catch {}
+      }
+
+      return { success: true, deposit: finalDep };
+    } catch (err: any) {
+      console.warn('Firestore atomic deposit transaction notice:', err);
+      saveDepositToFirestore(fullDeposit).catch(() => {});
+      return { success: true, deposit: fullDeposit };
+    }
+  }, [deposits, showTunedToast]);
 
   const processedWithdrawalTxIdsRef = useRef<Set<string>>(new Set());
   const withdrawalTxInFlightRef = useRef<number>(0);
-  const userProfileRef = useRef<UserProfile>(userProfile);
-  userProfileRef.current = userProfile;
   const userQuizAttemptsRef = useRef<QuizAttemptResult[]>([]);
 
   const handleAddWithdrawal = useCallback((newWithdrawal: Partial<WithdrawalRequest> & { amount: number }) => {
@@ -4013,7 +4280,15 @@ export default function App() {
         activeContest={activeContest}
         onUpdateActiveContest={setActiveContest}
         contests={contests}
-        onUpdateContests={setContests}
+        onUpdateContests={(nextContests) => {
+          const now = Date.now();
+          (nextContests || []).forEach(c => {
+            if (c && c.id && c.isDeleted !== true) {
+              recentlySavedContestsRef.current.set(c.id, now);
+            }
+          });
+          setContests(nextContests);
+        }}
         onDeleteContest={handleDeleteContest}
         announcement={announcement}
         onUpdateAnnouncement={handleUpdateAnnouncement}
@@ -4384,6 +4659,7 @@ export default function App() {
                 localStorage.removeItem('quizkart_active_pending_withdrawal_id');
                 localStorage.setItem('quizkart_current_tab', 'home');
               } catch {}
+              processedDepositTxIdsRef.current.clear();
               processedWithdrawalTxIdsRef.current.clear();
               setUserQuizAttempts([]);
               setIsUserAuthenticated(false);

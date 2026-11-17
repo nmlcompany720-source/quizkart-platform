@@ -40,6 +40,7 @@ import {
   saveActiveContests, 
   getAutoPilotSettings, 
   saveAutoPilotSettings, 
+  AUTOPILOT_MANUAL_OPT_IN_KEY,
   selectSkillBasedQuestions,
   getAnsweredQuestionIds,
   resetAnsweredQuestionIds
@@ -118,7 +119,7 @@ interface ContestManagerTabProps {
   onUpdateActiveContest?: (contest: ActiveContest | null) => void;
   contests?: ActiveContest[];
   onUpdateContests?: (contests: ActiveContest[]) => void;
-  onDeleteContest?: (id: string) => void;
+  onDeleteContest?: (id: string) => void | Promise<boolean | void>;
   realParticipantsCount?: number;
 }
 
@@ -243,12 +244,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
-    const filteredBase = (baseContests || []).filter(c => c && !deletedList.includes(c.id));
-    if (activeContest && !deletedList.includes(activeContest.id) && !filteredBase.some(c => c.id === activeContest.id)) {
-      return [activeContest, ...filteredBase];
-    }
-    return filteredBase;
-  }, [baseContests, activeContest]);
+    return (baseContests || []).filter(
+      c => c && c.id && c.isDeleted !== true && !deletedList.includes(c.id)
+    );
+  }, [baseContests]);
 
   const setContests = (val: ActiveContest[] | ((prev: ActiveContest[]) => ActiveContest[])) => {
     if (typeof val === 'function') {
@@ -335,11 +334,10 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       return c;
     });
 
-    updateContestList(updated);
+    updateContestList(updated, updated.filter(c => c.id === targetId));
 
     const targetContest = updated.find(c => c.id === targetId);
     if (targetContest) {
-      saveContestToFirestore(targetContest).catch(() => {});
       if (targetContest.status === 'active' || targetContest.id === activeContest?.id) {
         onUpdateActiveContest?.(targetContest);
         onUpdatePrize({
@@ -358,16 +356,27 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     onShowToast('Contest image updated in real-time!', 'success');
   };
 
-  // Auto-Pilot ON/OFF Toggle Persistent State directly bound to LocalStorage ('quizkart_autopilot_active')
+  // Auto-Pilot ON/OFF Toggle State (Strictly OFF by default; never auto-creates fake/demo tournaments)
   const [isAutoPilotActive, setIsAutoPilotActive] = useState<boolean>(() => {
     try {
       const saved = localStorage.getItem('quizkart_autopilot_active');
-      if (saved !== null) {
-        return saved === 'true';
+      const manualOptIn = localStorage.getItem(AUTOPILOT_MANUAL_OPT_IN_KEY);
+      if (saved === 'true' && manualOptIn === 'true') {
+        return true;
       }
     } catch {}
-    return getAutoPilotSettings().isEnabled;
+    return false;
   });
+
+  // Clear legacy auto-enabled Auto-Pilot flag from earlier app versions on mount
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(AUTOPILOT_MANUAL_OPT_IN_KEY) !== 'true') {
+        localStorage.setItem('quizkart_autopilot_active', 'false');
+        setIsAutoPilotActive(false);
+      }
+    } catch {}
+  }, []);
 
   // Auto-Pilot Background Generation State
   const [isGeneratingContest, setIsGeneratingContest] = useState<boolean>(false);
@@ -513,23 +522,27 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
   const isRatioHealthy = easyCount >= 3 && mediumCount >= 3 && hardCount >= 3 && expertCount >= 1;
   const answeredIds = getAnsweredQuestionIds();
 
-  // Save contests update helper with immediate state response and non-blocking background Firestore sync
-  const updateContestList = (newList: ActiveContest[]) => {
+  // Save contests update helper: updates React/localStorage state and syncs ONLY explicitly modified contest(s) to Firestore
+  const updateContestList = (newList: ActiveContest[], contestsToSync: ActiveContest[] = []) => {
     let deletedList: string[] = [];
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
-    const filteredList = (newList || []).filter(c => c && c.id && !deletedList.includes(c.id));
+    const filteredList = (newList || []).filter(
+      c => c && c.id && c.isDeleted !== true && !deletedList.includes(c.id)
+    );
     // Keep user's full uploaded images and GIFs permanently in state and storage
     setContests(filteredList);
     saveActiveContests(filteredList);
     if (onUpdateContests) {
       onUpdateContests(filteredList);
     }
-    // Background sync to Firestore without hanging or blocking any UI actions
-    filteredList.forEach(c => {
-      saveContestToFirestore(c).catch(() => {});
-    });
+    // Sync ONLY the created/modified contest(s) to Firestore (never re-upload unrelated or deleted contests)
+    contestsToSync
+      .filter(c => c && c.id && c.isDeleted !== true && !deletedList.includes(c.id))
+      .forEach(c => {
+        saveContestToFirestore(c).catch(() => {});
+      });
   };
 
   // 1. AUTO-PILOT ON/OFF TOGGLE SWITCH LOGIC
@@ -538,9 +551,9 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     const nextState = !isAutoPilotActive;
     setIsAutoPilotActive(nextState);
 
-    // Persistent State: Bind the toggle switch directly to LocalStorage (`quizkart_autopilot_active`)
     try {
       localStorage.setItem('quizkart_autopilot_active', String(nextState));
+      localStorage.setItem(AUTOPILOT_MANUAL_OPT_IN_KEY, String(nextState));
     } catch {}
 
     const updatedSettings: AutoPilotSettings = {
@@ -550,156 +563,18 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     setAutoPilot(updatedSettings);
     saveAutoPilotSettings(updatedSettings);
 
-    // Toast notices matching exact specifications
     if (nextState) {
-      onShowToast("Auto-Pilot Scheduler Activated (Daily Automatic Contests Enabled)", "success");
+      onShowToast("Auto-Pilot Scheduler Activated (Manual tournament creation required — zero demo auto-generation)", "success");
     } else {
       onShowToast("Auto-Pilot Deactivated", "info");
     }
   };
 
-  // 2. CONTEST GENERATION EXECUTION (Manual Instant Play & Auto-Pilot Scheduler)
-  const executeContestGeneration = async (isAutomated = false) => {
-    if (isGeneratingContest) return;
-
-    if (questions.length === 0) {
-      soundFx.playWrong();
-      onShowToast("Question pool is empty! Please add questions to the Question Bank first.", "info");
-      return;
-    }
-
-    setIsGeneratingContest(true);
-    if (!isAutomated) {
-      soundFx.playClick();
-    }
-
-    // 1-Second Loading Animation
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // Immediately pull 10 questions from the active pool following the strict 3-3-3-1 ratio
-    // (3 Easy, 3 Medium, 3 Hard, 1 Expert)
-    const easyPool = (questions || []).filter(q => q && q.difficulty === 'Easy');
-    const mediumPool = (questions || []).filter(q => q && q.difficulty === 'Medium');
-    const hardPool = (questions || []).filter(q => q && q.difficulty === 'Hard');
-    const expertPool = (questions || []).filter(q => q && q.difficulty === 'Expert');
-
-    let pickedEasy = easyPool.slice(0, 3);
-    let pickedMedium = mediumPool.slice(0, 3);
-    let pickedHard = hardPool.slice(0, 3);
-    let pickedExpert = expertPool.slice(0, 1);
-
-    let selectedQuestions = [...pickedEasy, ...pickedMedium, ...pickedHard, ...pickedExpert].filter(q => q && q.id != null);
-    const pickedIds = new Set(selectedQuestions.map(q => q.id));
-
-    // If pool has fewer in certain tiers, supplement from remaining questions in pool to reach up to 10
-    if (selectedQuestions.length < 10 && (questions || []).length > selectedQuestions.length) {
-      const remainingQuestionsInPool = (questions || []).filter(q => q && q.id != null && !pickedIds.has(q.id));
-      const needed = 10 - selectedQuestions.length;
-      selectedQuestions = [...selectedQuestions, ...remainingQuestionsInPool.slice(0, needed)];
-    }
-
-    // If pool has fewer than 10 total questions, use all available questions
-    if (selectedQuestions.length === 0 && (questions || []).length > 0) {
-      selectedQuestions = (questions || []).filter(q => q && q.id != null).slice(0, 10);
-    }
-
-    // Reduce pool question counts dynamically in real-time
-    const selectedIdsSet = new Set(selectedQuestions.map(q => q.id));
-    const remainingQuestions = questions.filter(q => q && q.id != null && !selectedIdsSet.has(q.id));
-
-    onUpdateQuestions?.(remainingQuestions);
-    questionPoolManager.saveAllQuestions(remainingQuestions).catch(() => {});
-
-    // Instant UI Update: Create and push a new active contest into the live contest state / LocalStorage
-    const newContestId = `CNT-LIVE-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-    const isCash = autoPilot.contestType === 'cash';
-    const contestTitle = isCash
-      ? `₹${autoPilot.cashPrizePool.toLocaleString('en-IN')} Tournament Blitz`
-      : `${autoPilot.productItemTitle || todayPrize.title} Tournament Championship`;
-
-    const newContest: ActiveContest = {
-      id: newContestId,
-      type: isCash ? 'cash' : 'product',
-      title: contestTitle,
-      entryFee: autoPilot.entryFee || (isCash ? 50 : 100),
-      productConfig: !isCash ? {
-        itemTitle: autoPilot.productItemTitle || todayPrize.title,
-        brand: todayPrize.brand || 'Noise',
-        marketValue: autoPilot.productMarketValue || 7999,
-        retailValue: Math.round((autoPilot.productMarketValue || 7999) * 0.65),
-        productImageUrl: autoPilot.productImageUrl || todayPrize.imageUrl,
-        ecommerceFulfillmentLink: autoPilot.ecommerceFulfillmentLink || 'https://www.amazon.in/dp/B0C8V73TQR',
-        deliveryPartner: todayPrize.deliveryPartner || 'Amazon',
-        estimatedDeliveryDays: todayPrize.estimatedDeliveryDays || '2 - 3 Days'
-      } : undefined,
-      cashConfig: isCash ? {
-        entryFee: autoPilot.entryFee || 50,
-        prizePool: autoPilot.cashPrizePool || 10000,
-        shareBreakdownType: 'single_winner',
-        winnerShareSummary: `Rank 1 = 100% (₹${(autoPilot.cashPrizePool || 10000).toLocaleString('en-IN')} Instant UPI)`
-      } : undefined,
-      status: 'active',
-      scheduledTime: new Date().toISOString(),
-      endTime: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
-      activatedAt: new Date().toISOString(),
-      autoPilotRecurring: true,
-      questionIds: selectedQuestions.map(q => q.id),
-      createdAt: new Date().toISOString()
-    };
-
-    const updatedContests = [newContest, ...contests];
-    updateContestList(updatedContests);
-
-    // Update today's prize and pool data
-    if (!isCash) {
-      onUpdatePrize({
-        ...todayPrize,
-        id: `prize-${Date.now()}`,
-        title: autoPilot.productItemTitle || todayPrize.title,
-        mrp: autoPilot.productMarketValue || todayPrize.mrp,
-        retailValue: Math.round((autoPilot.productMarketValue || todayPrize.mrp) * 0.65),
-        imageUrl: autoPilot.productImageUrl || todayPrize.imageUrl
-      });
-    }
-
-    onUpdatePoolData({
-      ...poolData,
-      entryFee: autoPilot.entryFee || poolData.entryFee,
-      totalPoolAmount: (autoPilot.entryFee || poolData.entryFee) * 100,
-      activeParticipants: Math.floor(65 + Math.random() * 20),
-      targetParticipants: 100
-    });
-
+  // Background automatic tournament creation is permanently disabled to prevent fake/demo tournaments.
+  const executeContestGeneration = async (_isAutomated = false) => {
     setIsGeneratingContest(false);
-    soundFx.playSuccess();
-
-    // Trigger success notification popup
-    onShowToast("New Tournament Contest Successfully Created & Published!", "success");
+    onShowToast("Automatic demo tournament generation is disabled. Use 'New Tournament' to publish a real contest.", "info");
   };
-
-  // Execution: When active (ON), register a background timer interval/cron logic
-  useEffect(() => {
-    if (!isAutoPilotActive) return;
-
-    // Periodic check interval (every 30 seconds)
-    const intervalTimer = setInterval(() => {
-      const activeState = localStorage.getItem('quizkart_autopilot_active');
-      if (activeState !== 'true') return;
-
-      const lastAutomatedDate = localStorage.getItem('quizkart_autopilot_last_run_date');
-      const todayDateKey = new Date().toDateString();
-
-      // Check pool condition: Pool must have at least 10 questions to satisfy 3-3-3-1 ratio
-      if (questions.length >= 10 && lastAutomatedDate !== todayDateKey) {
-        try {
-          localStorage.setItem('quizkart_autopilot_last_run_date', todayDateKey);
-        } catch {}
-        executeContestGeneration(true);
-      }
-    }, 30000);
-
-    return () => clearInterval(intervalTimer);
-  }, [isAutoPilotActive, questions, autoPilot, contests]);
 
 
 
@@ -805,7 +680,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       scheduledTime: cashStartTime,
       endTime: effectiveEndTime,
       activatedAt: willBeActive ? new Date().toISOString() : undefined,
-      autoPilotRecurring: true,
+      autoPilotRecurring: false,
       questionIds: (questions || []).filter(q => q && q.id != null).slice(0, 10).map(q => q.id),
       realJoins: 0,
       totalRevenue: 0,
@@ -814,16 +689,19 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
 
     if (willBeActive) {
       // Single-live: new contest is active, previous active becomes completed
+      const completedPrevious: ActiveContest[] = [];
       const updatedContests = [
         newContest,
         ...contests.map(c => {
           if (c.status === 'active') {
-            return { ...c, status: 'completed' as const };
+            const done = { ...c, status: 'completed' as const };
+            completedPrevious.push(done);
+            return done;
           }
           return c;
         })
       ];
-      updateContestList(updatedContests);
+      updateContestList(updatedContests, [newContest, ...completedPrevious]);
 
       onUpdateActiveContest?.(newContest);
       try {
@@ -862,7 +740,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     } else {
       // Automatically queued to UPCOMING without disturbing active contest
       const updatedContests = [newContest, ...contests];
-      updateContestList(updatedContests);
+      updateContestList(updatedContests, [newContest]);
 
       soundFx.playSuccess();
       onShowToast(`🕒 Cash Tournament "${newContest.title}" queued as UPCOMING.`, 'success');
@@ -939,7 +817,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       scheduledTime: prodStartTime,
       endTime: effectiveEndTime,
       activatedAt: willBeActive ? new Date().toISOString() : undefined,
-      autoPilotRecurring: true,
+      autoPilotRecurring: false,
       questionIds: (questions || []).filter(q => q && q.id != null).slice(0, 10).map(q => q.id),
       realJoins: 0,
       totalRevenue: 0,
@@ -947,16 +825,19 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     };
 
     if (willBeActive) {
+      const completedPrevious: ActiveContest[] = [];
       const updatedContests = [
         newContest,
         ...contests.map(c => {
           if (c.status === 'active') {
-            return { ...c, status: 'completed' as const };
+            const done = { ...c, status: 'completed' as const };
+            completedPrevious.push(done);
+            return done;
           }
           return c;
         })
       ];
-      updateContestList(updatedContests);
+      updateContestList(updatedContests, [newContest, ...completedPrevious]);
 
       onUpdateActiveContest?.(newContest);
       try {
@@ -994,7 +875,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       onShowToast(`🎁 Product Tournament "${newContest.title}" published & set as ACTIVE!`, 'success');
     } else {
       const updatedContests = [newContest, ...contests];
-      updateContestList(updatedContests);
+      updateContestList(updatedContests, [newContest]);
 
       soundFx.playSuccess();
       onShowToast(`🕒 Product Tournament "${newContest.title}" queued as UPCOMING.`, 'success');
@@ -1174,7 +1055,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
     }
 
     const nextContests = contests.map(c => c.id === updated.id ? updated : c);
-    updateContestList(nextContests);
+    updateContestList(nextContests, [updated]);
 
     // If active, sync to activeContest and todayPrize
     if (activeContest?.id === updated.id) {
@@ -1286,6 +1167,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       localStorage.setItem(`quizkart_contest_activated_${contest.id}`, String(Date.now()));
     } catch {}
 
+    const modifiedIds = new Set<string>([contest.id]);
     const updated = (contests || []).filter(c => c && c.id).map(c => {
       if (c.id === contest.id) {
         return { ...c, status: 'active' as const, activatedAt: nowIso };
@@ -1293,11 +1175,12 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       // NO AUTO-UPCOMING: When activating a contest, previous active contest becomes completed.
       // Already scheduled or completed contests strictly retain their status.
       if (c.status === 'active') {
+        modifiedIds.add(c.id);
         return { ...c, status: 'completed' as const };
       }
       return c;
     });
-    updateContestList(updated);
+    updateContestList(updated, updated.filter(c => modifiedIds.has(c.id)));
 
     onUpdateActiveContest?.({ ...contest, status: 'active', activatedAt: nowIso });
     try {
@@ -1321,7 +1204,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       }
       return c;
     });
-    updateContestList(updated);
+    updateContestList(updated, updated.filter(c => c.id === contest.id));
 
     // If this contest was active, clear active contest pointer
     if (activeContest?.id === contest.id) {
@@ -1362,7 +1245,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
           if (c.id === nextActive.id) return { ...c, status: 'active' as const, activatedAt: new Date().toISOString() };
           return c;
         });
-        updateContestList(withNext);
+        updateContestList(withNext, withNext.filter(c => c.id === contest.id || c.id === nextActive.id));
         onUpdateActiveContest?.({ ...nextActive, status: 'active' });
         try {
           localStorage.setItem('quizkart_current_active_contest', JSON.stringify({ ...nextActive, status: 'active' }));
@@ -1401,7 +1284,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
         onShowToast(`Contest "${contest.title}" marked as EXPIRED. Next upcoming "${nextActive.title}" is now LIVE!`, 'info');
         return;
       } else {
-        updateContestList(updated);
+        updateContestList(updated, updated.filter(c => c.id === contest.id));
         onUpdateActiveContest?.(null);
         try {
           localStorage.removeItem('quizkart_current_active_contest');
@@ -1409,19 +1292,19 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
         } catch {}
       }
     } else {
-      updateContestList(updated);
+      updateContestList(updated, updated.filter(c => c.id === contest.id));
     }
 
     onShowToast(`⏸️ Contest "${contest.title}" marked as EXPIRED.`, 'info');
   };
 
-  // Delete contest permanently (from Firestore, state, and storage) immediately without hang/freeze
-  const handleDeleteContest = (id: string) => {
+  // Delete contest permanently (from Firestore, state, and storage) and await authoritative Firestore delete
+  const handleDeleteContest = async (id: string) => {
     if (deletingContestId) return;
     setDeletingContestId(id);
     soundFx.playClick();
 
-    // 1. Add to permanent deleted blacklist in localStorage so cloud sync never resurrects it
+    // 1. Add to deleted guard in localStorage so any concurrent snapshot never flickers it back
     try {
       const deletedList: string[] = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
       if (!deletedList.includes(id)) {
@@ -1430,104 +1313,155 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
       }
     } catch {}
 
-    // 2. Immediately purge from local contests and sync to global state (snappy 150ms feedback)
-    setTimeout(() => {
-      const filtered = (contests || []).filter(c => c && c.id !== id);
+    // 2. Immediately purge from local contests and sync to global state
+    const filtered = (contests || []).filter(c => c && c.id !== id);
+    let promotedNext: ActiveContest | null = null;
 
-      if (activeContest?.id === id) {
-        const queuedUpcoming = filtered
-          .filter(c => c.status === 'scheduled')
-          .sort((a, b) => parseTargetTimestamp(a.scheduledTime) - parseTargetTimestamp(b.scheduledTime));
-        const nextActiveRaw = queuedUpcoming[0] || null;
-        if (nextActiveRaw) {
-          const nextActive: ActiveContest = { ...nextActiveRaw, status: 'active', activatedAt: new Date().toISOString() };
-          const updatedList = filtered.map(c => ({
-            ...c,
-            status: c.id === nextActive.id ? ('active' as const) : c.status
-          }));
-          updateContestList(updatedList);
-          onUpdateActiveContest?.(nextActive);
-          try {
-            localStorage.setItem('quizkart_current_active_contest', JSON.stringify(nextActive));
-            localStorage.setItem('quizkart_active_contest_id', nextActive.id);
-          } catch {}
+    if (activeContest?.id === id) {
+      const queuedUpcoming = filtered
+        .filter(c => c.status === 'scheduled')
+        .sort((a, b) => parseTargetTimestamp(a.scheduledTime) - parseTargetTimestamp(b.scheduledTime));
+      const nextActiveRaw = queuedUpcoming[0] || null;
+      if (nextActiveRaw) {
+        const nextActive: ActiveContest = { ...nextActiveRaw, status: 'active', activatedAt: new Date().toISOString() };
+        promotedNext = nextActive;
+        const updatedList = filtered.map(c => ({
+          ...c,
+          status: c.id === nextActive.id ? ('active' as const) : c.status
+        }));
+        updateContestList(updatedList, [nextActive]);
+        onUpdateActiveContest?.(nextActive);
+        try {
+          localStorage.setItem('quizkart_current_active_contest', JSON.stringify(nextActive));
+          localStorage.setItem('quizkart_active_contest_id', nextActive.id);
+        } catch {}
 
-          const targetLimit = nextActive.maxParticipants || poolData.targetParticipants || 50;
-          if (nextActive.type === 'product' && nextActive.productConfig) {
-            onUpdatePrize({
-              ...todayPrize,
-              id: nextActive.id,
-              title: nextActive.productConfig.itemTitle,
-              brand: nextActive.productConfig.brand,
-              mrp: nextActive.productConfig.marketValue,
-              retailValue: nextActive.productConfig.retailValue,
-              imageUrl: nextActive.productConfig.productImageUrl,
-              deliveryPartner: nextActive.productConfig.deliveryPartner,
-              estimatedDeliveryDays: nextActive.productConfig.estimatedDeliveryDays
-            });
-            onUpdatePoolData({
-              ...poolData,
-              entryFee: nextActive.entryFee,
-              productPrizeValue: nextActive.productConfig.retailValue,
-              targetParticipants: targetLimit
-            });
-          } else if (nextActive.type === 'cash' && nextActive.cashConfig) {
-            onUpdatePrize({
-              ...todayPrize,
-              id: nextActive.id,
-              title: nextActive.title,
-              badge: nextActive.badge || 'INSTANT UPI',
-              brand: 'QuizKart Cash',
-              mrp: nextActive.cashConfig.prizePool,
-              retailValue: nextActive.cashConfig.prizePool,
-              category: 'Cash Tournament',
-              imageUrl: nextActive.cashConfig.cashImageUrl || 'https://images.unsplash.com/photo-1579621970563-ebec7560ff3e?w=800&auto=format&fit=crop&q=80',
-              features: [calculatePayoutSummary(nextActive.cashConfig.prizePool, nextActive.cashConfig.shareBreakdownType || 'single_winner')],
-              deliveryPartner: 'Instant UPI',
-              estimatedDeliveryDays: 'Instant'
-            });
-            onUpdatePoolData({
-              ...poolData,
-              entryFee: nextActive.entryFee,
-              totalPoolAmount: nextActive.cashConfig.prizePool,
-              targetParticipants: targetLimit
-            });
-          }
-        } else {
-          updateContestList([]);
-          onUpdateActiveContest?.(null);
-          try {
-            localStorage.removeItem('quizkart_current_active_contest');
-            localStorage.setItem('quizkart_active_contest_id', '');
-          } catch {}
+        const targetLimit = nextActive.maxParticipants || poolData.targetParticipants || 50;
+        if (nextActive.type === 'product' && nextActive.productConfig) {
           onUpdatePrize({
-            id: 'prize-fallback',
-            title: 'NEXT MEGA ROUND COMING SOON',
-            badge: 'UPCOMING',
-            brand: 'QuizKart',
-            mrp: 50000,
-            retailValue: 50000,
+            ...todayPrize,
+            id: nextActive.id,
+            title: nextActive.productConfig.itemTitle,
+            brand: nextActive.productConfig.brand,
+            mrp: nextActive.productConfig.marketValue,
+            retailValue: nextActive.productConfig.retailValue,
+            imageUrl: nextActive.productConfig.productImageUrl,
+            deliveryPartner: nextActive.productConfig.deliveryPartner,
+            estimatedDeliveryDays: nextActive.productConfig.estimatedDeliveryDays
+          });
+          onUpdatePoolData({
+            ...poolData,
+            entryFee: nextActive.entryFee,
+            productPrizeValue: nextActive.productConfig.retailValue,
+            targetParticipants: targetLimit
+          });
+        } else if (nextActive.type === 'cash' && nextActive.cashConfig) {
+          onUpdatePrize({
+            ...todayPrize,
+            id: nextActive.id,
+            title: nextActive.title,
+            badge: nextActive.badge || 'INSTANT UPI',
+            brand: 'QuizKart Cash',
+            mrp: nextActive.cashConfig.prizePool,
+            retailValue: nextActive.cashConfig.prizePool,
             category: 'Cash Tournament',
-            imageUrl: 'https://images.unsplash.com/photo-1579621970563-ebec7560ff3e?w=800&auto=format&fit=crop&q=80',
-            features: ['Stay tuned for the upcoming tournament round'],
+            imageUrl: nextActive.cashConfig.cashImageUrl || 'https://images.unsplash.com/photo-1579621970563-ebec7560ff3e?w=800&auto=format&fit=crop&q=80',
+            features: [calculatePayoutSummary(nextActive.cashConfig.prizePool, nextActive.cashConfig.shareBreakdownType || 'single_winner')],
             deliveryPartner: 'Instant UPI',
             estimatedDeliveryDays: 'Instant'
           });
+          onUpdatePoolData({
+            ...poolData,
+            entryFee: nextActive.entryFee,
+            totalPoolAmount: nextActive.cashConfig.prizePool,
+            targetParticipants: targetLimit
+          });
         }
       } else {
-        updateContestList(filtered);
+        updateContestList(filtered, []);
+        onUpdateActiveContest?.(null);
+        try {
+          localStorage.removeItem('quizkart_current_active_contest');
+          localStorage.setItem('quizkart_active_contest_id', '');
+          if (filtered.length === 0) {
+            localStorage.removeItem('quizkart_today_prize');
+          }
+        } catch {}
+        if (filtered.length === 0) {
+          onUpdatePrize({
+            id: '',
+            title: '',
+            brand: '',
+            mrp: 0,
+            retailValue: 0,
+            category: '',
+            imageUrl: '',
+            features: [],
+            deliveryPartner: '',
+            estimatedDeliveryDays: ''
+          });
+          onUpdatePoolData({
+            ...poolData,
+            entryFee: 0,
+            activeParticipants: 0,
+            targetParticipants: 0,
+            totalPoolAmount: 0,
+            productPrizeValue: 0,
+            runnerUpPoolValue: 0,
+            platformFeeValue: 0
+          });
+        }
       }
+    } else {
+      updateContestList(filtered, []);
+      if (filtered.length === 0) {
+        onUpdateActiveContest?.(null);
+        try {
+          localStorage.removeItem('quizkart_current_active_contest');
+          localStorage.setItem('quizkart_active_contest_id', '');
+          localStorage.removeItem('quizkart_today_prize');
+        } catch {}
+        onUpdatePrize({
+          id: '',
+          title: '',
+          brand: '',
+          mrp: 0,
+          retailValue: 0,
+          category: '',
+          imageUrl: '',
+          features: [],
+          deliveryPartner: '',
+          estimatedDeliveryDays: ''
+        });
+      }
+    }
 
-      onDeleteContest?.(id);
-      setDeletingContestId(null);
+    // 3. Notify App & await authoritative Firestore deletion before releasing spinner
+    let deletedOk = false;
+    try {
+      if (onDeleteContest) {
+        const res = await onDeleteContest(id);
+        deletedOk = res !== false;
+      } else {
+        deletedOk = await removeContestFromFirestore(id);
+      }
+    } catch (err) {
+      console.warn('Error removing contest from Firestore:', err);
+      deletedOk = false;
+    }
+
+    if (promotedNext) {
+      saveContestToFirestore(promotedNext).catch(() => {});
+    }
+
+    setDeletingContestId(null);
+    if (deletedOk) {
       soundFx.playSuccess();
       onShowToast('Tournament permanently deleted.', 'info');
-
-      // 3. Delete permanently from Firestore asynchronously in background (never blocks UI)
-      removeContestFromFirestore(id).catch(err => {
-        console.warn('Error removing contest from Firestore in background:', err);
-      });
-    }, 150);
+    } else {
+      soundFx.playSuccess();
+      onShowToast('Tournament removed locally; cloud deletion retry queued.', 'info');
+    }
   };
 
   const labelGradientStyle: React.CSSProperties = {
@@ -2367,6 +2301,14 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
           </div>
         </div>
 
+        {contests.length === 0 ? (
+          <div className="py-10 px-6 rounded-2xl border border-dashed border-slate-200 bg-slate-50/60 text-center space-y-1.5">
+            <p className="text-sm font-bold text-slate-700">No Active Contests</p>
+            <p className="text-xs text-slate-500">
+              No tournaments exist right now. Use &ldquo;New Tournament&rdquo; above to create and publish a tournament.
+            </p>
+          </div>
+        ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
           {contests.map((c) => {
             const contestImage = c.type === 'product'
@@ -2569,6 +2511,7 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
             );
           })}
         </div>
+        )}
 
         {/* Real-time Inline Contest Editor Modal */}
         {editingContest && (

@@ -11,7 +11,6 @@ import { DepositRequest, UserProfile } from '../types';
 import { soundFx } from '../utils/audio';
 import { compressScreenshot, normalizeImageUrl } from '../utils/imageCompressor';
 import phonepeExactQr from '../assets/images/phonepe_exact_qr.jpg';
-import { saveDepositToFirestore } from '../firebase';
 import { getNextDepositId, getCurrentFormattedTimestamp, getDeletedDepositIds, formatDepositId } from '../utils/depositUtils';
 import { getActiveDepositQr } from '../utils/qrConfig';
 
@@ -19,7 +18,7 @@ interface DepositPageProps {
   userProfile: UserProfile;
   onUpdateProfile: (profile: UserProfile) => void;
   deposits: DepositRequest[];
-  onAddDeposit: (deposit: Omit<DepositRequest, 'id' | 'timestamp' | 'status'> & { id?: string }) => void;
+  onAddDeposit: (deposit: Omit<DepositRequest, 'id' | 'timestamp' | 'status'> & { id?: string }) => Promise<{ success: boolean; deposit?: DepositRequest; error?: string }> | void;
   onBackToDashboard: () => void;
   onBackToProfile: () => void;
   onOpenHistory?: () => void;
@@ -263,10 +262,12 @@ export const DepositPage: React.FC<DepositPageProps> = ({
 
     if (!activeId) return;
 
-    const dep = deposits.find((d) => d && d.id === activeId);
+    const normActiveId = formatDepositId(activeId);
+    const dep = deposits.find((d) => d && (d.id === activeId || d.requestId === activeId || formatDepositId(d.id) === normActiveId));
     if (!dep) return;
 
-    if (dep.status === 'approved') {
+    const depStatus = String(dep.status || 'pending').trim().toLowerCase();
+    if (depStatus === 'approved') {
       try {
         localStorage.removeItem('quizkart_active_pending_deposit_id');
         localStorage.removeItem(DRAFT_STORAGE_KEY);
@@ -275,14 +276,18 @@ export const DepositPage: React.FC<DepositPageProps> = ({
       setSubmittedDepositId(null);
       soundFx.playSuccess();
       onBackToDashboard();
-    } else if (dep.status === 'rejected') {
+    } else if (depStatus === 'rejected' || depStatus === 'cancelled') {
       try {
         localStorage.removeItem('quizkart_active_pending_deposit_id');
         localStorage.removeItem(TIMER_STORAGE_KEY);
       } catch {}
       soundFx.playWrong();
       setSubmittedDepositId(null);
-      setErrorMsg('Your previous deposit request was rejected by admin. You may initiate a new deposit.');
+      setErrorMsg(
+        depStatus === 'cancelled'
+          ? 'Your previous deposit request was cancelled by admin. You may initiate a new deposit.'
+          : 'Your previous deposit request was rejected by admin. You may initiate a new deposit.'
+      );
     }
   }, [deposits, submittedDepositId, onBackToDashboard]);
 
@@ -384,7 +389,7 @@ export const DepositPage: React.FC<DepositPageProps> = ({
     setIsSubmitting(true);
     soundFx.playClick();
 
-    setTimeout(() => {
+    setTimeout(async () => {
       const newId = getNextDepositId(deposits);
       const now = new Date();
 
@@ -410,39 +415,58 @@ export const DepositPage: React.FC<DepositPageProps> = ({
         status: 'pending'
       };
 
-      onAddDeposit(newDepositItem);
-      setSubmittedDepositId(newId);
-
       try {
-        localStorage.setItem('quizkart_active_pending_deposit_id', newId);
-        localStorage.removeItem(DRAFT_STORAGE_KEY);
-
-        // Store into user permanent audit log (never deleted by admin actions)
-        const savedPerm = localStorage.getItem('quizkart_user_deposits_permanent');
-        const list = savedPerm ? JSON.parse(savedPerm) : [];
-        if (Array.isArray(list)) {
-          const filtered = list.filter((item: any) => item && item.id !== newId);
-          localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify([newDepositItem, ...filtered]));
+        const addRes = await onAddDeposit(newDepositItem);
+        if (addRes && addRes.success === false) {
+          setErrorMsg(addRes.error || 'Unable to submit deposit request to server. Please check your connection and try again.');
+          setIsSubmitting(false);
+          soundFx.playWrong();
+          return;
         }
 
-        if (currentUserEmail) {
-          const userKey = `quizkart_user_deposits_permanent_${currentUserEmail}`;
-          const savedUserPerm = localStorage.getItem(userKey);
-          const uList = savedUserPerm ? JSON.parse(savedUserPerm) : [];
-          if (Array.isArray(uList)) {
-            const uFiltered = uList.filter((item: any) => item && item.id !== newId);
-            localStorage.setItem(userKey, JSON.stringify([newDepositItem, ...uFiltered]));
+        const finalDeposit: DepositRequest = addRes?.deposit
+          ? {
+              ...newDepositItem,
+              ...addRes.deposit,
+              id: addRes.deposit.id || newId,
+              requestId: addRes.deposit.requestId || addRes.deposit.id || newId
+            }
+          : newDepositItem;
+        const finalId = finalDeposit.id;
+
+        setSubmittedDepositId(finalId);
+
+        try {
+          localStorage.setItem('quizkart_active_pending_deposit_id', finalId);
+          localStorage.removeItem(DRAFT_STORAGE_KEY);
+
+          // Store into user permanent audit log (never deleted by admin actions)
+          const savedPerm = localStorage.getItem('quizkart_user_deposits_permanent');
+          const list = savedPerm ? JSON.parse(savedPerm) : [];
+          if (Array.isArray(list)) {
+            const filtered = list.filter((item: any) => item && item.id !== finalId && item.id !== newId);
+            localStorage.setItem('quizkart_user_deposits_permanent', JSON.stringify([finalDeposit, ...filtered]));
           }
-        }
-      } catch {}
 
-      saveDepositToFirestore(newDepositItem).catch((err) => {
-        console.warn('Firestore deposit sync notice:', err);
-      });
+          if (currentUserEmail) {
+            const userKey = `quizkart_user_deposits_permanent_${currentUserEmail}`;
+            const savedUserPerm = localStorage.getItem(userKey);
+            const uList = savedUserPerm ? JSON.parse(savedUserPerm) : [];
+            if (Array.isArray(uList)) {
+              const uFiltered = uList.filter((item: any) => item && item.id !== finalId && item.id !== newId);
+              localStorage.setItem(userKey, JSON.stringify([finalDeposit, ...uFiltered]));
+            }
+          }
+        } catch {}
 
-      setIsSubmitting(false);
-      soundFx.playSuccess();
-    }, 1000);
+        setIsSubmitting(false);
+        soundFx.playSuccess();
+      } catch (err: any) {
+        setErrorMsg(err?.message || 'Unable to submit deposit request. Please try again.');
+        setIsSubmitting(false);
+        soundFx.playWrong();
+      }
+    }, 400);
   };
 
   // CONFIRMATION & PENDING APPROVAL SCREEN

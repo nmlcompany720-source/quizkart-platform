@@ -145,20 +145,22 @@ export const selectSkillBasedQuestions = (
   return selectedQuestions.slice(0, 10);
 };
 
+export const AUTOPILOT_MANUAL_OPT_IN_KEY = 'quizkart_autopilot_manual_opt_in';
+
 /**
- * Default Auto-Pilot Settings
+ * Default Auto-Pilot Settings (Strictly disabled by default; zero hardcoded demo products)
  */
 export const DEFAULT_AUTO_PILOT_SETTINGS: AutoPilotSettings = {
-  isEnabled: true,
-  dailyTime: '8:00 PM Daily Blitz',
-  contestType: 'product',
-  entryFee: 100,
-  cashPrizePool: 10000,
-  productItemTitle: 'Noise ColorFit Ultra 3 AMOLED Bluetooth Calling Smartwatch',
-  productMarketValue: 7999,
-  productImageUrl: 'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800&auto=format&fit=crop&q=80',
-  ecommerceFulfillmentLink: 'https://www.amazon.in/dp/B0C8V73TQR',
-  nextRunTimeDisplay: 'Tonight at 8:00 PM IST'
+  isEnabled: false,
+  dailyTime: '',
+  contestType: 'cash',
+  entryFee: 0,
+  cashPrizePool: 0,
+  productItemTitle: '',
+  productMarketValue: 0,
+  productImageUrl: '',
+  ecommerceFulfillmentLink: '',
+  nextRunTimeDisplay: ''
 };
 
 /**
@@ -176,13 +178,16 @@ export const getSavedContests = (): ActiveContest[] => {
         try {
           deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
         } catch {}
-        // Filter out invalid items, deleted items, and legacy dummy items
+        // Filter out invalid items, soft/hard deleted items, and legacy dummy items
         const cleaned = parsed
           .filter((c: any) => 
             c && 
             typeof c === 'object' &&
             c.id &&
+            c.isDeleted !== true &&
             !deletedList.includes(c.id) &&
+            c.id !== 'CNT-CASH-LIVE' &&
+            c.id !== 'CNT-FALLBACK-PLACEHOLDER' &&
             c.id !== 'CNT-PROD-101' && 
             c.id !== 'CNT-CASH-202'
           );
@@ -200,7 +205,7 @@ export const saveActiveContests = (contests: ActiveContest[]): void => {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
     const filtered = (contests || [])
-      .filter(c => c && c.id && !deletedList.includes(c.id));
+      .filter(c => c && c.id && c.isDeleted !== true && !deletedList.includes(c.id));
     localStorage.setItem(ACTIVE_CONTESTS_STORAGE_KEY, JSON.stringify(filtered));
   } catch (err) {
     console.warn('LocalStorage save active contests error:', err);
@@ -208,20 +213,25 @@ export const saveActiveContests = (contests: ActiveContest[]): void => {
 };
 
 export const getAutoPilotSettings = (): AutoPilotSettings => {
-  let settings = DEFAULT_AUTO_PILOT_SETTINGS;
+  let settings: AutoPilotSettings = { ...DEFAULT_AUTO_PILOT_SETTINGS };
   try {
     const saved = localStorage.getItem(AUTO_PILOT_SETTINGS_KEY);
     if (saved) {
-      settings = JSON.parse(saved);
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object') {
+        settings = { ...DEFAULT_AUTO_PILOT_SETTINGS, ...parsed };
+      }
     }
   } catch {}
 
   try {
     const activeStored = localStorage.getItem(AUTOPILOT_ACTIVE_STORAGE_KEY);
-    if (activeStored !== null) {
-      settings.isEnabled = activeStored === 'true';
-    }
-  } catch {}
+    const manualOptIn = localStorage.getItem(AUTOPILOT_MANUAL_OPT_IN_KEY);
+    // Only consider enabled if explicitly opted in by Admin action
+    settings.isEnabled = activeStored === 'true' && manualOptIn === 'true';
+  } catch {
+    settings.isEnabled = false;
+  }
 
   return settings;
 };
@@ -229,6 +239,6 @@ export const getAutoPilotSettings = (): AutoPilotSettings => {
 export const saveAutoPilotSettings = (settings: AutoPilotSettings): void => {
   try {
     localStorage.setItem(AUTO_PILOT_SETTINGS_KEY, JSON.stringify(settings));
-    localStorage.setItem(AUTOPILOT_ACTIVE_STORAGE_KEY, String(settings.isEnabled));
+    localStorage.setItem(AUTOPILOT_ACTIVE_STORAGE_KEY, String(Boolean(settings.isEnabled)));
   } catch {}
 };

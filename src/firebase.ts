@@ -34,7 +34,7 @@ import {
 import firebaseConfig from '../firebase-applet-config.json';
 import { Question, ActiveContest, LeaderboardEntry, UserProfile, QuizAttemptResult, DepositRequest, WithdrawalRequest, SupportTicket, BannerSlide, ContestEntry, FinancialLedgerRecord } from './types';
 import { isDemoSeedUser } from './data/quizData';
-import { prepareContestForFirestore, sanitizeContestSynchronous } from './utils/imageCompressor';
+import { prepareContestForFirestore, sanitizeContestSynchronous, compressImage, MAX_DATA_URL_LENGTH } from './utils/imageCompressor';
 import { ensureLocalStorageHeadroomForAuth, isStorageQuotaError } from './utils/storageHygiene';
 import { contestBackend } from './backend/contestEngine';
 
@@ -54,6 +54,13 @@ ensureLocalStorageHeadroomForAuth();
 
 // Designated Admin account authorized for central Firestore Registered Users access
 export const AUTHORIZED_ADMIN_EMAIL = 'nmlcompany720@gmail.com';
+
+export function isFirebaseVerifiedAdmin(user?: User | null): boolean {
+  const target = user === undefined ? auth.currentUser : user;
+  if (!target) return false;
+  const email = (target.email || '').trim().toLowerCase();
+  return email === AUTHORIZED_ADMIN_EMAIL && target.emailVerified === true;
+}
 
 export type AuthPersistenceMode =
   | 'indexedDBLocalPersistence'
@@ -1612,35 +1619,70 @@ export async function removeQuestionFromFirestore(qId: number): Promise<void> {
 
 
 // Contests Sync
-export async function fetchContestsFromFirestore(): Promise<ActiveContest[]> {
+export async function fetchContestsFromFirestoreAuthoritative(): Promise<{ contests: ActiveContest[]; ok: boolean }> {
   const path = 'contests';
   try {
     const snap = await getDocs(collection(db, path));
     const list: ActiveContest[] = [];
     snap.forEach((docItem) => {
       const data = docItem.data();
-      if (data) {
+      if (data && data.isDeleted !== true) {
         list.push({ ...data, id: data.id || docItem.id } as ActiveContest);
       }
     });
-    return list.filter(c => c && c.id != null);
+    return { contests: list.filter(c => c && c.id != null), ok: true };
   } catch (error) {
     try {
       handleFirestoreError(error, OperationType.LIST, path);
     } catch {}
-    return [];
+    return { contests: [], ok: false };
+  }
+}
+
+export async function fetchContestsFromFirestore(): Promise<ActiveContest[]> {
+  const res = await fetchContestsFromFirestoreAuthoritative();
+  return res.contests;
+}
+
+export function subscribeToContestsFromFirestore(
+  onUpdate: (contests: ActiveContest[]) => void,
+  onError?: (err: unknown) => void
+): () => void {
+  const path = 'contests';
+  try {
+    return onSnapshot(
+      collection(db, path),
+      (snap) => {
+        const list: ActiveContest[] = [];
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data && data.isDeleted !== true) {
+            list.push({ ...data, id: data.id || docItem.id } as ActiveContest);
+          }
+        });
+        onUpdate(list.filter(c => c && c.id != null));
+      },
+      (error) => {
+        console.warn('Firestore contests snapshot notice:', error);
+        onError?.(error);
+      }
+    );
+  } catch (error) {
+    console.warn('Firestore contests subscribe notice:', error);
+    onError?.(error);
+    return () => {};
   }
 }
 
 export async function saveContestToFirestore(contest: ActiveContest): Promise<void> {
-  if (!contest || !contest.id || isFirestoreQuotaExceeded()) return;
+  if (!contest || !contest.id || contest.isDeleted === true || isFirestoreQuotaExceeded()) return;
   const path = `contests/${contest.id}`;
   try {
     const safeContest = await prepareContestForFirestore(contest);
     const writePromise = setDoc(doc(db, 'contests', safeContest.id), safeContest);
-    // Timeout safeguard: max 3.5 seconds so Firestore never blocks the UI
+    // Timeout safeguard: max 5 seconds so Firestore never hangs the UI
     const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Firestore save timed out')), 3500)
+      setTimeout(() => reject(new Error('Firestore save timed out')), 5000)
     );
     await Promise.race([writePromise, timeoutPromise]);
   } catch (error: any) {
@@ -1663,19 +1705,21 @@ export async function saveContestToFirestore(contest: ActiveContest): Promise<vo
   }
 }
 
-export async function removeContestFromFirestore(contestId: string): Promise<void> {
-  if (!contestId || isFirestoreQuotaExceeded()) return;
+export async function removeContestFromFirestore(contestId: string): Promise<boolean> {
+  if (!contestId || isFirestoreQuotaExceeded()) return false;
   const path = `contests/${contestId}`;
   try {
     const deletePromise = deleteDoc(doc(db, 'contests', contestId));
-    // Timeout safeguard: max 3.5 seconds
+    // Timeout safeguard: max 8 seconds to allow authoritative delete confirmation
     const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Firestore delete timed out')), 3500)
+      setTimeout(() => reject(new Error('Firestore delete timed out')), 8000)
     );
     await Promise.race([deletePromise, timeoutPromise]);
+    return true;
   } catch (error) {
-    if (handlePossibleQuotaError(error)) return;
-    console.warn('Firestore remove contest notice:', contestId, error);
+    if (handlePossibleQuotaError(error)) return false;
+    console.warn('Firestore remove contest notice:', path, error);
+    return false;
   }
 }
 
@@ -2083,38 +2127,178 @@ export function subscribeToUserQuizAttempts(
   }
 }
 
+function normalizeDepositRecordFromFirestore(docId: string, data: Record<string, any>): DepositRequest {
+  const id = String(data.id || docId).trim();
+  const normalizedStatus = String(data.status || 'pending').trim().toLowerCase() as DepositRequest['status'];
+  return {
+    ...data,
+    id,
+    requestId: String(data.requestId || id).trim(),
+    firestoreDocId: docId,
+    status: normalizedStatus
+  } as DepositRequest;
+}
+
+function getDepositSortTimeMs(d: DepositRequest): number {
+  const raw = d.createdAt || d.updatedAt || d.timestamp || d.date || 0;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  const parsed = new Date(String(raw)).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sortDepositsNewestFirst(list: DepositRequest[]): DepositRequest[] {
+  return [...list].sort((a, b) => getDepositSortTimeMs(b) - getDepositSortTimeMs(a));
+}
+
+async function fetchAllDepositsViaRestFallback(): Promise<{ deposits: DepositRequest[]; ok: boolean }> {
+  try {
+    if (typeof fetch === 'undefined') return { deposits: [], ok: false };
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/deposits`;
+    const map = new Map<string, DepositRequest>();
+    let pageToken = '';
+    for (let page = 0; page < 10; page++) {
+      const url = pageToken
+        ? `${baseUrl}?pageSize=300&pageToken=${encodeURIComponent(pageToken)}`
+        : `${baseUrl}?pageSize=300`;
+      const res = await fetch(url);
+      if (!res.ok) return { deposits: [], ok: false };
+      const json = await res.json();
+      const docs = Array.isArray(json?.documents) ? json.documents : [];
+      docs.forEach((docObj: any) => {
+        const decoded = decodeFirestoreRestDoc(docObj);
+        if (decoded && decoded.data) {
+          const item = normalizeDepositRecordFromFirestore(decoded.docId, decoded.data);
+          if (item.id) {
+            map.set(decoded.docId || item.id, item);
+          }
+        }
+      });
+      pageToken = typeof json?.nextPageToken === 'string' ? json.nextPageToken : '';
+      if (!pageToken) break;
+    }
+    return { deposits: sortDepositsNewestFirst(Array.from(map.values())), ok: true };
+  } catch {
+    return { deposits: [], ok: false };
+  }
+}
+
+async function saveDepositViaRestFallback(deposit: DepositRequest): Promise<boolean> {
+  if (typeof fetch === 'undefined' || !deposit || !deposit.id) return false;
+  try {
+    const fields = encodeFirestoreRestFields(stripUndefinedFields({ ...deposit }));
+    const res = await fetch(`${getFirestoreRestBase()}/deposits/${encodeURIComponent(deposit.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields })
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveNonCollidingDepositId(
+  preferredId: string,
+  cleanEmail: string,
+  resolvedOwnerUid: string,
+  utrNumber?: string,
+  createdAt?: string
+): Promise<string> {
+  const normalizedPreferred = String(preferredId || '').trim() || `QK-DEP-${1001}`;
+  const cleanUtr = String(utrNumber || '').trim();
+  const cleanCreatedAt = String(createdAt || '').trim();
+
+  const tryAvailable = async (candidateId: string): Promise<boolean> => {
+    try {
+      const snap = await getDoc(doc(db, 'deposits', candidateId));
+      if (!snap.exists()) {
+        // Double-check REST in case local rules or cache missed anything
+        return true;
+      }
+      const existing = snap.data() as DepositRequest;
+      const existingEmail = (existing.userEmail || existing.email || '').trim().toLowerCase();
+      const existingUid = (existing.ownerUid || existing.userId || '').trim();
+      const sameOwner =
+        (cleanEmail && existingEmail === cleanEmail) ||
+        (resolvedOwnerUid && existingUid === resolvedOwnerUid);
+      const sameRequest =
+        (cleanUtr && String(existing.utrNumber || '').trim() === cleanUtr) ||
+        (cleanCreatedAt && String(existing.createdAt || '').trim() === cleanCreatedAt);
+      return Boolean(sameOwner && sameRequest);
+    } catch {
+      // Permission-denied or unreadable doc indicates existing document belonging to another user
+      const restExisting = await fetchDepositDocViaRest(candidateId);
+      if (!restExisting) {
+        return false;
+      }
+      const existing = restExisting.data as DepositRequest;
+      const existingEmail = (existing.userEmail || existing.email || '').trim().toLowerCase();
+      const existingUid = (existing.ownerUid || existing.userId || '').trim();
+      const sameOwner =
+        (cleanEmail && existingEmail === cleanEmail) ||
+        (resolvedOwnerUid && existingUid === resolvedOwnerUid);
+      const sameRequest =
+        (cleanUtr && String(existing.utrNumber || '').trim() === cleanUtr) ||
+        (cleanCreatedAt && String(existing.createdAt || '').trim() === cleanCreatedAt);
+      return Boolean(sameOwner && sameRequest);
+    }
+  };
+
+  if (await tryAvailable(normalizedPreferred)) {
+    return normalizedPreferred;
+  }
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const randSuffix = 100000 + Math.floor((Date.now() % 800000) + Math.random() * 99999);
+    const candidate = `QK-DEP-${String(randSuffix).slice(0, 6)}`;
+    if (await tryAvailable(candidate)) {
+      return candidate;
+    }
+  }
+  return `QK-DEP-${Date.now().toString().slice(-6)}`;
+}
+
 // Deposit Requests Cloud Database Sync
 export async function saveDepositToFirestore(deposit: DepositRequest): Promise<void> {
   if (!deposit || !deposit.id || isFirestoreQuotaExceeded()) return;
+  await waitForFirebaseAuthReady();
   const path = `deposits/${deposit.id}`;
   const cleanEmail = (deposit.userEmail || deposit.email || auth.currentUser?.email || '').trim().toLowerCase();
-  const resolvedOwnerUid = deposit.ownerUid || deposit.userId || auth.currentUser?.uid || (cleanEmail ? `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${deposit.id}`);
+  const authEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+  const authMatchesOwner = Boolean(auth.currentUser && (!cleanEmail || !authEmail || authEmail === cleanEmail));
+  const resolvedOwnerUid = (
+    (authMatchesOwner && auth.currentUser?.uid) ||
+    deposit.ownerUid ||
+    deposit.userId ||
+    (cleanEmail ? `usr-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}` : `usr-${deposit.id}`)
+  ).trim();
   const persistentRequestId = deposit.requestId || deposit.id;
 
-  try {
-    await setDoc(doc(db, 'deposits', deposit.id), {
-      id: deposit.id,
-      requestId: persistentRequestId,
-      ownerUid: resolvedOwnerUid,
-      userId: resolvedOwnerUid,
-      userName: deposit.userName || '',
-      userEmail: cleanEmail,
-      email: cleanEmail,
-      phone: deposit.phone || '',
-      upiId: deposit.upiId || '',
-      amount: Number(deposit.amount),
-      utrNumber: deposit.utrNumber || '',
-      screenshotUrl: deposit.screenshotUrl || '',
-      app: deposit.app || 'PhonePe',
-      timestamp: deposit.timestamp || new Date().toISOString(),
-      date: deposit.date || new Date().toISOString().split('T')[0],
-      createdAt: deposit.createdAt || new Date().toISOString(),
-      status: deposit.status || 'pending',
-      ...(deposit.walletCredited !== undefined ? { walletCredited: deposit.walletCredited } : (deposit.status === 'pending' ? { walletCredited: false } : {})),
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
+  const payload = stripUndefinedFields({
+    id: deposit.id,
+    requestId: persistentRequestId,
+    ownerUid: resolvedOwnerUid,
+    userId: resolvedOwnerUid,
+    userName: deposit.userName || '',
+    userEmail: cleanEmail,
+    email: cleanEmail,
+    phone: deposit.phone || '',
+    upiId: deposit.upiId || '',
+    amount: Number(deposit.amount),
+    utrNumber: deposit.utrNumber || '',
+    screenshotUrl: deposit.screenshotUrl || '',
+    app: deposit.app || 'PhonePe',
+    timestamp: deposit.timestamp || new Date().toISOString(),
+    date: deposit.date || new Date().toISOString().split('T')[0],
+    createdAt: deposit.createdAt || new Date().toISOString(),
+    status: String(deposit.status || 'pending').trim().toLowerCase(),
+    ...(deposit.walletCredited !== undefined ? { walletCredited: deposit.walletCredited } : (deposit.status === 'pending' ? { walletCredited: false } : {})),
+    updatedAt: new Date().toISOString()
+  });
 
-    const authEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+  try {
+    await setDoc(doc(db, 'deposits', deposit.id), payload, { merge: true });
+
     const matchesCurrentAuthOwner = Boolean(
       auth.currentUser &&
       !isFirestoreQuotaExceeded() &&
@@ -2122,14 +2306,183 @@ export async function saveDepositToFirestore(deposit: DepositRequest): Promise<v
     );
     if (matchesCurrentAuthOwner && auth.currentUser) {
       await setDoc(doc(db, 'users', auth.currentUser.uid), {
-        pendingDepositId: deposit.status === 'pending' ? deposit.id : null,
-        pendingDepositStatus: deposit.status,
+        pendingDepositId: payload.status === 'pending' ? deposit.id : null,
+        pendingDepositStatus: payload.status,
         updatedAt: new Date().toISOString()
-      }, { merge: true });
+      }, { merge: true }).catch(() => {});
     }
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
+    const savedViaRest = await saveDepositViaRestFallback(payload as DepositRequest);
+    if (savedViaRest) return;
     handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function submitDepositTransaction(
+  deposit: DepositRequest,
+  fallbackProfile?: Partial<UserProfile>
+): Promise<{
+  success: boolean;
+  alreadyProcessed?: boolean;
+  deposit?: DepositRequest;
+  error?: string;
+}> {
+  if (!deposit || !deposit.id) {
+    return { success: false, error: 'Invalid deposit request.' };
+  }
+
+  const amt = Number(deposit.amount);
+  if (!Number.isFinite(amt) || amt < 100) {
+    return { success: false, error: 'Minimum deposit amount is ₹100.' };
+  }
+
+  await waitForFirebaseAuthReady();
+
+  const cleanEmail = (deposit.userEmail || deposit.email || fallbackProfile?.email || auth.currentUser?.email || '').trim().toLowerCase();
+  const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
+  const authEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+  const authMatchesUser = Boolean(auth.currentUser && (!cleanEmail || !authEmail || authEmail === cleanEmail));
+  const authUid = authMatchesUser && auth.currentUser?.uid ? auth.currentUser.uid : '';
+  const resolvedOwnerUid = (
+    authUid ||
+    deposit.ownerUid ||
+    deposit.userId ||
+    fallbackProfile?.uid ||
+    fallbackProfile?.id ||
+    (safeEmailDocId ? `usr-${safeEmailDocId}` : `usr-${deposit.id}`)
+  ).trim();
+
+  let safeScreenshotUrl = deposit.screenshotUrl || '';
+  if (typeof safeScreenshotUrl === 'string' && safeScreenshotUrl.startsWith('data:image/') && safeScreenshotUrl.length > MAX_DATA_URL_LENGTH) {
+    try {
+      safeScreenshotUrl = await compressImage(safeScreenshotUrl, 900, 900, 0.65);
+    } catch {}
+  }
+
+  const buildSavedDeposit = (finalId: string, nowIso: string): DepositRequest =>
+    stripUndefinedFields({
+      id: finalId,
+      requestId: finalId === deposit.id ? (deposit.requestId || finalId) : finalId,
+      ownerUid: resolvedOwnerUid,
+      userId: resolvedOwnerUid,
+      userName: deposit.userName || fallbackProfile?.name || '',
+      userEmail: cleanEmail,
+      email: cleanEmail,
+      phone: deposit.phone || fallbackProfile?.mobile || '',
+      upiId: deposit.upiId || fallbackProfile?.upiId || 'Contestant UPI',
+      amount: amt,
+      utrNumber: (deposit.utrNumber || '').trim(),
+      screenshotUrl: safeScreenshotUrl,
+      app: deposit.app || 'PhonePe',
+      timestamp: deposit.timestamp || nowIso,
+      date: deposit.date || nowIso.split('T')[0],
+      createdAt: deposit.createdAt || nowIso,
+      status: 'pending',
+      walletCredited: false,
+      updatedAt: nowIso
+    });
+
+  if (isFirestoreQuotaExceeded()) {
+    return {
+      success: true,
+      deposit: buildSavedDeposit(deposit.id, new Date().toISOString())
+    };
+  }
+
+  const targetDepositId = await resolveNonCollidingDepositId(
+    deposit.id,
+    cleanEmail,
+    resolvedOwnerUid,
+    deposit.utrNumber,
+    deposit.createdAt
+  );
+  const dRef = doc(db, 'deposits', targetDepositId);
+
+  try {
+    const txResult = await runTransaction(db, async (tx) => {
+      const dSnap = await tx.get(dRef).catch(() => null);
+      if (dSnap && dSnap.exists()) {
+        const existingD = dSnap.data() as DepositRequest;
+        const existingEmail = (existingD?.userEmail || existingD?.email || '').trim().toLowerCase();
+        const sameOwner =
+          (cleanEmail && existingEmail === cleanEmail) ||
+          (resolvedOwnerUid && (existingD?.ownerUid === resolvedOwnerUid || existingD?.userId === resolvedOwnerUid));
+        if (sameOwner) {
+          return {
+            success: true,
+            alreadyProcessed: true,
+            deposit: normalizeDepositRecordFromFirestore(targetDepositId, existingD)
+          };
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const savedDeposit = buildSavedDeposit(targetDepositId, nowIso);
+      tx.set(dRef, savedDeposit, { merge: true });
+
+      if (authMatchesUser && auth.currentUser?.uid) {
+        tx.set(
+          doc(db, 'users', auth.currentUser.uid),
+          {
+            pendingDepositId: targetDepositId,
+            pendingDepositStatus: 'pending',
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+      }
+
+      return {
+        success: true,
+        alreadyProcessed: false,
+        deposit: { ...savedDeposit, firestoreDocId: targetDepositId }
+      };
+    });
+
+    return txResult;
+  } catch (error) {
+    if (handlePossibleQuotaError(error)) {
+      return {
+        success: true,
+        deposit: buildSavedDeposit(targetDepositId, new Date().toISOString())
+      };
+    }
+
+    const fallbackNowIso = new Date().toISOString();
+    const finalId = await resolveNonCollidingDepositId(
+      targetDepositId,
+      cleanEmail,
+      resolvedOwnerUid,
+      deposit.utrNumber,
+      deposit.createdAt
+    );
+    const fallbackSaved = buildSavedDeposit(finalId, fallbackNowIso);
+    let persisted = false;
+
+    try {
+      await setDoc(doc(db, 'deposits', finalId), fallbackSaved, { merge: true });
+      const verifySnap = await getDoc(doc(db, 'deposits', finalId)).catch(() => null);
+      if (verifySnap && verifySnap.exists()) {
+        persisted = true;
+      }
+    } catch {}
+
+    if (!persisted) {
+      persisted = await saveDepositViaRestFallback(fallbackSaved);
+    }
+
+    if (!persisted) {
+      return {
+        success: false,
+        error: 'Unable to save deposit request to Firestore. Please check your internet connection and try again.'
+      };
+    }
+
+    return {
+      success: true,
+      deposit: { ...fallbackSaved, firestoreDocId: finalId }
+    };
   }
 }
 
@@ -2151,106 +2504,280 @@ export async function updateDepositStatusInFirestore(depositId: string, status: 
   }
 }
 
-export async function fetchDepositsFromFirestore(ownerUid?: string, userEmail?: string): Promise<DepositRequest[]> {
-  if (isFirestoreQuotaExceeded()) return [];
+export async function fetchDepositsWithStatusFromFirestore(
+  ownerUid?: string,
+  userEmail?: string
+): Promise<{
+  deposits: DepositRequest[];
+  ok: boolean;
+  errorCode?: string;
+  errorMessage?: string;
+}> {
+  if (isFirestoreQuotaExceeded()) {
+    return { deposits: [], ok: false, errorCode: 'resource-exhausted', errorMessage: 'Firestore quota exceeded.' };
+  }
 
+  await waitForFirebaseAuthReady();
+  const currentUser = auth.currentUser;
+  const isAdmin = isFirebaseVerifiedAdmin(currentUser);
   const path = 'deposits';
+  const cleanTargetUid = (ownerUid || '').trim();
+  const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
+  const isUserScopedRequest = Boolean(cleanTargetUid || cleanTargetEmail);
+
   try {
-    const q = collection(db, path);
-    const snap = await getDocs(q);
-    const list: DepositRequest[] = [];
-    const cleanTargetUid = (ownerUid || '').trim();
-    const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
+    const map = new Map<string, DepositRequest>();
 
-    snap.forEach((docItem) => {
-      const data = docItem.data();
-      if (data) {
-        const item: DepositRequest = {
-          ...data,
-          id: data.id || docItem.id,
-          requestId: data.requestId || data.id || docItem.id,
-          firestoreDocId: docItem.id,
-          status: (data.status as any) || 'pending'
-        } as DepositRequest;
+    if (isUserScopedRequest && currentUser && !isAdmin) {
+      const queryUid = currentUser.uid;
+      const queryEmail = cleanTargetEmail || (currentUser.email || '').trim().toLowerCase();
+      const snapshots = await Promise.all([
+        queryUid ? getDocs(query(collection(db, path), where('ownerUid', '==', queryUid))).catch(() => null) : Promise.resolve(null),
+        queryUid ? getDocs(query(collection(db, path), where('userId', '==', queryUid))).catch(() => null) : Promise.resolve(null),
+        queryEmail ? getDocs(query(collection(db, path), where('userEmail', '==', queryEmail))).catch(() => null) : Promise.resolve(null)
+      ]);
+      const anySnapSucceeded = snapshots.some((s) => s !== null);
+      if (!anySnapSucceeded) {
+        return { deposits: [], ok: false, errorCode: 'permission-denied', errorMessage: 'Unable to fetch user deposits.' };
+      }
+      snapshots.forEach((snap) => {
+        if (!snap) return;
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data) {
+            const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
+            if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
+            const item = normalizeDepositRecordFromFirestore(docItem.id, data);
+            map.set(item.firestoreDocId || item.id, item);
+          }
+        });
+      });
+      return { deposits: sortDepositsNewestFirst(Array.from(map.values())), ok: true };
+    }
 
-        if (!cleanTargetUid && !cleanTargetEmail) {
-          list.push(item);
-        } else {
-          const itemUid = (item.ownerUid || item.userId || '').trim();
-          const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
-          const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
-                          (cleanTargetEmail && itemEmail === cleanTargetEmail);
-          if (isMatch) {
-            list.push(item);
+    try {
+      const snap = await getDocs(collection(db, path));
+      snap.forEach((docItem) => {
+        const data = docItem.data();
+        if (data) {
+          const item = normalizeDepositRecordFromFirestore(docItem.id, data);
+          if (!isUserScopedRequest || isAdmin) {
+            map.set(item.firestoreDocId || item.id, item);
+          } else {
+            const itemUid = (item.ownerUid || item.userId || '').trim();
+            const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+            if (cleanTargetEmail && itemEmail && itemEmail !== cleanTargetEmail) return;
+            const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                            (cleanTargetEmail && itemEmail === cleanTargetEmail);
+            if (isMatch) {
+              map.set(item.firestoreDocId || item.id, item);
+            }
           }
         }
+      });
+      return { deposits: sortDepositsNewestFirst(Array.from(map.values())), ok: true };
+    } catch (listErr: any) {
+      if (!isUserScopedRequest) {
+        const restResult = await fetchAllDepositsViaRestFallback();
+        if (restResult.ok) {
+          return { deposits: restResult.deposits, ok: true };
+        }
       }
-    });
-
-    return list.sort((a, b) => {
-      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
-      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
-      return timeB - timeA;
-    });
-  } catch (error) {
+      throw listErr;
+    }
+  } catch (error: any) {
     handlePossibleQuotaError(error);
-    return [];
+    return {
+      deposits: [],
+      ok: false,
+      errorCode: String(error?.code || 'unknown'),
+      errorMessage: error instanceof Error ? error.message : String(error || '')
+    };
   }
+}
+
+export async function fetchDepositsFromFirestore(ownerUid?: string, userEmail?: string): Promise<DepositRequest[]> {
+  const res = await fetchDepositsWithStatusFromFirestore(ownerUid, userEmail);
+  return res.deposits;
 }
 
 export function subscribeToDepositsFromFirestore(
   callback: (deposits: DepositRequest[]) => void,
   ownerUid?: string,
-  userEmail?: string
+  userEmail?: string,
+  onError?: (error: unknown) => void
 ): () => void {
   if (isFirestoreQuotaExceeded()) return () => {};
   const path = 'deposits';
   const cleanTargetUid = (ownerUid || '').trim();
   const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
+  const isUserScopedRequest = Boolean(cleanTargetUid || cleanTargetEmail);
 
-  try {
-    const unsubscribe = onSnapshot(collection(db, path), (snap) => {
-      const list: DepositRequest[] = [];
-      snap.forEach((docItem) => {
-        const data = docItem.data();
-        if (data) {
-          const item: DepositRequest = {
-            ...data,
-            id: data.id || docItem.id,
-            requestId: data.requestId || data.id || docItem.id,
-            firestoreDocId: docItem.id,
-            status: (data.status as any) || 'pending'
-          } as DepositRequest;
+  let isDisposed = false;
+  let activeUnsubs: (() => void)[] = [];
+  let fallbackTimer: ReturnType<typeof setInterval> | null = null;
+  let lastBoundAuthKey = '__unset__';
 
-          if (!cleanTargetUid && !cleanTargetEmail) {
-            list.push(item);
-          } else {
-            const itemUid = (item.ownerUid || item.userId || '').trim();
-            const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
-            const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
-                            (cleanTargetEmail && itemEmail === cleanTargetEmail);
-            if (isMatch) {
-              list.push(item);
+  const cleanupActiveListeners = () => {
+    activeUnsubs.forEach((fn) => {
+      try {
+        fn();
+      } catch {}
+    });
+    activeUnsubs = [];
+    if (fallbackTimer) {
+      clearInterval(fallbackTimer);
+      fallbackTimer = null;
+    }
+  };
+
+  const attachListeners = () => {
+    if (isDisposed) return;
+    const currentUser = auth.currentUser;
+    const nextAuthKey = currentUser
+      ? `${currentUser.uid}:${(currentUser.email || '').toLowerCase()}:${String(currentUser.emailVerified)}`
+      : 'anon';
+    if (nextAuthKey === lastBoundAuthKey && activeUnsubs.length > 0) return;
+    lastBoundAuthKey = nextAuthKey;
+    cleanupActiveListeners();
+
+    const isAdmin = isFirebaseVerifiedAdmin(currentUser);
+
+    try {
+      if (isUserScopedRequest && currentUser && !isAdmin) {
+        const queryUid = currentUser.uid;
+        const queryEmail = cleanTargetEmail || (currentUser.email || '').trim().toLowerCase();
+        const byOwnerUid = new Map<string, DepositRequest>();
+        const byUserId = new Map<string, DepositRequest>();
+        const byEmail = new Map<string, DepositRequest>();
+
+        const emitMerged = () => {
+          if (isDisposed) return;
+          const merged = new Map<string, DepositRequest>();
+          byOwnerUid.forEach((v, k) => merged.set(k, v));
+          byUserId.forEach((v, k) => merged.set(k, v));
+          byEmail.forEach((v, k) => merged.set(k, v));
+          callback(sortDepositsNewestFirst(Array.from(merged.values())));
+        };
+
+        if (queryUid) {
+          activeUnsubs.push(onSnapshot(query(collection(db, path), where('ownerUid', '==', queryUid)), (snap) => {
+            byOwnerUid.clear();
+            snap.forEach((docItem) => {
+              const data = docItem.data();
+              if (data) {
+                const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
+                if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
+                const item = normalizeDepositRecordFromFirestore(docItem.id, data);
+                byOwnerUid.set(item.firestoreDocId || item.id, item);
+              }
+            });
+            emitMerged();
+          }, (err) => {
+            handlePossibleQuotaError(err);
+            if (!queryEmail) onError?.(err);
+          }));
+
+          activeUnsubs.push(onSnapshot(query(collection(db, path), where('userId', '==', queryUid)), (snap) => {
+            byUserId.clear();
+            snap.forEach((docItem) => {
+              const data = docItem.data();
+              if (data) {
+                const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
+                if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
+                const item = normalizeDepositRecordFromFirestore(docItem.id, data);
+                byUserId.set(item.firestoreDocId || item.id, item);
+              }
+            });
+            emitMerged();
+          }, (err) => {
+            handlePossibleQuotaError(err);
+          }));
+        }
+
+        if (queryEmail) {
+          activeUnsubs.push(onSnapshot(query(collection(db, path), where('userEmail', '==', queryEmail)), (snap) => {
+            byEmail.clear();
+            snap.forEach((docItem) => {
+              const data = docItem.data();
+              if (data) {
+                const item = normalizeDepositRecordFromFirestore(docItem.id, data);
+                byEmail.set(item.firestoreDocId || item.id, item);
+              }
+            });
+            emitMerged();
+          }, (err) => {
+            handlePossibleQuotaError(err);
+            onError?.(err);
+          }));
+        }
+        return;
+      }
+
+      const unsubCollection = onSnapshot(collection(db, path), (snap) => {
+        if (isDisposed) return;
+        const map = new Map<string, DepositRequest>();
+        snap.forEach((docItem) => {
+          const data = docItem.data();
+          if (data) {
+            const item = normalizeDepositRecordFromFirestore(docItem.id, data);
+            if (!isUserScopedRequest || isAdmin) {
+              map.set(item.firestoreDocId || item.id, item);
+            } else {
+              const itemUid = (item.ownerUid || item.userId || '').trim();
+              const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
+              if (cleanTargetEmail && itemEmail && itemEmail !== cleanTargetEmail) return;
+              const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
+                              (cleanTargetEmail && itemEmail === cleanTargetEmail);
+              if (isMatch) {
+                map.set(item.firestoreDocId || item.id, item);
+              }
             }
           }
+        });
+        callback(sortDepositsNewestFirst(Array.from(map.values())));
+      }, (err) => {
+        handlePossibleQuotaError(err);
+        if (!isUserScopedRequest && !isDisposed && !fallbackTimer) {
+          const syncAll = () => {
+            fetchAllDepositsViaRestFallback().then((res) => {
+              if (!isDisposed && res.ok) {
+                callback(res.deposits);
+              }
+            }).catch(() => {});
+          };
+          syncAll();
+          fallbackTimer = setInterval(syncAll, 4000);
         }
+        onError?.(err);
       });
 
-      list.sort((a, b) => {
-        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
-        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
-        return timeB - timeA;
+      activeUnsubs.push(unsubCollection);
+    } catch (err) {
+      onError?.(err);
+    }
+  };
+
+  let unsubAuth: (() => void) | null = null;
+  waitForFirebaseAuthReady().then(() => {
+    if (isDisposed) return;
+    attachListeners();
+    try {
+      unsubAuth = onAuthStateChanged(auth, () => {
+        attachListeners();
       });
+    } catch {}
+  });
 
-      callback(list);
-    }, (err) => {
-      handlePossibleQuotaError(err);
-    });
-
-    return unsubscribe;
-  } catch {
-    return () => {};
-  }
+  return () => {
+    isDisposed = true;
+    cleanupActiveListeners();
+    if (unsubAuth) {
+      try {
+        unsubAuth();
+      } catch {}
+    }
+  };
 }
 
 export async function deleteDepositFromFirestore(depositId: string): Promise<void> {
@@ -3350,41 +3877,50 @@ async function processWithdrawalStatusViaRestFallback(
   }
 }
 
-async function fetchAllWithdrawalsViaRestFallback(): Promise<WithdrawalRequest[]> {
+async function fetchAllWithdrawalsViaRestFallback(): Promise<{ withdrawals: WithdrawalRequest[]; ok: boolean }> {
   try {
-    if (typeof fetch === 'undefined') return [];
-    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/withdrawals?pageSize=300`;
-    const res = await fetch(url);
-    if (!res.ok) return [];
-    const json = await res.json();
-    const docs = Array.isArray(json?.documents) ? json.documents : [];
-    const list: WithdrawalRequest[] = [];
-    docs.forEach((docObj: any) => {
-      const nameParts = String(docObj?.name || '').split('/');
-      const docId = nameParts[nameParts.length - 1] || '';
-      const fields = docObj?.fields || {};
-      const decoded: Record<string, any> = {};
-      Object.keys(fields).forEach((k) => {
-        decoded[k] = decodeFirestoreRestValue(fields[k]);
+    if (typeof fetch === 'undefined') return { withdrawals: [], ok: false };
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/withdrawals`;
+    const map = new Map<string, WithdrawalRequest>();
+    let pageToken = '';
+    for (let page = 0; page < 10; page++) {
+      const url = pageToken
+        ? `${baseUrl}?pageSize=300&pageToken=${encodeURIComponent(pageToken)}`
+        : `${baseUrl}?pageSize=300`;
+      const res = await fetch(url);
+      if (!res.ok) return { withdrawals: [], ok: false };
+      const json = await res.json();
+      const docs = Array.isArray(json?.documents) ? json.documents : [];
+      docs.forEach((docObj: any) => {
+        const nameParts = String(docObj?.name || '').split('/');
+        const docId = nameParts[nameParts.length - 1] || '';
+        const fields = docObj?.fields || {};
+        const decoded: Record<string, any> = {};
+        Object.keys(fields).forEach((k) => {
+          decoded[k] = decodeFirestoreRestValue(fields[k]);
+        });
+        const id = decoded.id || docId;
+        if (id) {
+          map.set(docId || id, {
+            ...decoded,
+            id,
+            firestoreDocId: docId,
+            requestId: decoded.requestId || id,
+            status: (String(decoded.status || 'pending').trim().toLowerCase() as any)
+          } as WithdrawalRequest);
+        }
       });
-      const id = decoded.id || docId;
-      if (id) {
-        list.push({
-          ...decoded,
-          id,
-          firestoreDocId: docId,
-          requestId: decoded.requestId || id,
-          status: (String(decoded.status || 'pending').toLowerCase() as any)
-        } as WithdrawalRequest);
-      }
-    });
-    return list.sort((a, b) => {
+      pageToken = typeof json?.nextPageToken === 'string' ? json.nextPageToken : '';
+      if (!pageToken) break;
+    }
+    const list = Array.from(map.values()).sort((a, b) => {
       const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
       const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
       return timeB - timeA;
     });
+    return { withdrawals: list, ok: true };
   } catch {
-    return [];
+    return { withdrawals: [], ok: false };
   }
 }
 
@@ -3405,8 +3941,17 @@ async function resolveNonCollidingWithdrawalId(
         (resolvedOwnerUid && existingUid === resolvedOwnerUid);
       return Boolean(sameOwner);
     } catch {
-      // Permission denied means doc already exists under a different owner
-      return false;
+      const restExisting = await findWithdrawalByIdViaRest(candidateId);
+      if (!restExisting) {
+        return false;
+      }
+      const existing = restExisting.data as WithdrawalRequest;
+      const existingEmail = (existing.userEmail || existing.email || '').trim().toLowerCase();
+      const existingUid = (existing.ownerUid || existing.userId || '').trim();
+      const sameOwner =
+        (cleanEmail && existingEmail === cleanEmail) ||
+        (resolvedOwnerUid && existingUid === resolvedOwnerUid);
+      return Boolean(sameOwner);
     }
   };
 
@@ -3415,7 +3960,7 @@ async function resolveNonCollidingWithdrawalId(
   }
 
   // Generate a guaranteed-unique 6-digit sequential-compatible QK-WTH ID
-  for (let attempt = 0; attempt < 6; attempt++) {
+  for (let attempt = 0; attempt < 8; attempt++) {
     const randSuffix = 100000 + Math.floor((Date.now() % 800000) + Math.random() * 99999);
     const candidate = `QK-WTH-${String(randSuffix).slice(0, 6)}`;
     if (await tryAvailable(candidate)) {
@@ -3508,9 +4053,13 @@ export async function submitWithdrawalTransaction(
     return { success: false, error: 'Maximum withdrawal amount is ₹5000 per request.' };
   }
 
+  await waitForFirebaseAuthReady();
+
   const cleanEmail = (w.userEmail || w.email || fallbackProfile?.email || auth.currentUser?.email || '').trim().toLowerCase();
   const safeEmailDocId = cleanEmail ? cleanEmail.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
-  const authUid = auth.currentUser?.uid || '';
+  const authEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+  const authMatchesUser = Boolean(auth.currentUser && (!cleanEmail || !authEmail || authEmail === cleanEmail));
+  const authUid = authMatchesUser && auth.currentUser?.uid ? auth.currentUser.uid : '';
   const resolvedOwnerUid = (authUid || w.ownerUid || w.userId || fallbackProfile?.uid || (safeEmailDocId ? `usr-${safeEmailDocId}` : `usr-${w.id}`)).trim();
 
   const buildSavedWithdrawal = (finalId: string, nowIso: string): WithdrawalRequest =>
@@ -4007,11 +4556,22 @@ export async function processWithdrawalStatusTransaction(
   }
 }
 
-export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail?: string): Promise<WithdrawalRequest[]> {
-  const currentUser = auth.currentUser;
-  if (isFirestoreQuotaExceeded()) return [];
+export async function fetchWithdrawalsWithStatusFromFirestore(
+  ownerUid?: string,
+  userEmail?: string
+): Promise<{
+  withdrawals: WithdrawalRequest[];
+  ok: boolean;
+  errorCode?: string;
+  errorMessage?: string;
+}> {
+  if (isFirestoreQuotaExceeded()) {
+    return { withdrawals: [], ok: false, errorCode: 'resource-exhausted', errorMessage: 'Firestore quota exceeded.' };
+  }
 
-  const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
+  await waitForFirebaseAuthReady();
+  const currentUser = auth.currentUser;
+  const isAdmin = isFirebaseVerifiedAdmin(currentUser);
   const path = 'withdrawals';
   const cleanTargetUid = (ownerUid || '').trim();
   const cleanTargetEmail = (userEmail || '').trim().toLowerCase();
@@ -4021,13 +4581,18 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
     const map = new Map<string, WithdrawalRequest>();
 
     if (isUserScopedRequest && currentUser && !isAdmin) {
-      // User-scoped view: only query ownerUid with real Firebase Auth UID to prevent permission-denied
+      // User-scoped view: only query ownerUid/userId/userEmail with real Firebase Auth UID to prevent permission-denied
       const queryUid = currentUser.uid;
       const queryEmail = cleanTargetEmail || (currentUser.email || '').trim().toLowerCase();
       const snapshots = await Promise.all([
         queryUid ? getDocs(query(collection(db, path), where('ownerUid', '==', queryUid))).catch(() => null) : Promise.resolve(null),
+        queryUid ? getDocs(query(collection(db, path), where('userId', '==', queryUid))).catch(() => null) : Promise.resolve(null),
         queryEmail ? getDocs(query(collection(db, path), where('userEmail', '==', queryEmail))).catch(() => null) : Promise.resolve(null)
       ]);
+      const anySnapSucceeded = snapshots.some((s) => s !== null);
+      if (!anySnapSucceeded) {
+        return { withdrawals: [], ok: false, errorCode: 'permission-denied', errorMessage: 'Unable to fetch user withdrawals.' };
+      }
       snapshots.forEach((snap) => {
         if (!snap) return;
         snap.forEach((docItem) => {
@@ -4036,12 +4601,12 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
             const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
             if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
             const id = data.id || docItem.id;
-            map.set(id, {
+            map.set(docItem.id || id, {
               ...data,
               id,
               firestoreDocId: docItem.id,
               requestId: data.requestId || id,
-              status: (String(data.status || 'pending').toLowerCase() as any)
+              status: (String(data.status || 'pending').trim().toLowerCase() as any)
             } as WithdrawalRequest);
           }
         });
@@ -4057,11 +4622,11 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
               id: data.id || docItem.id,
               firestoreDocId: docItem.id,
               requestId: data.requestId || data.id || docItem.id,
-              status: (String(data.status || 'pending').toLowerCase() as any)
+              status: (String(data.status || 'pending').trim().toLowerCase() as any)
             } as WithdrawalRequest;
 
             if (!isUserScopedRequest || isAdmin) {
-              map.set(item.id, item);
+              map.set(docItem.id || item.id, item);
             } else {
               const itemUid = (item.ownerUid || item.userId || '').trim();
               const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
@@ -4069,19 +4634,23 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
               const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
                               (cleanTargetEmail && itemEmail === cleanTargetEmail);
               if (isMatch) {
-                map.set(item.id, item);
+                map.set(docItem.id || item.id, item);
               }
             }
           }
         });
       } catch (listErr) {
         // When Admin Panel is unlocked via AdminAuthModal while a non-admin Firebase user is signed in,
-        // Firestore client rules reject unfiltered collection list; fall back to public REST list + user queries.
+        // Firestore client rules reject unfiltered collection list; fall back to paginated REST list + user queries.
         if (!isUserScopedRequest) {
-          const restList = await fetchAllWithdrawalsViaRestFallback();
-          restList.forEach((item) => {
-            if (item && item.id) map.set(item.id, item);
-          });
+          const restRes = await fetchAllWithdrawalsViaRestFallback();
+          if (restRes.ok) {
+            restRes.withdrawals.forEach((item) => {
+              if (item && item.id) map.set(item.firestoreDocId || item.id, item);
+            });
+          } else if (!currentUser) {
+            throw listErr;
+          }
           if (currentUser) {
             const queryEmail = (currentUser.email || '').trim().toLowerCase();
             const userSnaps = await Promise.all([
@@ -4094,16 +4663,19 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
                 const data = docItem.data();
                 if (data) {
                   const id = data.id || docItem.id;
-                  map.set(id, {
+                  map.set(docItem.id || id, {
                     ...data,
                     id,
                     firestoreDocId: docItem.id,
                     requestId: data.requestId || id,
-                    status: (String(data.status || 'pending').toLowerCase() as any)
+                    status: (String(data.status || 'pending').trim().toLowerCase() as any)
                   } as WithdrawalRequest);
                 }
               });
             });
+          }
+          if (!restRes.ok && map.size === 0) {
+            throw listErr;
           }
         } else {
           throw listErr;
@@ -4111,15 +4683,26 @@ export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail
       }
     }
 
-    return Array.from(map.values()).sort((a, b) => {
+    const sorted = Array.from(map.values()).sort((a, b) => {
       const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
       const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
       return timeB - timeA;
     });
-  } catch (error) {
+    return { withdrawals: sorted, ok: true };
+  } catch (error: any) {
     handlePossibleQuotaError(error);
-    return [];
+    return {
+      withdrawals: [],
+      ok: false,
+      errorCode: String(error?.code || 'unknown'),
+      errorMessage: error instanceof Error ? error.message : String(error || '')
+    };
   }
+}
+
+export async function fetchWithdrawalsFromFirestore(ownerUid?: string, userEmail?: string): Promise<WithdrawalRequest[]> {
+  const res = await fetchWithdrawalsWithStatusFromFirestore(ownerUid, userEmail);
+  return res.withdrawals;
 }
 
 export function subscribeToWithdrawalsFromFirestore(
@@ -4155,24 +4738,28 @@ export function subscribeToWithdrawalsFromFirestore(
   const attachListeners = () => {
     if (isDisposed) return;
     const currentUser = auth.currentUser;
-    const nextAuthKey = currentUser ? `${currentUser.uid}:${(currentUser.email || '').toLowerCase()}` : 'anon';
-    if (nextAuthKey === lastBoundAuthKey) return;
+    const nextAuthKey = currentUser
+      ? `${currentUser.uid}:${(currentUser.email || '').toLowerCase()}:${String(currentUser.emailVerified)}`
+      : 'anon';
+    if (nextAuthKey === lastBoundAuthKey && activeUnsubs.length > 0) return;
     lastBoundAuthKey = nextAuthKey;
     cleanupActiveListeners();
 
-    const isAdmin = currentUser?.email === 'nmlcompany720@gmail.com';
+    const isAdmin = isFirebaseVerifiedAdmin(currentUser);
 
     try {
       if (isUserScopedRequest && currentUser && !isAdmin) {
         const queryUid = currentUser.uid;
         const queryEmail = cleanTargetEmail || (currentUser.email || '').trim().toLowerCase();
         const byUid = new Map<string, WithdrawalRequest>();
+        const byUserId = new Map<string, WithdrawalRequest>();
         const byEmail = new Map<string, WithdrawalRequest>();
 
         const emitMerged = () => {
           if (isDisposed) return;
           const merged = new Map<string, WithdrawalRequest>();
           byUid.forEach((v, k) => merged.set(k, v));
+          byUserId.forEach((v, k) => merged.set(k, v));
           byEmail.forEach((v, k) => merged.set(k, v));
           const list = Array.from(merged.values()).sort((a, b) => {
             const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
@@ -4191,12 +4778,12 @@ export function subscribeToWithdrawalsFromFirestore(
                 const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
                 if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
                 const id = data.id || docItem.id;
-                byUid.set(id, {
+                byUid.set(docItem.id || id, {
                   ...data,
                   id,
                   firestoreDocId: docItem.id,
                   requestId: data.requestId || id,
-                  status: (String(data.status || 'pending').toLowerCase() as any)
+                  status: (String(data.status || 'pending').trim().toLowerCase() as any)
                 } as WithdrawalRequest);
               }
             });
@@ -4204,6 +4791,28 @@ export function subscribeToWithdrawalsFromFirestore(
           }, (err) => {
             handlePossibleQuotaError(err);
             if (!queryEmail) onError?.(err);
+          }));
+
+          activeUnsubs.push(onSnapshot(query(collection(db, path), where('userId', '==', queryUid)), (snap) => {
+            byUserId.clear();
+            snap.forEach((docItem) => {
+              const data = docItem.data();
+              if (data) {
+                const itemEmail = String(data.userEmail || data.email || '').trim().toLowerCase();
+                if (queryEmail && itemEmail && itemEmail !== queryEmail) return;
+                const id = data.id || docItem.id;
+                byUserId.set(docItem.id || id, {
+                  ...data,
+                  id,
+                  firestoreDocId: docItem.id,
+                  requestId: data.requestId || id,
+                  status: (String(data.status || 'pending').trim().toLowerCase() as any)
+                } as WithdrawalRequest);
+              }
+            });
+            emitMerged();
+          }, (err) => {
+            handlePossibleQuotaError(err);
           }));
         }
 
@@ -4214,12 +4823,12 @@ export function subscribeToWithdrawalsFromFirestore(
               const data = docItem.data();
               if (data) {
                 const id = data.id || docItem.id;
-                byEmail.set(id, {
+                byEmail.set(docItem.id || id, {
                   ...data,
                   id,
                   firestoreDocId: docItem.id,
                   requestId: data.requestId || id,
-                  status: (String(data.status || 'pending').toLowerCase() as any)
+                  status: (String(data.status || 'pending').trim().toLowerCase() as any)
                 } as WithdrawalRequest);
               }
             });
@@ -4234,7 +4843,7 @@ export function subscribeToWithdrawalsFromFirestore(
 
       const unsubCollection = onSnapshot(collection(db, path), (snap) => {
         if (isDisposed) return;
-        const list: WithdrawalRequest[] = [];
+        const map = new Map<string, WithdrawalRequest>();
         snap.forEach((docItem) => {
           const data = docItem.data();
           if (data) {
@@ -4243,11 +4852,11 @@ export function subscribeToWithdrawalsFromFirestore(
               id: data.id || docItem.id,
               firestoreDocId: docItem.id,
               requestId: data.requestId || data.id || docItem.id,
-              status: (String(data.status || 'pending').toLowerCase() as any)
+              status: (String(data.status || 'pending').trim().toLowerCase() as any)
             } as WithdrawalRequest;
 
             if (!isUserScopedRequest || isAdmin) {
-              list.push(item);
+              map.set(docItem.id || item.id, item);
             } else {
               const itemUid = (item.ownerUid || item.userId || '').trim();
               const itemEmail = (item.userEmail || item.email || '').trim().toLowerCase();
@@ -4255,13 +4864,13 @@ export function subscribeToWithdrawalsFromFirestore(
               const isMatch = (cleanTargetUid && (itemUid === cleanTargetUid || itemUid.replace(/^usr-/, '') === cleanTargetUid.replace(/^usr-/, ''))) ||
                               (cleanTargetEmail && itemEmail === cleanTargetEmail);
               if (isMatch) {
-                list.push(item);
+                map.set(docItem.id || item.id, item);
               }
             }
           }
         });
 
-        list.sort((a, b) => {
+        const list = Array.from(map.values()).sort((a, b) => {
           const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
           const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
           return timeB - timeA;
@@ -4274,9 +4883,9 @@ export function subscribeToWithdrawalsFromFirestore(
         // fallback to REST sync so Admin still receives all pending withdrawals.
         if (!isUserScopedRequest && !isDisposed && !fallbackTimer) {
           const syncAll = () => {
-            fetchAllWithdrawalsViaRestFallback().then((list) => {
-              if (!isDisposed && list.length > 0) {
-                callback(list);
+            fetchAllWithdrawalsViaRestFallback().then((res) => {
+              if (!isDisposed && res.ok) {
+                callback(res.withdrawals);
               }
             }).catch(() => {});
           };
@@ -4293,14 +4902,16 @@ export function subscribeToWithdrawalsFromFirestore(
     }
   };
 
-  attachListeners();
-
   let unsubAuth: (() => void) | null = null;
-  try {
-    unsubAuth = onAuthStateChanged(auth, () => {
-      attachListeners();
-    });
-  } catch {}
+  waitForFirebaseAuthReady().then(() => {
+    if (isDisposed) return;
+    attachListeners();
+    try {
+      unsubAuth = onAuthStateChanged(auth, () => {
+        attachListeners();
+      });
+    } catch {}
+  });
 
   return () => {
     isDisposed = true;

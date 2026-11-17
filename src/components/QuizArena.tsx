@@ -181,27 +181,27 @@ export const QuizArena: React.FC<QuizArenaProps> = ({
   const markedCount = markedForReview.length;
 
   // Fallback prize & pool if not passed
-  const prize = todayPrize || {
-    id: 'p-1',
-    title: 'Noise ColorFit Pro 5 AMOLED Smartwatch',
-    brand: 'Noise',
-    category: 'Smartwatches',
-    imageUrl: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=600&auto=format&fit=crop&q=80',
-    retailValue: 4999,
-    mrp: 7999,
-    features: ['1.43" AMOLED Display', 'Bluetooth Calling', 'IP68 Water Resistance'],
-    deliveryPartner: 'Amazon' as const,
-    estimatedDeliveryDays: '2-3 Business Days'
+  const prize = todayPrize && todayPrize.title ? todayPrize : {
+    id: '',
+    title: 'QuizKart Tournament',
+    brand: 'QuizKart',
+    category: 'Tournament',
+    imageUrl: '',
+    retailValue: 0,
+    mrp: 0,
+    features: [],
+    deliveryPartner: 'QuizKart',
+    estimatedDeliveryDays: ''
   };
 
   const pool = poolData || {
-    entryFee: 100,
-    totalPoolAmount: 10000,
-    productPrizeValue: 5000,
-    runnerUpPoolValue: 4500,
-    platformFeeValue: 500,
-    activeParticipants: 68,
-    targetParticipants: 100,
+    entryFee: 0,
+    totalPoolAmount: 0,
+    productPrizeValue: 0,
+    runnerUpPoolValue: 0,
+    platformFeeValue: 0,
+    activeParticipants: 0,
+    targetParticipants: 0,
     productSharePercentage: 50,
     runnerUpCashbackPercentage: 45,
     platformFeePercentage: 5

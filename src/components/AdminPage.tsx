@@ -137,9 +137,10 @@ import {
   fetchContestEntriesFromFirestore,
   subscribeToContestEntriesFromFirestore,
   fetchAllContestEntriesFromFirestore,
-  fetchDepositsFromFirestore,
+  fetchDepositsWithStatusFromFirestore,
   subscribeToDepositsFromFirestore,
-  fetchWithdrawalsFromFirestore,
+  fetchWithdrawalsWithStatusFromFirestore,
+  subscribeToWithdrawalsFromFirestore,
   fetchUserProfile
 } from '../firebase';
 import { contestBackend, mapEntriesToLeaderboard } from '../backend/contestEngine';
@@ -151,6 +152,7 @@ import {
   formatTicketId,
   getCurrentFormattedTimestamp,
   addDeletedDepositId,
+  getDeletedDepositIds,
   addDeletedWithdrawalId,
   getDeletedWithdrawalIds,
   isTicketDeleted,
@@ -733,6 +735,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [adminCloudAuthError, setAdminCloudAuthError] = useState<string | null>(null);
   const [isAuthorizingAdminGoogle, setIsAuthorizingAdminGoogle] = useState<boolean>(false);
   const hasCloudUsersSnapshotRef = useRef<boolean>(false);
+  const hasCloudDepositsRef = useRef<boolean>(false);
+  const hasCloudWithdrawalsRef = useRef<boolean>(false);
   const attemptedBackfillUidsRef = useRef<Set<string>>(new Set());
 
   const ensureBackfillIdsAndCounter = async (cloudUsers: UserProfile[]) => {
@@ -889,6 +893,20 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         setRegisteredUsersList(deduped);
         safeSetLocalStorageJson('quizkart_registered_users', compactRegisteredUsersForLocalCache(deduped));
         ensureBackfillIdsAndCounter(deduped).catch(() => {});
+        fetchDepositsWithStatusFromFirestore()
+          .then((depRes) => {
+            if (depRes && depRes.ok) {
+              applyAuthoritativeDepositsSnapshot(depRes.deposits || []);
+            }
+          })
+          .catch(() => {});
+        fetchWithdrawalsWithStatusFromFirestore()
+          .then((wthRes) => {
+            if (wthRes && wthRes.ok) {
+              applyAuthoritativeWithdrawalsSnapshot(wthRes.withdrawals || []);
+            }
+          })
+          .catch(() => {});
         setStatusMessage({
           text: persistenceInfo.warning
             ? `Admin Google Sync authorized (${result.user?.email || AUTHORIZED_ADMIN_EMAIL}). Note: ${persistenceInfo.warning}`
@@ -2024,6 +2042,8 @@ RULES:
   // -------------------------------------------------------------
   // TAB 3: DEPOSITS & VERIFICATION STATE
   // -------------------------------------------------------------
+  const processingDepositIdsRef = useRef<Set<string>>(new Set());
+
   const [deposits, setDeposits] = useState<DepositRequest[]>(() => {
     const raw = (propDeposits && propDeposits.length > 0) ? propDeposits : (() => {
       try {
@@ -2036,72 +2056,158 @@ RULES:
     const map = new Map<string, DepositRequest>();
     (raw || []).forEach((d) => {
       if (d && d.id) {
-        const normId = formatDepositId(d.id);
-        if (!map.has(normId)) {
-          map.set(normId, {
+        const dedupKey = d.firestoreDocId || d.id;
+        if (!map.has(dedupKey)) {
+          map.set(dedupKey, {
             ...d,
-            id: normId,
+            id: d.id,
+            status: String(d.status || 'pending').trim().toLowerCase() as DepositRequest['status'],
             timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
           });
         }
       }
     });
-    return Array.from(map.values());
+    return Array.from(map.values()).sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
   });
 
+  const latestDepositsRef = useRef<DepositRequest[]>(deposits);
+  latestDepositsRef.current = deposits;
+
+  const applyAuthoritativeDepositsSnapshot = (cloudList: DepositRequest[]) => {
+    hasCloudDepositsRef.current = true;
+    const deletedDeposits = getDeletedDepositIds();
+    const prevList = latestDepositsRef.current || [];
+    const prevById = new Map<string, DepositRequest>();
+    prevList.forEach((d) => {
+      if (d && d.id) {
+        prevById.set(d.id, d);
+        prevById.set(formatDepositId(d.id), d);
+      }
+    });
+
+    const map = new Map<string, DepositRequest>();
+    const coveredIds = new Set<string>();
+    (cloudList || []).forEach((d) => {
+      if (!d || !d.id) return;
+      const normId = formatDepositId(d.id);
+      const dedupKey = d.firestoreDocId || d.id;
+      const cloudStatus = String(d.status || 'pending').trim().toLowerCase() as DepositRequest['status'];
+      const isDeletedResolved =
+        cloudStatus !== 'pending' &&
+        (deletedDeposits.includes(d.id) || deletedDeposits.includes(normId) || Boolean((d as any).adminHidden));
+      if (isDeletedResolved) return;
+
+      const existingLocal = prevById.get(d.id) || prevById.get(normId);
+      const isInFlightAdminAction = processingDepositIdsRef.current.has(d.id) || processingDepositIdsRef.current.has(normId);
+      const resolvedStatus = isInFlightAdminAction && existingLocal ? existingLocal.status : cloudStatus;
+
+      coveredIds.add(d.id);
+      coveredIds.add(normId);
+      map.set(dedupKey, {
+        ...d,
+        id: d.id,
+        status: resolvedStatus,
+        timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
+      });
+    });
+
+    prevList.forEach((d) => {
+      if (!d || !d.id) return;
+      const normId = formatDepositId(d.id);
+      const dedupKey = d.firestoreDocId || d.id;
+      if (map.has(dedupKey) || coveredIds.has(d.id) || coveredIds.has(normId)) return;
+      const isInFlightAdminAction = processingDepositIdsRef.current.has(d.id) || processingDepositIdsRef.current.has(normId);
+      if (isInFlightAdminAction) {
+        coveredIds.add(d.id);
+        coveredIds.add(normId);
+        map.set(dedupKey, d);
+      }
+    });
+
+    const merged = Array.from(map.values()).sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
+
+    latestDepositsRef.current = merged;
+    setDeposits(merged);
+    if (onUpdateDeposits) {
+      onUpdateDeposits(merged);
+    }
+    safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
+  };
+
   useEffect(() => {
-    if (propDeposits) {
-      const map = new Map<string, DepositRequest>();
-      propDeposits.forEach((d) => {
+    if (!propDeposits) return;
+    const deletedDeposits = getDeletedDepositIds();
+    setDeposits((prev) => {
+      const prevById = new Map<string, DepositRequest>();
+      (prev || []).forEach((d) => {
         if (d && d.id) {
-          const normId = formatDepositId(d.id);
-          if (!map.has(normId)) {
-            map.set(normId, {
-              ...d,
-              id: normId,
-              timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
-            });
-          }
+          prevById.set(d.id, d);
+          prevById.set(formatDepositId(d.id), d);
         }
       });
-      setDeposits(Array.from(map.values()));
-    }
+
+      const map = new Map<string, DepositRequest>();
+      propDeposits.forEach((d) => {
+        if (!d || !d.id) return;
+        const normId = formatDepositId(d.id);
+        const dedupKey = d.firestoreDocId || d.id;
+        const normalizedStatus = String(d.status || 'pending').trim().toLowerCase() as DepositRequest['status'];
+        const isDeletedResolved =
+          normalizedStatus !== 'pending' &&
+          (deletedDeposits.includes(d.id) || deletedDeposits.includes(normId) || Boolean((d as any).adminHidden));
+        if (hasCloudDepositsRef.current && isDeletedResolved) return;
+
+        const existingLocal = prevById.get(d.id) || prevById.get(normId);
+        const isInFlightAdminAction = processingDepositIdsRef.current.has(d.id) || processingDepositIdsRef.current.has(normId);
+        const resolvedStatus = isInFlightAdminAction && existingLocal ? existingLocal.status : normalizedStatus;
+        if (!map.has(dedupKey)) {
+          map.set(dedupKey, {
+            ...d,
+            id: d.id,
+            status: resolvedStatus,
+            timestamp: formatDepositTimestamp(d.timestamp, d.createdAt, d.date)
+          });
+        }
+      });
+      return Array.from(map.values()).sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+        return timeB - timeA;
+      });
+    });
   }, [propDeposits]);
 
   // Authoritative real-time Firestore synchronization for Admin Ledger
   useEffect(() => {
+    let isActive = true;
     let unsubscribe: (() => void) | undefined;
-    fetchDepositsFromFirestore()
-      .then((cloudList) => {
-        if (cloudList && cloudList.length > 0) {
-          setDeposits((prev) => {
-            const map = new Map<string, DepositRequest>();
-            (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
-            cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
-            const merged = Array.from(map.values());
-            safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
-            return merged;
-          });
+
+    fetchDepositsWithStatusFromFirestore()
+      .then((res) => {
+        if (isActive && res && res.ok) {
+          applyAuthoritativeDepositsSnapshot(res.deposits || []);
         }
       })
       .catch(() => {});
 
     try {
       unsubscribe = subscribeToDepositsFromFirestore((cloudList) => {
-        if (cloudList && cloudList.length > 0) {
-          setDeposits((prev) => {
-            const map = new Map<string, DepositRequest>();
-            (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
-            cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
-            const merged = Array.from(map.values());
-            safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
-            return merged;
-          });
+        if (isActive && cloudList) {
+          applyAuthoritativeDepositsSnapshot(cloudList);
         }
       });
     } catch {}
 
     return () => {
+      isActive = false;
       if (unsubscribe) unsubscribe();
     };
   }, []);
@@ -2118,14 +2224,13 @@ RULES:
   }, [depositFilter, depositSearch, depositDateFilter]);
 
   const saveDeposits = (newDeposits: DepositRequest[]) => {
+    latestDepositsRef.current = newDeposits;
     setDeposits(newDeposits);
     if (onUpdateDeposits) {
       onUpdateDeposits(newDeposits);
     }
     safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(newDeposits));
   };
-
-  const processingDepositIdsRef = useRef<Set<string>>(new Set());
 
   const syncUserDepositPermanentLogs = (
     targetEmail: string,
@@ -2486,6 +2591,8 @@ RULES:
   // -------------------------------------------------------------
   // TAB: WITHDRAWAL APPROVALS STATE & HANDLERS
   // -------------------------------------------------------------
+  const processingWithdrawalIdsRef = useRef<Set<string>>(new Set());
+
   const [withdrawalsList, setWithdrawalsList] = useState<WithdrawalRequest[]>(() => {
     const raw = (propWithdrawals && propWithdrawals.length > 0) ? propWithdrawals : (() => {
       try {
@@ -2498,10 +2605,12 @@ RULES:
     const map = new Map<string, WithdrawalRequest>();
     (raw || []).forEach((w) => {
       if (w && w.id) {
-        if (!map.has(w.id)) {
-          map.set(w.id, {
+        const dedupKey = w.firestoreDocId || w.id;
+        if (!map.has(dedupKey)) {
+          map.set(dedupKey, {
             ...w,
             id: w.id,
+            status: String(w.status || 'pending').trim().toLowerCase() as WithdrawalRequest['status'],
             timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
           });
         }
@@ -2514,35 +2623,142 @@ RULES:
     });
   });
 
+  const latestWithdrawalsRef = useRef<WithdrawalRequest[]>(withdrawalsList);
+  latestWithdrawalsRef.current = withdrawalsList;
+
+  const applyAuthoritativeWithdrawalsSnapshot = (cloudWithdrawals: WithdrawalRequest[]) => {
+    hasCloudWithdrawalsRef.current = true;
+    const deletedWithdrawals = getDeletedWithdrawalIds();
+    const prevList = latestWithdrawalsRef.current || [];
+    const prevById = new Map<string, WithdrawalRequest>();
+    prevList.forEach((w) => {
+      if (w && w.id) {
+        prevById.set(w.id, w);
+        prevById.set(formatWithdrawalId(w.id), w);
+      }
+    });
+
+    const map = new Map<string, WithdrawalRequest>();
+    const coveredIds = new Set<string>();
+    (cloudWithdrawals || []).forEach((w) => {
+      if (!w || !w.id) return;
+      const normId = formatWithdrawalId(w.id);
+      const dedupKey = w.firestoreDocId || w.id;
+      const cloudStatus = String(w.status || 'pending').trim().toLowerCase() as WithdrawalRequest['status'];
+      const isDeletedResolved =
+        cloudStatus !== 'pending' &&
+        (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+      if (isDeletedResolved) return;
+
+      const existingLocal = prevById.get(w.id) || prevById.get(normId);
+      const isInFlightAdminAction = processingWithdrawalIdsRef.current.has(w.id) || processingWithdrawalIdsRef.current.has(normId);
+      const resolvedStatus = isInFlightAdminAction && existingLocal ? existingLocal.status : cloudStatus;
+
+      coveredIds.add(w.id);
+      coveredIds.add(normId);
+      map.set(dedupKey, {
+        ...w,
+        id: w.id,
+        status: resolvedStatus,
+        timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
+      });
+    });
+
+    prevList.forEach((w) => {
+      if (!w || !w.id) return;
+      const normId = formatWithdrawalId(w.id);
+      const dedupKey = w.firestoreDocId || w.id;
+      if (map.has(dedupKey) || coveredIds.has(w.id) || coveredIds.has(normId)) return;
+      const isInFlightAdminAction = processingWithdrawalIdsRef.current.has(w.id) || processingWithdrawalIdsRef.current.has(normId);
+      if (isInFlightAdminAction) {
+        coveredIds.add(w.id);
+        coveredIds.add(normId);
+        map.set(dedupKey, w);
+      }
+    });
+
+    const merged = Array.from(map.values()).sort((a, b) => {
+      const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
+      const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
+      return timeB - timeA;
+    });
+
+    latestWithdrawalsRef.current = merged;
+    setWithdrawalsList(merged);
+    if (onUpdateWithdrawals) {
+      onUpdateWithdrawals(merged);
+    }
+    try {
+      localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(merged));
+    } catch {}
+  };
+
   useEffect(() => {
     if (!propWithdrawals) return;
     const deletedWithdrawals = getDeletedWithdrawalIds();
     setWithdrawalsList((prev) => {
+      const prevById = new Map<string, WithdrawalRequest>();
+      (prev || []).forEach((w) => {
+        if (w && w.id) {
+          prevById.set(w.id, w);
+          prevById.set(formatWithdrawalId(w.id), w);
+        }
+      });
+
       const map = new Map<string, WithdrawalRequest>();
+      const coveredIds = new Set<string>();
       const mergeIntoMap = (w: WithdrawalRequest, preferNew: boolean) => {
         if (!w || !w.id) return;
         const normId = formatWithdrawalId(w.id);
-        const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
+        const dedupKey = w.firestoreDocId || w.id;
+        const normalizedStatus = String(w.status || 'pending').trim().toLowerCase() as WithdrawalRequest['status'];
+        const isDeletedResolved =
+          normalizedStatus !== 'pending' &&
+          (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
         if (isDeletedResolved) return;
-        const existing = map.get(w.id);
+        const existing = map.get(dedupKey) || prevById.get(w.id) || prevById.get(normId);
+        const isInFlightAdminAction = processingWithdrawalIdsRef.current.has(w.id) || processingWithdrawalIdsRef.current.has(normId);
         const normalizedItem: WithdrawalRequest = {
           ...w,
           id: w.id,
+          status: normalizedStatus,
           timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
         };
+        coveredIds.add(w.id);
+        coveredIds.add(normId);
         if (!existing) {
-          map.set(w.id, normalizedItem);
+          map.set(dedupKey, normalizedItem);
           return;
         }
         if (preferNew) {
-          const resolvedStatus = (existing.status && existing.status !== 'pending' && normalizedItem.status === 'pending')
+          const resolvedStatus = isInFlightAdminAction
             ? existing.status
-            : (normalizedItem.status || existing.status || 'pending');
-          map.set(w.id, { ...existing, ...normalizedItem, status: resolvedStatus });
+            : (existing.status && existing.status !== 'pending' && normalizedItem.status === 'pending')
+              ? existing.status
+              : (normalizedItem.status || existing.status || 'pending');
+          map.set(dedupKey, { ...existing, ...normalizedItem, status: resolvedStatus });
+        } else if (!map.has(dedupKey)) {
+          map.set(dedupKey, { ...normalizedItem, status: existing.status || normalizedStatus });
         }
       };
-      (prev || []).forEach((w) => mergeIntoMap(w, false));
+
       propWithdrawals.forEach((w) => mergeIntoMap(w, true));
+      if (!hasCloudWithdrawalsRef.current) {
+        (prev || []).forEach((w) => {
+          const normId = w?.id ? formatWithdrawalId(w.id) : '';
+          if (w && w.id && !coveredIds.has(w.id) && !coveredIds.has(normId)) {
+            mergeIntoMap(w, false);
+          }
+        });
+      } else {
+        (prev || []).forEach((w) => {
+          const normId = w?.id ? formatWithdrawalId(w.id) : '';
+          if (w && w.id && !coveredIds.has(w.id) && !coveredIds.has(normId) && (processingWithdrawalIdsRef.current.has(w.id) || processingWithdrawalIdsRef.current.has(normId))) {
+            mergeIntoMap(w, false);
+          }
+        });
+      }
+
       return Array.from(map.values()).sort((a, b) => {
         const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
         const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
@@ -2552,56 +2768,33 @@ RULES:
   }, [propWithdrawals]);
 
   useEffect(() => {
-    const mergeCloudWithdrawals = (cloudWithdrawals: WithdrawalRequest[]) => {
-      if (!cloudWithdrawals || cloudWithdrawals.length === 0) return;
-      const deletedWithdrawals = getDeletedWithdrawalIds();
-      setWithdrawalsList((prev) => {
-        const map = new Map<string, WithdrawalRequest>();
-        cloudWithdrawals.forEach((w) => {
-          if (w && w.id) {
-            const normId = formatWithdrawalId(w.id);
-            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
-            if (!isDeletedResolved) {
-              map.set(w.id, {
-                ...w,
-                id: w.id,
-                timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-              });
-            }
-          }
-        });
-        prev.forEach((w) => {
-          if (w && w.id) {
-            const normId = formatWithdrawalId(w.id);
-            const isDeletedResolved = w.status !== 'pending' && (deletedWithdrawals.includes(w.id) || deletedWithdrawals.includes(normId) || Boolean(w.adminHidden));
-            if (!isDeletedResolved && !map.has(w.id)) {
-              map.set(w.id, {
-                ...w,
-                id: w.id,
-                timestamp: formatDepositTimestamp(w.timestamp, w.createdAt, w.date)
-              });
-            }
-          }
-        });
-        const merged = Array.from(map.values()).sort((a, b) => {
-          const timeA = new Date(a.createdAt || a.timestamp || 0).getTime();
-          const timeB = new Date(b.createdAt || b.timestamp || 0).getTime();
-          return timeB - timeA;
-        });
-        try {
-          localStorage.setItem('quizkart_admin_withdrawals', JSON.stringify(merged));
-        } catch {}
-        return merged;
-      });
-    };
+    let isActive = true;
+    let unsubWithdrawals: (() => void) | undefined;
 
-    // Single authoritative mount refresh; real-time updates flow via App.tsx's single listener
-    fetchWithdrawalsFromFirestore().then(mergeCloudWithdrawals).catch(() => {});
+    fetchWithdrawalsWithStatusFromFirestore()
+      .then((res) => {
+        if (isActive && res && res.ok) {
+          applyAuthoritativeWithdrawalsSnapshot(res.withdrawals || []);
+        }
+      })
+      .catch(() => {});
+
+    try {
+      unsubWithdrawals = subscribeToWithdrawalsFromFirestore((cloudList) => {
+        if (isActive && cloudList) {
+          applyAuthoritativeWithdrawalsSnapshot(cloudList);
+        }
+      });
+    } catch {}
+
+    return () => {
+      isActive = false;
+      if (unsubWithdrawals) unsubWithdrawals();
+    };
   }, []);
 
-  const processingWithdrawalIdsRef = useRef<Set<string>>(new Set());
-
   const saveWithdrawals = (newWithdrawals: WithdrawalRequest[]) => {
+    latestWithdrawalsRef.current = newWithdrawals;
     setWithdrawalsList(newWithdrawals);
     if (onUpdateWithdrawals) {
       onUpdateWithdrawals(newWithdrawals);
@@ -3207,20 +3400,20 @@ RULES:
         if (lSaved) onUpdateLeaderboard(JSON.parse(lSaved));
         const poolSaved = localStorage.getItem('quizkart_pool');
         if (poolSaved) onUpdatePoolData(JSON.parse(poolSaved));
-        const depSaved = localStorage.getItem('quizkart_admin_deposits');
-        if (depSaved) setDeposits(JSON.parse(depSaved));
-        fetchDepositsFromFirestore().then((cloudList) => {
-          if (cloudList && cloudList.length > 0) {
-            setDeposits((prev) => {
-              const map = new Map<string, DepositRequest>();
-              (prev || []).forEach(d => { if (d && d.id) map.set(d.id, d); });
-              cloudList.forEach(d => { if (d && d.id) map.set(d.id, d); });
-              const merged = Array.from(map.values());
-              safeSetLocalStorageJson('quizkart_admin_deposits', compactDepositsForLocalCache(merged));
-              return merged;
-            });
-          }
-        }).catch(() => {});
+        fetchDepositsWithStatusFromFirestore()
+          .then((depRes) => {
+            if (depRes && depRes.ok) {
+              applyAuthoritativeDepositsSnapshot(depRes.deposits || []);
+            }
+          })
+          .catch(() => {});
+        fetchWithdrawalsWithStatusFromFirestore()
+          .then((wthRes) => {
+            if (wthRes && wthRes.ok) {
+              applyAuthoritativeWithdrawalsSnapshot(wthRes.withdrawals || []);
+            }
+          })
+          .catch(() => {});
         const timerSaved = localStorage.getItem('quizkart_global_quiz_timer');
         if (timerSaved) setContestTimerSeconds(parseInt(timerSaved, 10));
         const secSaved = localStorage.getItem('quizkart_security_logs');
@@ -3269,7 +3462,8 @@ RULES:
   // Filtered Deposits for Tab 3
   const filteredDeposits = (deposits || []).filter((d) => {
     if (!d || !d.id) return false;
-    if (depositFilter !== 'all' && d.status !== depositFilter) return false;
+    const normalizedStatus = String(d.status || 'pending').trim().toLowerCase();
+    if (depositFilter !== 'all' && normalizedStatus !== depositFilter) return false;
 
     if (depositSearch.trim()) {
       const q = depositSearch.trim().toLowerCase();
@@ -5857,7 +6051,7 @@ RULES:
                     className="px-3 py-0.5 rounded-full text-xs font-bold text-white shadow-xs inline-flex items-center"
                     style={{ background: 'linear-gradient(135deg, #2563eb 0%, #3b82f6 50%, #059669 100%)' }}
                   >
-                    {(deposits || []).filter(d => d && d.status === 'pending').length} Pending
+                    {(deposits || []).filter(d => d && String(d.status || 'pending').trim().toLowerCase() === 'pending').length} Pending
                   </span>
                 </div>
 

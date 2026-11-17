@@ -1,21 +1,16 @@
 import { Question, DailyPrizeItem, LeaderboardEntry, UserProfile, PoolEconomics, BannerSlide, AnnouncementSettings, DepositRequest, WithdrawalRequest } from '../types';
 
 export const TODAY_PRIZE: DailyPrizeItem = {
-  id: 'prize-live-01',
-  title: 'QuizKart Championship Tournament',
-  brand: 'QuizKart',
-  mrp: 5000,
-  retailValue: 5000,
-  category: 'Live Tournament',
-  imageUrl: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=800&auto=format&fit=crop&q=80',
-  features: [
-    '100% Skill-based Arena',
-    'Certified Speed & Accuracy Scoring',
-    'Instant Leaderboard Settlement',
-    'Verified One-Click Dispatch'
-  ],
-  deliveryPartner: 'Amazon',
-  estimatedDeliveryDays: '2 - 3 Days'
+  id: '',
+  title: '',
+  brand: '',
+  mrp: 0,
+  retailValue: 0,
+  category: '',
+  imageUrl: '',
+  features: [],
+  deliveryPartner: '',
+  estimatedDeliveryDays: ''
 };
 
 export const UPCOMING_PRIZES: DailyPrizeItem[] = [];
@@ -339,16 +334,16 @@ export function isConfirmedFakeDisplayUser(u?: Partial<UserProfile> | null): boo
 export const DEFAULT_REGISTERED_USERS: UserProfile[] = [];
 
 export const INITIAL_POOL_ECONOMICS: PoolEconomics = {
-  entryFee: 100,
-  activeParticipants: 41,
-  targetParticipants: 50,
-  totalPoolAmount: 4100,
+  entryFee: 0,
+  activeParticipants: 0,
+  targetParticipants: 0,
+  totalPoolAmount: 0,
   productSharePercentage: 50,
   runnerUpCashbackPercentage: 45,
   platformFeePercentage: 5,
-  productPrizeValue: 2050, // 50%
-  runnerUpPoolValue: 1845,  // 45%
-  platformFeeValue: 205     // 5%
+  productPrizeValue: 0,
+  runnerUpPoolValue: 0,
+  platformFeeValue: 0
 };
 
 export const DEFAULT_ANNOUNCEMENT_SETTINGS: AnnouncementSettings = {

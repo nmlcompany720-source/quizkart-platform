@@ -153,6 +153,8 @@ export interface ActiveContest {
   activatedAt?: string;   // Timestamp when contest went LIVE
   randomBasePercent?: number; // Single random base (25% - 45%) generated 30s after LIVE
   autoPilotRecurring?: boolean;
+  isDeleted?: boolean;
+  deletedAt?: string;
   questionIds: number[];
   createdAt: string;
 }

@@ -318,11 +318,6 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
     currentUserHeroEntry.rank >= 6
   );
 
-  // Dynamic boosted higher participant count for public front-end card urgency
-  const boostedParticipants = useMemo(() => {
-    const base = poolData.activeParticipants || 41;
-    return base >= 30 ? base : Math.min(poolData.targetParticipants - 9, 41);
-  }, [poolData.activeParticipants, poolData.targetParticipants]);
 
   // Detect whether a valid real admin tournament exists and is actively running
   const realTournament = useMemo(() => {
@@ -438,17 +433,19 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
   const progressPercent = livePoolMetrics.progressPercent;
   const isLivePoolFull = livePoolMetrics.isPoolFull || effectiveContest?.status === 'full';
 
-  const isCashTournament = effectiveContest?.type === 'cash' || todayPrize.category?.toLowerCase().includes('cash');
+  const isCashTournament = Boolean(
+    effectiveContest && (effectiveContest.type === 'cash' || todayPrize.category?.toLowerCase().includes('cash'))
+  );
 
   // Prize headline value
   const prizeDisplayValue = effectiveContest?.type === 'cash' && effectiveContest.cashConfig
     ? `₹${effectiveContest.cashConfig.prizePool.toLocaleString('en-IN')}`
-    : `₹${todayPrize.retailValue.toLocaleString('en-IN')}`;
+    : (effectiveContest && todayPrize.retailValue > 0 ? `₹${todayPrize.retailValue.toLocaleString('en-IN')}` : '—');
 
-  // Dynamic Entry Fee: Strictly ₹10 in Upcoming / Inactive state, dynamic active fee when live
-  const currentEntryFee = (isUpcoming || !hasRealActiveContest)
-    ? 10
-    : (effectiveContest?.entryFee || poolData.entryFee || 100);
+  // Dynamic Entry Fee: Show actual contest entry fee when a contest exists, otherwise ₹0
+  const currentEntryFee = effectiveContest
+    ? (effectiveContest.entryFee || poolData.entryFee || 0)
+    : 0;
   const upcomingContests = useMemo(() => {
     let deletedList: string[] = [];
     try {
@@ -902,7 +899,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   className="rounded-xl border p-3 text-center transition-all shadow-xs flex flex-col justify-center items-center"
                   style={{ backgroundColor: '#FFFFFF', borderColor: '#E0E7FF' }}
                 >
-                  <div className="text-base sm:text-xl font-black text-slate-900">{dynamicQuestionsCount}</div>
+                  <div className="text-base sm:text-xl font-black text-slate-900">{hasRealActiveContest ? dynamicQuestionsCount : '—'}</div>
                   <div className="text-[10px] text-slate-600 font-medium">Questions</div>
                 </div>
 
@@ -912,7 +909,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   style={{ backgroundColor: '#FFFFFF', borderColor: '#CFFAFE' }}
                 >
                   <div className="text-base sm:text-xl font-black text-slate-900">
-                    <span className="text-emerald-600 font-black">₹{currentEntryFee}</span>
+                    <span className="text-emerald-600 font-black">{hasRealActiveContest ? `₹${currentEntryFee}` : '—'}</span>
                   </div>
                   <div className="text-[10px] text-slate-600 font-medium">Entry Fee</div>
                 </div>
@@ -922,7 +919,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
                   className="rounded-xl border p-3 text-center transition-all shadow-xs flex flex-col justify-center items-center"
                   style={{ backgroundColor: '#FFFFFF', borderColor: '#E0E7FF' }}
                 >
-                  <div className="text-base sm:text-xl font-black text-slate-900">{dynamicMinutesCount}</div>
+                  <div className="text-base sm:text-xl font-black text-slate-900">{hasRealActiveContest ? dynamicMinutesCount : '—'}</div>
                   <div className="text-[10px] text-slate-600 font-medium">Minutes</div>
                 </div>
               </div>
@@ -1127,7 +1124,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               1
             </span>
             <div>
-              <h4 className="text-xs font-bold text-slate-900">Enter with ₹{currentEntryFee}</h4>
+              <h4 className="text-xs font-bold text-slate-900">{hasRealActiveContest ? `Enter with ₹${currentEntryFee}` : 'Join Live Contest'}</h4>
             </div>
           </div>
 
@@ -1142,7 +1139,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
               2
             </span>
             <div>
-              <h4 className="text-xs font-bold text-slate-900">Solve {dynamicQuestionsCount} Questions</h4>
+              <h4 className="text-xs font-bold text-slate-900">{hasRealActiveContest ? `Solve ${dynamicQuestionsCount} Questions` : 'Solve Contest Questions'}</h4>
             </div>
           </div>
 
