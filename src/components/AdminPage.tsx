@@ -135,6 +135,7 @@ import {
   removeQuestionFromFirestore,
   extractNumericUserNumber,
   fetchContestEntriesFromFirestore,
+  fetchContestEntriesWithStatusFromFirestore,
   subscribeToContestEntriesFromFirestore,
   fetchAllContestEntriesFromFirestore,
   fetchDepositsWithStatusFromFirestore,
@@ -3396,8 +3397,31 @@ RULES:
         }).catch(() => {});
         const pSaved = localStorage.getItem('quizkart_today_prize');
         if (pSaved) onUpdatePrize(JSON.parse(pSaved));
-        const lSaved = localStorage.getItem('quizkart_leaderboard');
-        if (lSaved) onUpdateLeaderboard(JSON.parse(lSaved));
+        const refreshContestId = selectedLedgerContestId || activeContest?.id;
+        if (refreshContestId) {
+          fetchContestEntriesWithStatusFromFirestore(refreshContestId)
+            .then((entryRes) => {
+              if (entryRes.ok) {
+                contestBackend.loadContestEntries(refreshContestId, entryRes.entries || []);
+                const activeList = contestBackend.getActiveEntries(refreshContestId);
+                const targetC = contests.find(c => c.id === refreshContestId) || activeContest;
+                const mapped = activeList.length > 0
+                  ? mapEntriesToLeaderboard(
+                      activeList,
+                      undefined,
+                      targetC?.type === 'product',
+                      todayPrize?.brand,
+                      todayPrize?.retailValue
+                    )
+                  : [];
+                setLedgerLeaderboard(mapped);
+                if (!selectedLedgerContestId || selectedLedgerContestId === activeContest?.id) {
+                  onUpdateLeaderboard(mapped);
+                }
+              }
+            })
+            .catch(() => {});
+        }
         const poolSaved = localStorage.getItem('quizkart_pool');
         if (poolSaved) onUpdatePoolData(JSON.parse(poolSaved));
         fetchDepositsWithStatusFromFirestore()
@@ -3506,34 +3530,115 @@ RULES:
   // Only resolved (approved or rejected) deposits can be deleted
   const resolvableDeposits = (filteredDeposits || []).filter(d => d && d.status !== 'pending');
 
+  // Selected contest for Tab 4 Winner Payout Ledger (supports viewing live, scheduled, and completed contests)
+  const [selectedLedgerContestId, setSelectedLedgerContestId] = useState<string>(() => activeContest?.id || contests?.[0]?.id || '');
+  const [ledgerLeaderboard, setLedgerLeaderboard] = useState<LeaderboardEntry[]>(leaderboard || []);
+  const [isLedgerLoading, setIsLedgerLoading] = useState<boolean>(false);
+  const [ledgerSyncError, setLedgerSyncError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!selectedLedgerContestId || !contests.some(c => c.id === selectedLedgerContestId)) {
+      const nextId = activeContest?.id || contests?.[0]?.id || '';
+      if (nextId && nextId !== selectedLedgerContestId) {
+        setSelectedLedgerContestId(nextId);
+      }
+    }
+  }, [activeContest?.id, contests, selectedLedgerContestId]);
+
+  const selectedLedgerContest: ActiveContest | null =
+    contests.find(c => c.id === selectedLedgerContestId) || activeContest || contests?.[0] || null;
+
+  const enrichLeaderboardWithRegisteredUsers = (mapped: LeaderboardEntry[], rawEntries: any[]): LeaderboardEntry[] => {
+    return mapped.map(item => {
+      const raw = rawEntries.find(r => r.entryId === item.entryId && (!item.ownerUid || r.ownerUid === item.ownerUid));
+      const matchedUser = registeredUsersList.find(u =>
+        (item.ownerUid && (u.uid === item.ownerUid || u.id === item.ownerUid || u.customUserId === item.ownerUid)) ||
+        (raw?.userEmail && u.email && u.email.trim().toLowerCase() === String(raw.userEmail).trim().toLowerCase())
+      );
+      const cleanEntryName = (item.userName || '').trim();
+      const resolvedName = cleanEntryName && cleanEntryName.toUpperCase() !== 'USER' && cleanEntryName !== 'Contestant'
+        ? cleanEntryName
+        : (matchedUser?.name?.trim() || cleanEntryName || 'Contestant');
+      const resolvedAvatar = item.avatar || matchedUser?.avatarUrl || '';
+      return {
+        ...item,
+        userName: resolvedName,
+        avatar: resolvedAvatar
+      };
+    });
+  };
+
   // Hydrate persistent Firebase contest entries into Tab 4 Winner Payout Ledger
   useEffect(() => {
-    const contestId = activeContest?.id;
-    if (!contestId) return;
+    const contestId = selectedLedgerContest?.id;
+    if (!contestId) {
+      setLedgerLeaderboard([]);
+      setIsLedgerLoading(false);
+      setLedgerSyncError(null);
+      return;
+    }
+
+    let isEffectActive = true;
+    setIsLedgerLoading(true);
+    setLedgerSyncError(null);
 
     const handleEntries = (cloudEntries: any[]) => {
+      if (!isEffectActive) return;
+      setIsLedgerLoading(false);
+      setLedgerSyncError(null);
       contestBackend.loadContestEntries(contestId, cloudEntries || []);
       const activeList = contestBackend.getActiveEntries(contestId);
-      const mapped = activeList.length > 0
+      const mappedRaw = activeList.length > 0
         ? mapEntriesToLeaderboard(
             activeList,
             undefined,
-            activeContest?.type === 'product',
+            selectedLedgerContest?.type === 'product',
             todayPrize?.brand,
             todayPrize?.retailValue
           )
         : [];
-      onUpdateLeaderboard(mapped);
+      const enriched = enrichLeaderboardWithRegisteredUsers(mappedRaw, activeList);
+      setLedgerLeaderboard(enriched);
+      if (contestId === activeContest?.id) {
+        onUpdateLeaderboard(enriched);
+      }
     };
 
-    fetchContestEntriesFromFirestore(contestId).then(handleEntries).catch(() => {});
-    const unsub = subscribeToContestEntriesFromFirestore(contestId, handleEntries);
-    return () => unsub();
-  }, [activeContest?.id]);
+    fetchContestEntriesWithStatusFromFirestore(contestId)
+      .then((res) => {
+        if (!isEffectActive) return;
+        if (res.ok) {
+          handleEntries(res.entries || []);
+        } else {
+          setIsLedgerLoading(false);
+          setLedgerSyncError(res.errorMessage || 'Failed to load contest entries');
+        }
+      })
+      .catch(() => {
+        if (isEffectActive) setIsLedgerLoading(false);
+      });
 
-  // Filtered Leaderboard for Tab 4 (strictly by name, preserving all valid contest entries)
-  const filteredLeaderboard = (leaderboard || []).filter(item => {
+    const unsub = subscribeToContestEntriesFromFirestore(
+      contestId,
+      handleEntries,
+      (err) => {
+        if (!isEffectActive) return;
+        setIsLedgerLoading(false);
+        setLedgerSyncError(err?.message || 'Real-time ledger sync error');
+      }
+    );
+    return () => {
+      isEffectActive = false;
+      unsub();
+    };
+  }, [selectedLedgerContest?.id, selectedLedgerContest?.type, activeContest?.id, registeredUsersList.length]);
+
+  const activeLedgerSource = selectedLedgerContest?.id ? ledgerLeaderboard : (leaderboard || []);
+
+  // Filtered Leaderboard for Tab 4 (strictly by name or UID, preserving all valid contest entries)
+  const filteredLeaderboard = activeLedgerSource.filter(item => {
     if (!item || !item.id) return false;
+    if (item.userName === 'User 1' || item.userName === 'User 2' || item.userName === 'USER') return false;
     const isReal = item.isCurrentUser || 
       item.id.startsWith('ENTRY-') ||
       item.id.startsWith('entry-') ||
@@ -3544,7 +3649,11 @@ RULES:
       !item.id.startsWith('lb-') ||
       Boolean(item.submittedAt);
     if (!isReal) return false;
-    const matchesSearch = (item.userName || '').toLowerCase().includes(ledgerSearch.toLowerCase());
+    const q = ledgerSearch.trim().toLowerCase();
+    const matchesSearch = !q ||
+      (item.userName || '').toLowerCase().includes(q) ||
+      (item.ownerUid || '').toLowerCase().includes(q) ||
+      (item.entryId || '').toLowerCase().includes(q);
     if (!matchesSearch) return false;
     const status = payoutStatuses[item.id] || 'pending';
     if (ledgerFilter === 'all') return true;
@@ -6515,12 +6624,84 @@ RULES:
           <div className="space-y-6">
             <div className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 shadow-sm space-y-6">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-100">
-                <div>
+                <div className="space-y-1">
                   <h3 className="text-base font-black text-slate-900">
                     Winner Payout Ledger
                   </h3>
+                  {selectedLedgerContest && (
+                    <p className="text-[11px] font-semibold text-slate-500">
+                      {selectedLedgerContest.title} • <span className="font-mono">{selectedLedgerContest.id}</span> • {filteredLeaderboard.length} {filteredLeaderboard.length === 1 ? 'Participant' : 'Participants'}
+                    </p>
+                  )}
                 </div>
+
+                {contests.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="admin-ledger-contest-select" className="text-[11px] font-bold text-slate-600 whitespace-nowrap">
+                      Contest:
+                    </label>
+                    <select
+                      id="admin-ledger-contest-select"
+                      value={selectedLedgerContest?.id || ''}
+                      onChange={(e) => setSelectedLedgerContestId(e.target.value)}
+                      className="px-3 py-2 rounded-xl border border-slate-200 text-xs font-bold text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-[#3A81F5]/20 shadow-2xs"
+                    >
+                      {contests.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.title} ({c.status.toUpperCase()}) • {c.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
+
+              {ledgerSyncError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-700">
+                  {ledgerSyncError}
+                </div>
+              )}
+
+              {/* Authoritative Winner & Settlement Summary */}
+              {selectedLedgerContest && filteredLeaderboard.length > 0 && (() => {
+                const topWinner = filteredLeaderboard.find(item => item.rank === 1) || filteredLeaderboard[0];
+                const winnerUserRecord = registeredUsersList.find(u =>
+                  topWinner.ownerUid && (u.uid === topWinner.ownerUid || u.id === topWinner.ownerUid || u.customUserId === topWinner.ownerUid)
+                );
+                const winnerDisplayUid = winnerUserRecord?.customUserId || topWinner.ownerUid || topWinner.entryId || '—';
+                const winnerPrize = topWinner.settlementStatus === 'settled' && topWinner.settledPrizeRupees !== undefined
+                  ? topWinner.settledPrizeRupees
+                  : (topWinner.rewardAmount ?? 0);
+                const isSettled = topWinner.settlementStatus === 'settled' || selectedLedgerContest.status === 'completed';
+
+                return (
+                  <div className="p-4 rounded-2xl bg-slate-50/80 border border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-0.5 min-w-0">
+                      <p className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500">
+                        Confirmed Rank #1 Winner
+                      </p>
+                      <p className="text-sm font-black text-slate-900 truncate">
+                        {topWinner.userName} <span className="text-[11px] font-mono font-semibold text-slate-500">({winnerDisplayUid})</span>
+                      </p>
+                      <p className="text-[11px] font-semibold text-slate-600">
+                        Score: <strong className="text-[#3A81F5]">{topWinner.score}/{topWinner.totalQuestions || 10}</strong> • Time: <strong className="font-mono">{topWinner.formattedTime || `${Math.round(topWinner.timeTakenSeconds || 0)}s`}</strong>
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2.5 shrink-0">
+                      <span className="px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-extrabold tabular-nums">
+                        Prize: ₹{winnerPrize.toLocaleString('en-IN')}
+                      </span>
+                      <span className={`px-2.5 py-1.5 rounded-xl text-[10px] font-extrabold uppercase tracking-wider border ${
+                        isSettled
+                          ? 'bg-emerald-100/70 text-emerald-800 border-emerald-200'
+                          : 'bg-amber-50 text-amber-800 border-amber-200'
+                      }`}>
+                        {isSettled ? 'Settled' : 'Projected'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Filter & Search Bar */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -6552,7 +6733,7 @@ RULES:
                     type="text"
                     value={ledgerSearch}
                     onChange={(e) => setLedgerSearch(e.target.value)}
-                    placeholder="Search by name"
+                    placeholder="Search by name or UID"
                     className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs focus:outline-none focus:ring-2 focus:ring-[#3A81F5]/20 shadow-2xs text-slate-900"
                     style={{ backgroundColor: '#FFFFFF' }}
                   />
@@ -6565,22 +6746,37 @@ RULES:
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-slate-700">
                       <th className="py-3 px-4 font-bold w-16 whitespace-nowrap">Rank</th>
-                      <th className="py-3 px-4 font-bold min-w-[140px]">Contestant</th>
+                      <th className="py-3 px-4 font-bold min-w-[160px]">Contestant</th>
                       <th className="py-3 px-4 font-bold text-center w-52 whitespace-nowrap">Score & Speed</th>
-                      <th className="py-3 px-4 font-bold text-center w-36 whitespace-nowrap">Allocated Reward</th>
+                      <th className="py-3 px-4 font-bold text-center w-40 whitespace-nowrap">Allocated Reward</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {filteredLeaderboard.length === 0 ? (
                       <tr>
                         <td colSpan={4} className="py-12 px-4 text-center text-slate-400 font-medium text-xs bg-white">
-                          No active contest participants or test submissions found.
+                          {isLedgerLoading
+                            ? 'Loading authoritative contest participants from Firestore...'
+                            : 'No active contest participants or test submissions found.'}
                         </td>
                       </tr>
                     ) : (
                       filteredLeaderboard.map((item) => {
+                        const matchedUser = registeredUsersList.find(u =>
+                          item.ownerUid && (u.uid === item.ownerUid || u.id === item.ownerUid || u.customUserId === item.ownerUid)
+                        );
+                        const uidBadge = matchedUser?.customUserId || item.ownerUid || item.entryId;
+                        const authoritativePrize = item.settlementStatus === 'settled' && item.settledPrizeRupees !== undefined
+                          ? item.settledPrizeRupees
+                          : (item.rewardAmount !== undefined
+                              ? item.rewardAmount
+                              : (item.rewardText && item.rewardText.match(/₹\s*(\d+)/)
+                                  ? Number(item.rewardText.match(/₹\s*(\d+)/)![1])
+                                  : 0));
+                        const isRowSettled = item.settlementStatus === 'settled' || selectedLedgerContest?.status === 'completed';
+
                         return (
-                          <tr key={item.id} className="hover:bg-slate-50/70 transition-colors bg-white">
+                          <tr key={`${item.contestId || 'ctx'}-${item.id}-${item.ownerUid || ''}`} className="hover:bg-slate-50/70 transition-colors bg-white">
                             {/* Rank */}
                             <td className="py-3.5 px-4 font-black whitespace-nowrap align-middle">
                               <span
@@ -6591,17 +6787,24 @@ RULES:
                               </span>
                             </td>
 
-                            {/* Contestant: clean name and YOU badge without location or avatar thumbnail */}
+                            {/* Contestant: real name, Registration UID badge, and YOU badge */}
                             <td className="py-3.5 px-4 align-middle">
-                              <div className="font-bold text-slate-900 flex items-center gap-1.5 truncate">
-                                <span className="truncate">{item.userName}</span>
-                                {item.isCurrentUser && (
-                                  <span
-                                    className="text-[9px] text-white px-2 py-0.5 rounded-full font-bold shadow-2xs shrink-0"
-                                    style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
-                                  >
-                                    YOU
-                                  </span>
+                              <div className="space-y-0.5 min-w-0">
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5 truncate">
+                                  <span className="truncate">{item.userName}</span>
+                                  {item.isCurrentUser && (
+                                    <span
+                                      className="text-[9px] text-white px-2 py-0.5 rounded-full font-bold shadow-2xs shrink-0"
+                                      style={{ background: 'linear-gradient(135deg, #5F69EF 0%, #417CF4 35%, #3A81F5 65%, #20A5AC 100%)' }}
+                                    >
+                                      YOU
+                                    </span>
+                                  )}
+                                </div>
+                                {uidBadge && (
+                                  <p className="text-[10px] font-mono font-medium text-slate-400 truncate">
+                                    {uidBadge} {item.entryId ? `• ${item.entryId}` : ''}
+                                  </p>
                                 )}
                               </div>
                             </td>
@@ -6610,7 +6813,7 @@ RULES:
                             <td className="py-3.5 px-4 whitespace-nowrap text-center align-middle">
                               <div className="flex items-center justify-center gap-2">
                                 <span className="w-14 h-7 inline-flex items-center justify-center rounded-lg font-black text-xs text-[#3A81F5] bg-blue-50 border border-blue-200/80 shadow-2xs tabular-nums whitespace-nowrap">
-                                  {item.score}/10
+                                  {item.score}/{item.totalQuestions || 10}
                                 </span>
                                 <span className="text-slate-300 font-bold">|</span>
                                 <span className="min-w-[76px] px-2.5 h-7 inline-flex items-center justify-center rounded-lg font-mono font-semibold text-xs text-slate-700 bg-slate-50 border border-slate-200 shadow-2xs tabular-nums whitespace-nowrap">
@@ -6619,15 +6822,14 @@ RULES:
                               </div>
                             </td>
 
-                            {/* Allocated Reward: all prize boxes have identical dimensions w-20 h-7, centered */}
+                            {/* Allocated Reward: authoritative settled/projected prize + status */}
                             <td className="py-3.5 px-4 whitespace-nowrap text-center align-middle">
-                              <div className="flex items-center justify-center">
+                              <div className="flex items-center justify-center gap-1.5">
                                 <span className="w-20 h-7 inline-flex items-center justify-center rounded-lg text-xs font-extrabold bg-emerald-50 text-emerald-800 border border-emerald-200 shadow-2xs whitespace-nowrap tabular-nums">
-                                  {item.rewardAmount !== undefined
-                                    ? (item.rewardAmount > 0 ? `₹${item.rewardAmount.toLocaleString('en-IN')}` : '₹0')
-                                    : (item.rewardText && item.rewardText.includes('₹')
-                                        ? (item.rewardText.match(/₹\s*(\d+)/) ? `₹${Number(item.rewardText.match(/₹\s*(\d+)/)![1]).toLocaleString('en-IN')}` : item.rewardText)
-                                        : '₹0')}
+                                  {`₹${authoritativePrize.toLocaleString('en-IN')}`}
+                                </span>
+                                <span className="text-[9px] font-bold uppercase text-slate-400">
+                                  {isRowSettled ? 'Settled' : 'Proj.'}
                                 </span>
                               </div>
                             </td>
@@ -6659,22 +6861,22 @@ RULES:
                 </button>
 
                 {isFinancialsExpanded && (() => {
-                  const hasActiveContest = Boolean(activeContest && activeContest.status === 'active');
-                  const feeRupees = hasActiveContest
-                    ? (activeContest!.entryFee || poolData.entryFee || 100)
+                  const targetContest = selectedLedgerContest || activeContest;
+                  const hasContest = Boolean(targetContest);
+                  const feeRupees = hasContest
+                    ? (targetContest!.entryFee || poolData.entryFee || 100)
                     : 100;
-                  const poolCalc = hasActiveContest
-                    ? contestBackend.getPoolCalculation(activeContest!.id, feeRupees)
+                  const poolCalc = hasContest
+                    ? contestBackend.getPoolCalculation(targetContest!.id, feeRupees)
                     : null;
-                  const confirmedPaidCount = hasActiveContest
-                    ? (activeContest!.confirmedPaidEntries !== undefined
-                        ? activeContest!.confirmedPaidEntries
-                        : (activeContest!.realJoins !== undefined
-                            ? activeContest!.realJoins
-                            : (poolCalc?.confirmedPaidEntries || 0)))
+                  const confirmedPaidCount = hasContest
+                    ? (poolCalc?.confirmedPaidEntries ||
+                        targetContest!.confirmedPaidEntries ||
+                        targetContest!.realJoins ||
+                        0)
                     : 0;
 
-                  const hasPaidJoins = hasActiveContest && confirmedPaidCount > 0;
+                  const hasPaidJoins = hasContest && confirmedPaidCount > 0;
                   const totalRevenue = confirmedPaidCount * feeRupees;
                   const winnerPoolAmount = hasPaidJoins ? Math.floor(totalRevenue * 0.60) : 0;
                   const referralPoolAmount = hasPaidJoins ? Math.floor(totalRevenue * 0.10) : 0;

@@ -394,9 +394,19 @@ export function mapEntriesToLeaderboard(
   return sorted.map((entry, idx) => {
     const isCurrentUser = Boolean(currentOwnerUid && entry.ownerUid === currentOwnerUid);
     const rank = entry.rank || (idx + 1);
-    const prizeRupees = entry.projectedPrizeRupees !== undefined 
-      ? entry.projectedPrizeRupees 
+    const provisionalPrizeRupees = entry.projectedPrizeRupees !== undefined
+      ? entry.projectedPrizeRupees
       : (entry.projectedPrizePaise ? paiseToRupees(entry.projectedPrizePaise) : 0);
+    const isSettled = entry.settlementStatus === 'settled';
+    const settledPrizeRupees = isSettled
+      ? (entry.settledPrizeRupees !== undefined
+          ? entry.settledPrizeRupees
+          : (entry.settledPrizePaise !== undefined
+              ? paiseToRupees(entry.settledPrizePaise)
+              : provisionalPrizeRupees))
+      : undefined;
+    // Strictly prefer authoritative settled prize once settled; use provisional only while unsettled
+    const prizeRupees = isSettled ? (settledPrizeRupees ?? 0) : provisionalPrizeRupees;
 
     let rewardText = '₹0';
     let rewardType: 'product' | 'cashback' | 'none' = 'none';
@@ -429,13 +439,17 @@ export function mapEntriesToLeaderboard(
       ? new Date(entry.submittedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+    const rawName = (entry.userName || '').trim();
+    const safeUserName = rawName && rawName.toUpperCase() !== 'USER' ? rawName : 'Contestant';
+
     return {
       id: entry.entryId,
       entryId: entry.entryId,
+      contestId: entry.contestId,
       ownerUid: entry.ownerUid,
       rank,
-      userName: entry.userName || 'Contestant',
-      avatar: entry.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=120&auto=format&fit=crop&q=80',
+      userName: safeUserName,
+      avatar: entry.avatarUrl || '',
       score: entry.score || 0,
       totalQuestions: entry.totalQuestions || 10,
       timeTakenSeconds: entry.timeTakenSeconds || 0,
@@ -445,6 +459,9 @@ export function mapEntriesToLeaderboard(
       rewardText,
       rewardType,
       rewardAmount,
+      settlementStatus: isSettled ? 'settled' : 'pending',
+      settledPrizeRupees,
+      provisionalPrizeRupees,
       isCurrentUser,
       timestamp: timeStr,
       submittedAt: `${dateStr}, ${timeStr}`,
@@ -555,9 +572,21 @@ class QuizKartContestBackendService {
 
     const rankedActiveEntries = rankActiveEntries(activeEntriesOnly, poolCalculation);
     rankedActiveEntries.forEach(re => {
-      const idx = contestList.findIndex(e => e.entryId === re.entryId);
+      let idx = contestList.findIndex(e => e.entryId === re.entryId && e.ownerUid === re.ownerUid);
+      if (idx < 0) idx = contestList.findIndex(e => e.entryId === re.entryId);
       if (idx >= 0) {
-        contestList[idx] = re;
+        const prevEntry = contestList[idx];
+        contestList[idx] = {
+          ...re,
+          ...(prevEntry.settlementStatus === 'settled'
+            ? {
+                settlementStatus: 'settled' as const,
+                settledPrizePaise: prevEntry.settledPrizePaise,
+                settledPrizeRupees: prevEntry.settledPrizeRupees,
+                settledAt: prevEntry.settledAt
+              }
+            : {})
+        };
       }
     });
 
@@ -574,12 +603,14 @@ class QuizKartContestBackendService {
       !e.ownerUid.startsWith('demo-') && !e.ownerUid.startsWith('seed-')
     );
 
-    // Strict deduplication by entryId
+    // Deduplicate by composite key (entryId + ownerUid) so concurrent cross-device joins never collide
     const seen = new Set<string>();
     const active: ContestEntry[] = [];
     list.forEach(e => {
-      if (!e || !e.entryId || seen.has(e.entryId)) return;
-      seen.add(e.entryId);
+      if (!e || !e.entryId) return;
+      const dedupeKey = `${e.entryId}::${e.ownerUid || ''}`;
+      if (seen.has(dedupeKey)) return;
+      seen.add(dedupeKey);
       if (hasRealEntries && (e.ownerUid.startsWith('demo-') || e.ownerUid.startsWith('seed-'))) return;
       // Valid, confirmed, active paid entries only:
       // Replaced, invalid, failed, pending or unpaid entries must NOT be counted in active Real Joins
@@ -612,28 +643,38 @@ class QuizKartContestBackendService {
 
   /**
    * Authoritative contest synchronization from persistent Firestore records.
-   * Isolates records to contestId, deduplicates by entryId, preserves submitted state,
+   * Isolates records to contestId, deduplicates by entryId+ownerUid, preserves submitted & settled state,
    * enforces latest-active-entry-per-user, and updates sequence counters.
    */
   public loadContestEntries(contestId: string, cloudEntries: ContestEntry[]): void {
     if (!contestId) return;
 
+    const getEntryKey = (e: ContestEntry) => `${e.entryId}::${e.ownerUid || ''}`;
+
     // Existing entries in memory for this contest
     const existingList = this.entriesStore.get(contestId) || [];
     const existingMap = new Map<string, ContestEntry>();
     existingList.forEach(e => {
-      if (e && e.entryId) existingMap.set(e.entryId, e);
+      if (e && e.entryId) existingMap.set(getEntryKey(e), e);
     });
 
     const cleanMap = new Map<string, ContestEntry>();
     let maxSeq = this.entrySequenceCounter.get(contestId) || 0;
+    let cloudHasSettledEntry = false;
 
     (cloudEntries || []).forEach(incoming => {
       if (!incoming || !incoming.entryId) return;
       if (incoming.contestId === contestId) {
-        // If local entry is already submitted, preserve submission if incoming snapshot is unsubmitted
-        const local = existingMap.get(incoming.entryId);
+        const key = getEntryKey(incoming);
+        // Fallback match by entryId when local entry shares the same owner
+        const local = existingMap.get(key) || existingList.find(e => e.entryId === incoming.entryId && e.ownerUid === incoming.ownerUid);
         let merged: ContestEntry = { ...incoming };
+
+        if (incoming.settlementStatus === 'settled') {
+          cloudHasSettledEntry = true;
+        }
+
+        // If local entry is already submitted, preserve submission if incoming snapshot is unsubmitted
         if (local && local.isSubmitted && !incoming.isSubmitted) {
           merged = {
             ...incoming,
@@ -654,6 +695,17 @@ class QuizKartContestBackendService {
           };
         }
 
+        // Preserve settled state if either authoritative snapshot or local settled state holds it
+        if (local && local.settlementStatus === 'settled' && merged.settlementStatus !== 'settled') {
+          merged = {
+            ...merged,
+            settlementStatus: 'settled',
+            settledPrizeRupees: local.settledPrizeRupees,
+            settledPrizePaise: local.settledPrizePaise,
+            settledAt: local.settledAt
+          };
+        }
+
         // Real-time synchronization: preserve latest profile name & photo for active entries
         if (merged.ownerUid && this.userProfilesCache.has(merged.ownerUid) && merged.isActive && merged.status === 'active') {
           const cached = this.userProfilesCache.get(merged.ownerUid)!;
@@ -661,23 +713,29 @@ class QuizKartContestBackendService {
           if (cached.avatarUrl !== undefined) merged.avatarUrl = cached.avatarUrl;
         }
 
-        cleanMap.set(merged.entryId, merged);
+        cleanMap.set(key, merged);
         if (merged.entrySequenceNumber && merged.entrySequenceNumber > maxSeq) {
           maxSeq = merged.entrySequenceNumber;
         }
       }
     });
 
+    if (cloudHasSettledEntry) {
+      this.settledContests.add(contestId);
+    }
+
     // Also preserve local entries that haven't synced to cloud yet (in-flight, testing, or offline)
     existingList.forEach(local => {
-      if (local && local.entryId && local.contestId === contestId && !cleanMap.has(local.entryId)) {
+      if (!local || !local.entryId || local.contestId !== contestId) return;
+      const key = getEntryKey(local);
+      if (!cleanMap.has(key)) {
         if (local.isActive && local.isValid && local.status === 'active') {
           if (local.ownerUid && this.userProfilesCache.has(local.ownerUid)) {
             const cached = this.userProfilesCache.get(local.ownerUid)!;
             if (cached.userName) local.userName = cached.userName;
             if (cached.avatarUrl !== undefined) local.avatarUrl = cached.avatarUrl;
           }
-          cleanMap.set(local.entryId, local);
+          cleanMap.set(key, local);
           if (local.entrySequenceNumber && local.entrySequenceNumber > maxSeq) {
             maxSeq = local.entrySequenceNumber;
           }
@@ -702,7 +760,7 @@ class QuizKartContestBackendService {
         // Keep the first (latest) as active; mark previous ones as replaced
         for (let i = 1; i < userEntries.length; i++) {
           const old = userEntries[i];
-          const entryInMap = cleanMap.get(old.entryId);
+          const entryInMap = cleanMap.get(getEntryKey(old));
           if (entryInMap) {
             entryInMap.isActive = false;
             entryInMap.isValid = false;
@@ -729,6 +787,9 @@ class QuizKartContestBackendService {
       if (!entry || !entry.contestId || !entry.entryId) return;
       const contestId = entry.contestId;
       affectedContests.add(contestId);
+      if (entry.settlementStatus === 'settled') {
+        this.settledContests.add(contestId);
+      }
       // Real-time synchronization: preserve latest profile name for active entries
       if (entry.ownerUid && this.userProfilesCache.has(entry.ownerUid) && entry.isActive && entry.status === 'active') {
         const cached = this.userProfilesCache.get(entry.ownerUid)!;
@@ -736,7 +797,8 @@ class QuizKartContestBackendService {
         if (cached.avatarUrl !== undefined) entry.avatarUrl = cached.avatarUrl;
       }
       const list = this.entriesStore.get(contestId) || [];
-      const existingIdx = list.findIndex(e => e.entryId === entry.entryId);
+      let existingIdx = list.findIndex(e => e.entryId === entry.entryId && e.ownerUid === entry.ownerUid);
+      if (existingIdx < 0) existingIdx = list.findIndex(e => e.entryId === entry.entryId);
       if (existingIdx >= 0) {
         list[existingIdx] = entry;
       } else {

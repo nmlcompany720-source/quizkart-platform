@@ -1790,17 +1790,26 @@ export async function fetchLeaderboardFromFirestore(): Promise<LeaderboardEntry[
   }
 }
 
+export function getScopedLeaderboardDocId(entry: LeaderboardEntry): string {
+  const safeId = String(entry.id || entry.entryId || 'entry').replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!entry.contestId) return safeId.slice(0, 120);
+  const safeContest = String(entry.contestId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeOwner = entry.ownerUid ? `__${String(entry.ownerUid).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 32)}` : '';
+  return `${safeContest}__${safeId}${safeOwner}`.slice(0, 120);
+}
+
 export async function saveLeaderboardEntryToFirestore(entry: LeaderboardEntry): Promise<void> {
   if (!entry || !entry.id || isFirestoreQuotaExceeded()) return;
-  const path = `leaderboard/${entry.id}`;
+  const docId = getScopedLeaderboardDocId(entry);
+  const path = `leaderboard/${docId}`;
   try {
-    await setDoc(doc(db, 'leaderboard', entry.id), {
+    await setDoc(doc(db, 'leaderboard', docId), {
       ...entry,
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
-    console.warn(`Firestore leaderboard save notice (${entry.id}):`, error);
+    console.warn(`Firestore leaderboard save notice (${path}):`, error);
   }
 }
 
@@ -5022,22 +5031,42 @@ export async function deleteSupportTicketFromFirestore(ticketId: string): Promis
 }
 
 // Contest Entries Firestore Cloud Database Persistence
+export function getScopedContestEntryDocId(entry: Pick<ContestEntry, 'contestId' | 'entryId' | 'ownerUid'>): string {
+  const safeEntryId = String(entry.entryId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!entry.contestId) return safeEntryId.slice(0, 120);
+  const safeContestId = String(entry.contestId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeOwner = entry.ownerUid
+    ? `__${String(entry.ownerUid).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 32)}`
+    : '';
+  return `${safeContestId}__${safeEntryId}${safeOwner}`.slice(0, 120);
+}
+
 export async function saveContestEntryToFirestore(entry: ContestEntry): Promise<void> {
   if (!entry || !entry.entryId || isFirestoreQuotaExceeded()) return;
-  const path = `contest_entries/${entry.entryId}`;
+  const docId = getScopedContestEntryDocId(entry);
+  const path = `contest_entries/${docId}`;
   try {
-    await setDoc(doc(db, 'contest_entries', entry.entryId), {
+    // Strip stale cross-contest fields cleanly when writing active initial/unreplaced entries
+    await setDoc(doc(db, 'contest_entries', docId), {
       ...entry,
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
     if (handlePossibleQuotaError(error)) return;
-    console.warn(`Firestore contest entry save notice (${entry.entryId}):`, error);
+    console.warn(`Firestore contest entry save notice (${path}):`, error);
   }
 }
 
-export async function fetchContestEntriesFromFirestore(contestId: string): Promise<ContestEntry[]> {
-  if (!contestId || isFirestoreQuotaExceeded()) return [];
+export async function fetchContestEntriesWithStatusFromFirestore(contestId: string): Promise<{
+  entries: ContestEntry[];
+  ok: boolean;
+  errorCode?: string;
+  errorMessage?: string;
+}> {
+  if (!contestId) return { entries: [], ok: true };
+  if (isFirestoreQuotaExceeded()) {
+    return { entries: [], ok: false, errorCode: 'resource-exhausted', errorMessage: 'Firestore quota exceeded' };
+  }
   const path = 'contest_entries';
   try {
     const q = query(collection(db, path), where('contestId', '==', contestId));
@@ -5049,15 +5078,27 @@ export async function fetchContestEntriesFromFirestore(contestId: string): Promi
         list.push(data as ContestEntry);
       }
     });
-    return list;
-  } catch (error) {
-    return [];
+    return { entries: list, ok: true };
+  } catch (error: any) {
+    handlePossibleQuotaError(error);
+    return {
+      entries: [],
+      ok: false,
+      errorCode: error?.code || 'unknown',
+      errorMessage: error?.message || 'Failed to load contest entries'
+    };
   }
+}
+
+export async function fetchContestEntriesFromFirestore(contestId: string): Promise<ContestEntry[]> {
+  const res = await fetchContestEntriesWithStatusFromFirestore(contestId);
+  return res.entries;
 }
 
 export function subscribeToContestEntriesFromFirestore(
   contestId: string,
-  callback: (entries: ContestEntry[]) => void
+  callback: (entries: ContestEntry[]) => void,
+  onError?: (error: { code?: string; message?: string }) => void
 ): () => void {
   if (!contestId || isFirestoreQuotaExceeded()) return () => {};
   const path = 'contest_entries';
@@ -5075,12 +5116,21 @@ export function subscribeToContestEntriesFromFirestore(
         });
         callback(list);
       },
-      (error) => {
+      (error: any) => {
         handlePossibleQuotaError(error);
         console.warn(`Firestore contest entries subscription notice (${contestId}):`, error);
+        if (onError) {
+          onError({
+            code: error?.code || 'unknown',
+            message: error?.message || 'Failed to sync leaderboard entries'
+          });
+        }
       }
     );
-  } catch (err) {
+  } catch (err: any) {
+    if (onError) {
+      onError({ code: err?.code || 'unknown', message: err?.message || 'Failed to subscribe' });
+    }
     return () => {};
   }
 }
@@ -5333,21 +5383,26 @@ export async function updateQuizAttemptPrizeInFirestore(
 
 export async function syncUserNameAcrossContestEntriesInFirestore(
   ownerUid: string,
-  newUserName: string
+  newUserName: string,
+  avatarUrl?: string
 ): Promise<void> {
   if (!ownerUid || !newUserName || !newUserName.trim() || isFirestoreQuotaExceeded()) return;
   const cleanName = newUserName.trim();
+  const patch: Record<string, any> = {
+    userName: cleanName,
+    updatedAt: new Date().toISOString()
+  };
+  if (avatarUrl !== undefined) {
+    patch.avatarUrl = avatarUrl;
+  }
   try {
-    // 1. Synchronize name on all active contest entries for this ownerUid
+    // 1. Synchronize name & photo on all active contest entries for this ownerUid
     const qEntries = query(collection(db, 'contest_entries'), where('ownerUid', '==', ownerUid));
     const snapEntries = await getDocs(qEntries);
     snapEntries.forEach((docItem) => {
       const data = docItem.data();
       if (data && data.isActive && data.status === 'active') {
-        updateDoc(doc(db, 'contest_entries', docItem.id), {
-          userName: cleanName,
-          updatedAt: new Date().toISOString()
-        }).catch(() => {});
+        updateDoc(doc(db, 'contest_entries', docItem.id), patch).catch(() => {});
       }
     });
 
@@ -5357,6 +5412,17 @@ export async function syncUserNameAcrossContestEntriesInFirestore(
     snapAttempts.forEach((docItem) => {
       updateDoc(doc(db, 'quiz_attempts', docItem.id), {
         userName: cleanName,
+        updatedAt: new Date().toISOString()
+      }).catch(() => {});
+    });
+
+    // 3. Synchronize name & avatar on leaderboard docs for this ownerUid
+    const qLeaderboard = query(collection(db, 'leaderboard'), where('ownerUid', '==', ownerUid));
+    const snapLeaderboard = await getDocs(qLeaderboard);
+    snapLeaderboard.forEach((docItem) => {
+      updateDoc(doc(db, 'leaderboard', docItem.id), {
+        userName: cleanName,
+        ...(avatarUrl !== undefined ? { avatar: avatarUrl } : {}),
         updatedAt: new Date().toISOString()
       }).catch(() => {});
     });

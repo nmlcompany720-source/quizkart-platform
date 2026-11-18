@@ -16,6 +16,8 @@ interface LiveLeaderboardProps {
   isContestLive?: boolean;
   todayPrize?: DailyPrizeItem;
   hasUserCompletedAttempt?: boolean;
+  isLoading?: boolean;
+  syncError?: string | null;
   onEnterQuiz: () => void;
   isQuizActive: boolean;
 }
@@ -38,6 +40,8 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
   isContestLive = false,
   todayPrize,
   hasUserCompletedAttempt = false,
+  isLoading = false,
+  syncError = null,
   onEnterQuiz,
   isQuizActive
 }) => {
@@ -50,10 +54,11 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
 
   const isRealSubmission = (e?: LeaderboardEntry | null) => {
     if (!e) return false;
-    // Exclude demo placeholder rows
-    if (e.userName === 'User 1' || e.userName === 'User 2') return false;
+    // Exclude demo or placeholder rows
+    if (e.userName === 'User 1' || e.userName === 'User 2' || e.userName === 'USER' || e.userName === 'Awaiting Player') return false;
     if (e.id && e.id.startsWith('lb-')) return false;
     if (e.ownerUid && (e.ownerUid.startsWith('demo-') || e.ownerUid.startsWith('seed-'))) return false;
+    if (activeContest?.id && e.contestId && e.contestId !== activeContest.id) return false;
 
     // Explicit real submission indicators
     if (e.id && (e.id.startsWith('ENTRY-') || e.id.startsWith('user-') || e.id.startsWith('sub-') || e.id.startsWith('att-') || e.id.startsWith('real-'))) return true;
@@ -116,6 +121,14 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
     return raw;
   };
 
+  // Authoritative Prize Helper: strictly prefers settled prize over provisional once settled
+  const getAuthoritativePrize = (entry: LeaderboardEntry): number => {
+    if (entry.settlementStatus === 'settled' && entry.settledPrizeRupees !== undefined) {
+      return entry.settledPrizeRupees;
+    }
+    return entry.rewardAmount !== undefined ? entry.rewardAmount : 0;
+  };
+
   // Clean Monetary Reward Formatter strictly mapped to contest prize tiers
   const renderPrize = (entry: LeaderboardEntry) => {
     if (entry.securityBreached || entry.rewardText === 'Disqualified (Violation)') {
@@ -127,7 +140,7 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
       );
     }
 
-    const prize = entry.rewardAmount !== undefined ? entry.rewardAmount : 0;
+    const prize = getAuthoritativePrize(entry);
     return (
       <span className="w-20 h-7 inline-flex items-center justify-center font-extrabold text-xs text-emerald-700 bg-emerald-50 rounded-lg border border-emerald-200 shadow-2xs whitespace-nowrap tabular-nums shrink-0">
         ₹{prize.toLocaleString('en-IN')}
@@ -160,33 +173,29 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
       realEntry && effectiveCurrentUid && realEntry.ownerUid === effectiveCurrentUid
     );
 
-    const hasLiveEntry = Boolean(hasRealJoins && realEntry && realEntry.userName && realEntry.userName.trim());
-    const displayName = hasLiveEntry ? realEntry.userName.trim() : (hasRealJoins ? 'Awaiting Player' : 'USER');
-    const avatarSrc = hasLiveEntry ? (realEntry.avatar || null) : null;
+    const hasLiveEntry = Boolean(
+      hasRealJoins &&
+      realEntry &&
+      realEntry.userName &&
+      realEntry.userName.trim() &&
+      realEntry.userName.trim().toUpperCase() !== 'USER'
+    );
+    const displayName = hasLiveEntry ? realEntry!.userName.trim() : 'Awaiting Player';
+    const avatarSrc = hasLiveEntry ? (realEntry!.avatar || null) : null;
     const scoreDisplay = hasLiveEntry
-      ? `${realEntry.score}/${realEntry.totalQuestions || 10}`
+      ? `${realEntry!.score}/${realEntry!.totalQuestions || 10}`
       : '—';
     const timeDisplay = hasLiveEntry
-      ? (realEntry.formattedTime ? realEntry.formattedTime.replace(/^in\s+/, '') : (realEntry.timeTakenSeconds ? `${Math.round(realEntry.timeTakenSeconds)}s` : '0m 00s'))
+      ? (realEntry!.formattedTime ? realEntry!.formattedTime.replace(/^in\s+/, '') : (realEntry!.timeTakenSeconds ? `${Math.round(realEntry!.timeTakenSeconds)}s` : '0m 00s'))
       : '—';
 
     // Strict Contest Engine Prize Rules:
-    // Demo behavior (before any real user joins): Rank 1 -> ₹180, Rank 2 -> ₹120, Rank 3 -> ₹60
-    // As soon as first verified real user joins:
-    // - Remove all demo prize data.
-    // - Display only actual contest calculations.
-    // - Only actual winning entries receive prizes. Non-winning users must show ₹0.
+    // Never render hardcoded demo/placeholder amounts like ₹180/₹120/₹60 when no verified submission exists.
+    // Once a verified entry exists, render only authoritative settled prize or calculated provisional prize (otherwise ₹0).
     let prizeText = '₹0';
-    if (!hasRealJoins) {
-      if (rank === 1) prizeText = '₹180';
-      else if (rank === 2) prizeText = '₹120';
-      else if (rank === 3) prizeText = '₹60';
-    } else {
-      if (realEntry && realEntry.rewardAmount !== undefined) {
-        prizeText = `₹${realEntry.rewardAmount.toLocaleString('en-IN')}`;
-      } else {
-        prizeText = '₹0';
-      }
+    if (hasLiveEntry && realEntry) {
+      const displayPrize = getAuthoritativePrize(realEntry);
+      prizeText = `₹${displayPrize.toLocaleString('en-IN')}`;
     }
 
     return (
@@ -272,6 +281,17 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
         <h2 className="text-xl sm:text-2xl font-black text-black tracking-tight text-center">
           Live Standings & Rankings
         </h2>
+        {activeContest && (
+          <p className="text-[11px] font-semibold text-slate-500">
+            {activeContest.title} • {activeContest.id}
+          </p>
+        )}
+
+        {syncError && (
+          <div className="px-3.5 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold">
+            {syncError}
+          </div>
+        )}
 
         {!isQuizActive && (
           <button
@@ -354,7 +374,7 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
           {/* Centered Contest-Linked Prize Badge with identical dimensions */}
           <div className="mt-3 h-8 w-full rounded-xl bg-emerald-50 border border-emerald-200 text-center flex items-center justify-center shadow-2xs shrink-0">
             <span className="text-xs font-extrabold text-emerald-700 tracking-wide whitespace-nowrap tabular-nums">
-              {userEntry.rewardAmount !== undefined ? `₹${userEntry.rewardAmount.toLocaleString('en-IN')}` : '₹0'}
+              {`₹${getAuthoritativePrize(userEntry).toLocaleString('en-IN')}`}
             </span>
           </div>
         </div>
@@ -441,9 +461,13 @@ export const LiveLeaderboard: React.FC<LiveLeaderboardProps> = ({
               {(!hasRealJoins || filteredEntries.length === 0) ? (
                 <tr>
                   <td colSpan={6} className="py-12 px-4 text-center text-slate-400 font-medium text-xs bg-white">
-                    {filterType === 'my_rank'
-                      ? 'You have not joined this contest yet. Join now to view your rank!'
-                      : 'No active submissions. Play now to join the rankings!'}
+                    {isLoading
+                      ? 'Loading authoritative contest standings...'
+                      : syncError
+                        ? 'Unable to sync leaderboard right now. Please try refreshing.'
+                        : filterType === 'my_rank'
+                          ? 'You have not joined this contest yet. Join now to view your rank!'
+                          : 'No active submissions yet. Play now to join the rankings!'}
                   </td>
                 </tr>
               ) : (

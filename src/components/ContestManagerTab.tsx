@@ -2331,6 +2331,9 @@ export const ContestManagerTab: React.FC<ContestManagerTabProps> = ({
                     <h4 className="text-sm sm:text-base font-black text-slate-900 tracking-tight leading-snug truncate">
                       {c.title}
                     </h4>
+                    <p className="text-[10px] font-mono font-semibold text-slate-400 truncate">
+                      ID: {c.id}
+                    </p>
                   </div>
 
                   {/* Top-Right Action Buttons: Edit (Pencil Only with Gradient) & Delete (Trash with Gradient + 1s Spinner) */}

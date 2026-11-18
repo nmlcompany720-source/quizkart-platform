@@ -196,6 +196,7 @@ export interface AutoPilotSettings {
 export interface LeaderboardEntry {
   id: string;
   entryId?: string;
+  contestId?: string;
   ownerUid?: string;
   rank: number;
   userName: string;
@@ -209,6 +210,9 @@ export interface LeaderboardEntry {
   rewardText: string;
   rewardType: 'product' | 'cashback' | 'none';
   rewardAmount?: number;
+  settlementStatus?: 'pending' | 'settled';
+  settledPrizeRupees?: number;
+  provisionalPrizeRupees?: number;
   isCurrentUser?: boolean;
   timestamp: string;
   submittedAt: string;

@@ -90,6 +90,7 @@ import {
   deleteUserProfileFromFirestore,
   saveContestEntryToFirestore,
   fetchContestEntriesFromFirestore,
+  fetchContestEntriesWithStatusFromFirestore,
   subscribeToContestEntriesFromFirestore,
   fetchAllContestEntriesFromFirestore,
   saveFinancialLedgerToFirestore,
@@ -366,22 +367,45 @@ export default function App() {
     }
   });
 
-  // Determine active contest accurately: strictly returns currently active tournament
+  // Determine active contest accurately: strictly prioritize LIVE active contests across all devices
+  // so a stale completed contest ID cached on one device never overrides a newly activated contest.
   const activeContest: ActiveContest | null = useMemo(() => {
     let deletedList: string[] = [];
     try {
       deletedList = JSON.parse(localStorage.getItem('quizkart_deleted_contests') || '[]');
     } catch {}
     const nonDeleted = contests.filter(c => c && c.id && !deletedList.includes(c.id) && c.id !== 'CNT-CASH-LIVE' && c.id !== 'CNT-FALLBACK-PLACEHOLDER' && c.id !== 'CNT-PROD-101' && c.id !== 'CNT-CASH-202');
+
+    // 1. Always prioritize currently active live contests (if activeContestId itself is active, keep it; otherwise pick latest active)
+    const activeContests = nonDeleted.filter(c => c.status === 'active');
+    if (activeContests.length > 0) {
+      if (activeContestId) {
+        const matchedActive = activeContests.find(c => c.id === activeContestId);
+        if (matchedActive) return matchedActive;
+      }
+      const sortedActive = [...activeContests].sort((a, b) => {
+        const tA = new Date(a.activatedAt || a.createdAt || 0).getTime();
+        const tB = new Date(b.activatedAt || b.createdAt || 0).getTime();
+        return tB - tA;
+      });
+      return sortedActive[0];
+    }
+
+    // 2. Next prefer scheduled upcoming contests
+    const scheduledContests = nonDeleted.filter(c => c.status === 'scheduled');
+    if (scheduledContests.length > 0) {
+      if (activeContestId) {
+        const matchedSched = scheduledContests.find(c => c.id === activeContestId);
+        if (matchedSched) return matchedSched;
+      }
+      return scheduledContests[0];
+    }
+
+    // 3. Fallback: keep matched contest (e.g. completed/expired until Admin deletes it) or newest non-deleted contest
     if (activeContestId && !deletedList.includes(activeContestId)) {
       const matched = nonDeleted.find(c => c.id === activeContestId);
       if (matched) return matched;
     }
-    const liveMatch = nonDeleted.find(c => c.status === 'active');
-    if (liveMatch) return liveMatch;
-    const upcomingMatch = nonDeleted.find(c => c.status === 'scheduled');
-    if (upcomingMatch) return upcomingMatch;
-    // Issue 1: Preserve created contest on website even when expired until Admin explicitly deletes it
     return nonDeleted[0] || null;
   }, [contests, activeContestId]);
 
@@ -573,12 +597,23 @@ export default function App() {
         window.dispatchEvent(new Event('quizkart_attempts_updated'));
       }
 
-      // 4. Save audit payout ledgers to Firestore
+      // 4. Save audit payout ledgers and authoritative settled contest entries to Firestore
       const allLedgers = contestBackend.getFinancialLedgers(contestId);
       const payoutLedgers = allLedgers.filter(l => l.type === 'PRIZE_PAYOUT');
       for (const pl of payoutLedgers) {
         saveFinancialLedgerToFirestore(pl).catch(() => {});
       }
+
+      const settledCloudEntries = contestBackend.getContestEntries(contestId).filter(
+        e => e.settlementStatus === 'settled' && !e.ownerUid.startsWith('demo-') && !e.ownerUid.startsWith('seed-')
+      );
+      for (const settledEntry of settledCloudEntries) {
+        saveContestEntryToFirestore(settledEntry).catch(() => {});
+      }
+      const updatedLeaderboardEntries = mapEntriesToLeaderboard(settledCloudEntries);
+      updatedLeaderboardEntries.forEach(lb => {
+        saveLeaderboardEntryToFirestore(lb).catch(() => {});
+      });
     } catch (err) {
       console.warn('Contest settlement execution notice:', err);
     }
@@ -793,7 +828,7 @@ export default function App() {
       });
 
       setActiveContestId(curr => {
-        const currentExistsInCloud = Boolean(curr && validCloud.some(c => c.id === curr));
+        const currCloudContest = curr ? validCloud.find(c => c.id === curr) : undefined;
         const currentIsFreshLocal = Boolean(
           curr &&
           !deletedList.includes(curr) &&
@@ -801,12 +836,21 @@ export default function App() {
           (recentlySavedContestsRef.current.get(curr) || 0) > now - 12_000
         );
 
-        if (currentExistsInCloud || currentIsFreshLocal) {
+        // Keep curr ONLY if it is a fresh local creation OR still active, OR still exists when no active contest supersedes it
+        const cloudHasActive = validCloud.some((c: any) => c.status === 'active');
+        const currentIsStillLive = Boolean(currCloudContest && currCloudContest.status === 'active');
+        const currentAcceptableWhenNoActive = Boolean(currCloudContest && !cloudHasActive);
+
+        if (currentIsFreshLocal || currentIsStillLive || currentAcceptableWhenNoActive) {
           return curr;
         }
 
+        const activePool = validCloud
+          .filter((c: any) => c.status === 'active')
+          .sort((a: any, b: any) => new Date(b.activatedAt || b.createdAt || 0).getTime() - new Date(a.activatedAt || a.createdAt || 0).getTime());
+
         const nextActive =
-          validCloud.find((c: any) => c.status === 'active') ||
+          activePool[0] ||
           validCloud.find((c: any) => c.status === 'scheduled') ||
           validCloud[0] ||
           null;
@@ -1452,19 +1496,29 @@ export default function App() {
 
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(() => {
     try {
+      const savedActiveContestId = localStorage.getItem('quizkart_active_contest_id') || '';
       const saved = localStorage.getItem('quizkart_leaderboard');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          const valid = parsed.filter((e): e is LeaderboardEntry => Boolean(e && e.id != null && !e.id.startsWith('lb-') && e.userName !== 'User 1' && e.userName !== 'User 2'));
+          const valid = parsed.filter((e): e is LeaderboardEntry => Boolean(
+            e &&
+            e.id != null &&
+            !e.id.startsWith('lb-') &&
+            e.userName !== 'User 1' &&
+            e.userName !== 'User 2' &&
+            e.userName !== 'USER' &&
+            (!savedActiveContestId || !e.contestId || e.contestId === savedActiveContestId)
+          ));
           if (valid.length > 0) return valid;
         }
       }
-      const savedActiveContestId = localStorage.getItem('quizkart_active_contest_id') || 'live_round';
-      const initialActive = contestBackend.getActiveEntries(savedActiveContestId);
-      if (initialActive.length > 0) {
-        const mapped = mapEntriesToLeaderboard(initialActive);
-        if (mapped.length > 0) return mapped;
+      if (savedActiveContestId) {
+        const initialActive = contestBackend.getActiveEntries(savedActiveContestId);
+        if (initialActive.length > 0) {
+          const mapped = mapEntriesToLeaderboard(initialActive);
+          if (mapped.length > 0) return mapped;
+        }
       }
       return [];
     } catch {
@@ -1472,6 +1526,8 @@ export default function App() {
     }
   });
 
+  const [isLeaderboardLoading, setIsLeaderboardLoading] = useState<boolean>(false);
+  const [leaderboardSyncError, setLeaderboardSyncError] = useState<string | null>(null);
 
   const [poolData, setPoolData] = useState<PoolEconomics>(() => {
     try {
@@ -1485,10 +1541,24 @@ export default function App() {
   // Persistent Real Joins & Leaderboard synchronization with Firestore in real-time
   useEffect(() => {
     const contestId = activeContest?.id;
-    if (!contestId) return;
+    if (!contestId) {
+      setLeaderboard([]);
+      setRealActiveParticipants(0);
+      setIsLeaderboardLoading(false);
+      setLeaderboardSyncError(null);
+      return;
+    }
+
+    let isEffectActive = true;
+    setIsLeaderboardLoading(true);
+    setLeaderboardSyncError(null);
+    // Clear any cached leaderboard entries from a different contest so stale contest winners never flash
+    setLeaderboard(prev => prev.filter(item => item && (!item.contestId || item.contestId === contestId)));
 
     const syncEntries = (cloudEntries: ContestEntry[]) => {
-      if (!cloudEntries) return;
+      if (!isEffectActive || !cloudEntries) return;
+      setIsLeaderboardLoading(false);
+      setLeaderboardSyncError(null);
       contestBackend.loadContestEntries(contestId, cloudEntries);
       const activeList = contestBackend.getActiveEntries(contestId);
       const feeRupees = activeContest?.entryFee || 100;
@@ -1565,8 +1635,10 @@ export default function App() {
           localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
         } catch {}
       } else {
-        const hasLocalSubmitted = activeList.some(e => e.isSubmitted);
-        if (!hasLocalSubmitted) {
+        const hasVeryRecentLocalSubmission = activeList.some(
+          e => e.isSubmitted && e.submittedTimestampMs && Date.now() - e.submittedTimestampMs < 15_000
+        );
+        if (!hasVeryRecentLocalSubmission) {
           setLeaderboard([]);
           try {
             localStorage.setItem('quizkart_leaderboard', JSON.stringify([]));
@@ -1575,9 +1647,37 @@ export default function App() {
       }
     };
 
-    const unsub = subscribeToContestEntriesFromFirestore(contestId, syncEntries);
-    return () => unsub();
-  }, [activeContest?.id, activeContest?.entryFee]);
+    // Immediate authoritative fetch on contest switch so devices don't show stale data
+    fetchContestEntriesWithStatusFromFirestore(contestId)
+      .then((res) => {
+        if (!isEffectActive) return;
+        if (res.ok) {
+          syncEntries(res.entries);
+        } else {
+          setIsLeaderboardLoading(false);
+          setLeaderboardSyncError(res.errorMessage || 'Unable to load contest standings');
+        }
+      })
+      .catch(() => {
+        if (isEffectActive) {
+          setIsLeaderboardLoading(false);
+        }
+      });
+
+    const unsub = subscribeToContestEntriesFromFirestore(
+      contestId,
+      syncEntries,
+      (err) => {
+        if (!isEffectActive) return;
+        setIsLeaderboardLoading(false);
+        setLeaderboardSyncError(err?.message || 'Real-time standings sync interrupted');
+      }
+    );
+    return () => {
+      isEffectActive = false;
+      unsub();
+    };
+  }, [activeContest?.id, activeContest?.entryFee, activeContest?.type, currentUser?.uid, userProfile?.uid, userProfile?.id, todayPrize?.brand, todayPrize?.retailValue]);
 
   const [deposits, setDeposits] = useState<DepositRequest[]>(() => {
     try {
@@ -3084,57 +3184,59 @@ export default function App() {
       }
 
       try {
-        const contestId = activeContestId || activeContest?.id || 'live_round';
-        const cloudEntries = await fetchContestEntriesFromFirestore(contestId);
-        contestBackend.loadContestEntries(contestId, cloudEntries || []);
-        const activeList = contestBackend.getActiveEntries(contestId);
-        const feeRupees = activeContest?.entryFee || 100;
-        const poolCalc = contestBackend.getPoolCalculation(contestId, feeRupees);
-        const confirmedPaidCount = poolCalc.confirmedPaidEntries;
+        const resolvedInitialContestId = activeContest?.id || activeContestId;
+        if (resolvedInitialContestId) {
+          const entryRes = await fetchContestEntriesWithStatusFromFirestore(resolvedInitialContestId);
+          if (entryRes.ok) {
+            contestBackend.loadContestEntries(resolvedInitialContestId, entryRes.entries || []);
+            const activeList = contestBackend.getActiveEntries(resolvedInitialContestId);
+            const feeRupees = activeContest?.entryFee || 100;
+            const poolCalc = contestBackend.getPoolCalculation(resolvedInitialContestId, feeRupees);
+            const confirmedPaidCount = poolCalc.confirmedPaidEntries;
 
-        setRealActiveParticipants(confirmedPaidCount);
-        try {
-          localStorage.setItem('quizkart_real_active_participants', String(confirmedPaidCount));
-        } catch {}
+            setRealActiveParticipants(confirmedPaidCount);
+            try {
+              localStorage.setItem('quizkart_real_active_participants', String(confirmedPaidCount));
+            } catch {}
 
-        setContests(prev => {
-          const updated = prev.map(c => {
-            if (c.id === contestId) {
-              return {
-                ...c,
-                realJoins: confirmedPaidCount,
-                confirmedPaidEntries: confirmedPaidCount,
-                totalRevenue: poolCalc.totalRevenueRupees,
-                prizePoolPaise: poolCalc.prizePoolPaise,
-                referralPoolPaise: poolCalc.referralPoolPaise,
-                platformMarginPaise: poolCalc.platformMarginPaise,
-                winnerSlots: poolCalc.winnerSlots
-              };
-            }
-            return c;
-          });
-          try {
-            localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
-          } catch {}
-          return updated;
-        });
+            setContests(prev => {
+              const updated = prev.map(c => {
+                if (c.id === resolvedInitialContestId) {
+                  return {
+                    ...c,
+                    realJoins: confirmedPaidCount,
+                    confirmedPaidEntries: confirmedPaidCount,
+                    totalRevenue: poolCalc.totalRevenueRupees,
+                    prizePoolPaise: poolCalc.prizePoolPaise,
+                    referralPoolPaise: poolCalc.referralPoolPaise,
+                    platformMarginPaise: poolCalc.platformMarginPaise,
+                    winnerSlots: poolCalc.winnerSlots
+                  };
+                }
+                return c;
+              });
+              try {
+                localStorage.setItem('quizkart_active_contests', JSON.stringify(updated));
+              } catch {}
+              return updated;
+            });
 
-        setPoolData(prev => ({
-          ...prev,
-          activeParticipants: confirmedPaidCount,
-          totalPoolAmount: poolCalc.prizePoolRupees,
-          productPrizeValue: poolCalc.prizePoolRupees
-        }));
+            setPoolData(prev => ({
+              ...prev,
+              activeParticipants: confirmedPaidCount,
+              totalPoolAmount: poolCalc.prizePoolRupees,
+              productPrizeValue: poolCalc.prizePoolRupees
+            }));
 
-        if (activeList.length > 0) {
-          const mapped = mapEntriesToLeaderboard(
-            activeList,
-            currentUser?.uid || userProfile?.uid,
-            activeContest?.type === 'product',
-            todayPrize?.brand,
-            todayPrize?.retailValue
-          );
-          if (mapped.length > 0) {
+            const mapped = activeList.length > 0
+              ? mapEntriesToLeaderboard(
+                  activeList,
+                  currentUser?.uid || userProfile?.uid,
+                  activeContest?.type === 'product',
+                  todayPrize?.brand,
+                  todayPrize?.retailValue
+                )
+              : [];
             setLeaderboard(mapped);
             try {
               localStorage.setItem('quizkart_leaderboard', JSON.stringify(mapped));
@@ -3509,8 +3611,8 @@ export default function App() {
         saveContestEntryToFirestore(entry).catch(() => {});
       });
 
-      // Synchronize user name in Firestore contest entries & quiz attempts
-      syncUserNameAcrossContestEntriesInFirestore(ownerUid, updated.name).catch(() => {});
+      // Synchronize user name & photo in Firestore contest entries & quiz attempts
+      syncUserNameAcrossContestEntriesInFirestore(ownerUid, updated.name, updated.avatarUrl).catch(() => {});
 
       if (activeContestId) {
         const activeList = contestBackend.getActiveEntries(activeContestId);
@@ -3831,7 +3933,8 @@ export default function App() {
         const nextBal = Math.max(0, (prev.walletBalance || 0) - feeToDeduct);
         const updated = {
           ...prev,
-          walletBalance: nextBal
+          walletBalance: nextBal,
+          updatedAt: new Date().toISOString()
         };
         try {
           localStorage.setItem('quizkart_user_profile', JSON.stringify(updated));
@@ -4619,6 +4722,8 @@ export default function App() {
             isContestLive={isContestLive}
             todayPrize={todayPrize}
             hasUserCompletedAttempt={hasUserCompletedCurrentContest}
+            isLoading={isLeaderboardLoading}
+            syncError={leaderboardSyncError}
             onEnterQuiz={handleStartRealQuiz}
             isQuizActive={isQuizActive}
           />
